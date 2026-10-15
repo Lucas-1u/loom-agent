@@ -5,7 +5,7 @@
 目标形态是 Codex / Cursor 式的个人 Coding Agent。但现阶段的目标不是"功能做得多"，
 而是 **"每一步都能讲清楚为什么"** —— 这是一个用来**理解现代 AI Agent 内部架构**的实验平台。
 
-**纯 Python · 不用编排框架 · 自检 353/353 · 真实模型 5/5 场景通过**
+**纯 Python · 不用编排框架 · 自检 397/397 · 真实模型 7/7 场景通过**
 
 ---
 
@@ -39,11 +39,12 @@ Loom：[PLAN   ] 计划 3 步
 |---|---|
 | 五阶段 Agent Loop（PLAN / ACT / OBSERVE / REFLECT / FINAL） | ✅ |
 | 工具调用（列目录 / 读文件 / 写文件） | ✅ |
+| **局部修改** `edit_file`（唯一匹配 / 冲突检测 / stale 检测 / diff 预览） | ✅ |
 | 写操作**人工审批**（真挂起-恢复，不是轮询） | ✅ |
 | 工作区越界防护 | ✅ |
 | 结构化事件流（16 种事件类型） | ✅ |
 | Windows 一键启动器 | ✅ |
-| `edit_file` / `delete_file` / diff / stale 检测 | ⬜ v0.1b |
+| `delete_file` | ⬜ 下一步 |
 | `run_command`（allowlist + 审批） | ⬜ 待定 |
 | 桌面 GUI（Tauri + React） | ⬜ 规划中 |
 
@@ -317,7 +318,8 @@ loom/
 │   │   ├── path_safety.py ★★★  路径越界防护
 │   │   ├── registry.py    ★★   注册表 + 统一执行入口
 │   │   ├── readonly/           list_files / read_file（自动执行）
-│   │   └── mutating/           write_file（需审批）
+│   │   └── mutating/           write_file / edit_file（需审批）
+│   │       └── _shared.py      备份 / 哈希 / 文本读取（两个写工具共用）
 │   │
 │   ├── models/                  ── 模型层 ──
 │   │   ├── adapter.py           ModelAdapter 抽象 + FakeAdapter
@@ -329,7 +331,7 @@ loom/
 │   │   ├── approve.py           审批交互
 │   │   └── main.py              入口 + 参数 + 交互 REPL
 │   │
-│   └── selfcheck_*.py           自检套件（353 项，全离线）
+│   └── selfcheck_*.py           自检套件（397 项，全离线）
 │
 ├── dev/                         开发辅助
 │   ├── loom.bat.src             启动器源文件（UTF-8）
@@ -353,14 +355,15 @@ server/  →  agent/  →  tools/
 
 ---
 
-## 工具边界（v0.1a）
+## 工具边界
 
 | 工具 | 风险 | 需审批 | 说明 |
 |---|---|---|---|
 | `list_files` | read | ❌ 自动 | 只列一层，跳过噪音目录，上限 300 条 |
 | `read_file` | read | ❌ 自动 | 40k 字符上限，多编码探测，带行号 |
 | `write_file` | write | ✅ **需确认** | 写前自动备份，`overwrite=false` 保护 |
-| `edit_file` / `delete_file` | write | ✅ | v0.1b |
+| `edit_file` | write | ✅ **需确认** | 只改一小段。**唯一匹配**；匹配到多处时拒绝而不是猜 |
+| `delete_file` | delete | ✅ | 下一步 |
 | `run_command` | exec | ✅ | 待定 |
 
 判据是 **"有没有副作用"**，不是工具名。
@@ -403,14 +406,15 @@ python -m backend.test_approval_live       # 真实交互式审批（管道喂 s
 - 审批批了 A → 实际执行的是 B
 - `/proj_evil` 被当成 `/proj` 的子目录
 
-这些都不会崩，只会静默地做错事。**353 项自检就是用来钉死这些的。**
+这些都不会崩，只会静默地做错事。**397 项自检就是用来钉死这些的。**
 
 ---
 
 ## 路线图
 
-- **v0.1b** — `edit_file` / `delete_file`（old_string 匹配、patch_conflict、hash 校验、
-  stale_content 检测、diff 展示）
+- ~~**v0.1b**~~ — ✅ `edit_file`（唯一匹配 / `patch_conflict` / `stale_content` /
+  CRLF 与 BOM 保真 / diff 审批预览）
+- **下一步** — `delete_file`（复用同一套备份与 stale 检测）
 - **v0.1c** — `run_command`（allowlist + 审批）
 - **v0.2** — 本地 HTTP + SSE 服务层（`POST /api/task` + `GET /api/stream`）
 - **v0.3** — Tauri + React 桌面端（Agent Core 零改动，只消费事件流）

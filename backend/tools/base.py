@@ -70,6 +70,14 @@ class ErrorKind(str, Enum):
     EXECUTION_ERROR = "execution_error"
     NOT_IMPLEMENTED = "not_implemented"
     INTERNAL_ERROR = "internal_error"
+    # ---- v0.1b：edit_file 引入的两类「定位失败」------------------------
+    # ★ 单独给它们类型名（而不是塞进 invalid_arguments），是因为它们
+    #   需要**完全不同的 hint**：
+    #     patch_conflict → "你给的 old_string 对不上，请重新读文件"
+    #     stale_content  → "文件已经变了，你手上的是旧内容"
+    #   混在 invalid_arguments 里，模型只会看到笼统的"参数不对"。
+    PATCH_CONFLICT = "patch_conflict"     # old_string 未找到，或匹配到多处
+    STALE_CONTENT = "stale_content"       # 文件在读取之后被改过
 
 
 # 哪些错误值得让模型换个姿势再试一次
@@ -79,6 +87,12 @@ RETRYABLE_KINDS: set[ErrorKind] = {
     ErrorKind.NOT_A_DIR,
     ErrorKind.INVALID_ARGUMENTS,
     ErrorKind.TIMEOUT,
+    # edit_file 的两类失败都是**可解决**的：重新读一次文件、或把 old_string
+    # 改得更精确，就能成功。所以标成可重试。
+    # ★ 注意：这不等于"可以原样重试"—— 参数不变的话结果必然一样，
+    #   Policy 的硬熔断会拦住（见 state.failed_before 的白名单）。
+    ErrorKind.PATCH_CONFLICT,
+    ErrorKind.STALE_CONTENT,
 }
 
 # 哪些错误属于「安全事件」，必须显著上报（前端可高亮）

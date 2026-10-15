@@ -288,12 +288,119 @@ def t5_path_boundary() -> bool:
     return c.report()
 
 
+def t6_edit_existing() -> bool:
+    """
+    ★ 这个场景专门回答一个离线测不出的问题：
+      真实模型会不会**主动选 edit_file**（而不是 write_file 整篇重写）？
+      以及它给的 old_string 是什么粒度 —— 整行？带缩进？还是带上下文？
+
+      离线 FakeAdapter 只能证明「不匹配时我 return 了 patch_conflict」，
+      证明不了「真实模型写出来的 old_string 到底长什么样」。
+    """
+    print(f"\n{'=' * 76}\n▶ t6 · 局部修改（edit_file 的真实用法）\n{'=' * 76}")
+    ws = mk("t6", {
+        "config.py": (
+            "# 应用配置\n"
+            "DEBUG = False\n"
+            "TIMEOUT = 30\n"
+            "RETRIES = 3\n"
+            "\n"
+            "\n"
+            "def get_timeout():\n"
+            "    return TIMEOUT\n"
+        ),
+    })
+    out, secs = run(ws, "把 config.py 里的超时时间从 30 秒改成 60 秒", stdin="y\ny\ny\n")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (LOG_DIR / "t6.log").write_text(out, encoding="utf-8")
+    show(out)
+
+    c = Case("t6 局部修改")
+    c.ok("任务结束：done" in out, "任务正常完成")
+    # ---- 最关键的一条：工具选择 ----
+    c.ok("edit_file" in out, "★★ 主动选了 edit_file（而不是 write_file 重写全篇）")
+    # 注意：工具清单里本来就印着 write_file，所以这里要找的是**实际调用**。
+    # 实测输出形如：`[TOOL   ] t3  → edit_file(path='config.py', ...)`
+    c.ok("→ edit_file(" in out, "★ 确实执行了 edit_file（不只是写在计划里）")
+    c.ok("调用 write_file" not in out and "→ write_file(" not in out,
+         "★★ 没有退化成 write_file（实际调用里只有 edit_file）")
+
+    body = Path(ws, "config.py").read_text(encoding="utf-8")
+    c.ok("TIMEOUT = 60" in body, "★★ 磁盘上确实改成了 60")
+    c.ok("DEBUG = False" in body and "RETRIES = 3" in body, "★★ 文件其余部分没被动过")
+    c.ok(body.startswith("# 应用配置"), "★ 首行注释完好（没被 BOM/换行问题搞坏）")
+    c.ok("def get_timeout" in body, "函数定义完好")
+    c.ok("patch_conflict" not in out, "★ 一次就匹配上了（没撞 patch 冲突）")
+    shutil.rmtree(ws, ignore_errors=True)
+    return c.report()
+
+
+def t7_patch_conflict() -> bool:
+    """
+    ★ 刻意放一处**重复内容**，看模型怎么处理「改哪个」。
+
+    `MAX_RETRY = 3` 在文件里出现两次（定义处 + reset 函数里）。
+    模型的正确出路有两条：
+      · 给两次带上下文的 old_string（分别匹配）
+      · 或改用 replace_all=true
+    两条都对。要观察的是：它会不会**随便挑一个就改**（那是危险的）。
+    """
+    print(f"\n{'=' * 76}\n▶ t7 · 重复内容（patch 冲突 / replace_all）\n{'=' * 76}")
+    ws = mk("t7", {
+        "settings.py": (
+            "MAX_RETRY = 3\n"
+            "BASE_DELAY = 1\n"
+            "\n"
+            "\n"
+            "def describe():\n"
+            '    return f"retry={MAX_RETRY}, delay={BASE_DELAY}"\n'
+            "\n"
+            "\n"
+            "def reset():\n"
+            "    global MAX_RETRY, BASE_DELAY\n"
+            "    MAX_RETRY = 3\n"
+            "    BASE_DELAY = 1\n"
+        ),
+    })
+    out, secs = run(
+        ws,
+        "把 MAX_RETRY 的值从 3 改成 5。文件里有两处需要改：文件开头的定义处，"
+        "以及 reset 函数里。",
+        stdin="y\ny\ny\ny\ny\n",
+    )
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (LOG_DIR / "t7.log").write_text(out, encoding="utf-8")
+    show(out)
+
+    c = Case("t7 重复内容")
+    c.ok("任务结束：done" in out, "任务正常完成")
+    c.ok("edit_file" in out, "★ 用了 edit_file")
+
+    body = Path(ws, "settings.py").read_text(encoding="utf-8")
+    c.ok(body.count("MAX_RETRY = 5") == 2,
+         f"★★ 两处都改成了 5（实际 {body.count('MAX_RETRY = 5')} 处）")
+    c.ok("BASE_DELAY = 1" in body and "BASE_DELAY = 1" in body, "★ 无关变量没被误改")
+    c.ok("def describe" in body and "def reset" in body, "★★ 函数定义完好（没被整篇覆盖）")
+
+    # ★ 这一条是"记录观察"而非"判定对错" —— 两种路径都对，
+    #   但知道模型走的是哪条，对后续改 prompt 很有价值。
+    conflicted = (
+        "patch_conflict" in out or "出现了 2 次" in out or "无法确定" in out
+    )
+    c.ok(True, f"（观察）是否撞上冲突后才换策略：{'是' if conflicted else '否，直接给唯一匹配'}")
+
+    shutil.rmtree(ws, ignore_errors=True)
+    return c.report()
+
+
 ALL = {
     "t1": t1_project_analysis,
     "t2": t2_create_approved,
     "t3": t3_create_rejected,
     "t4": t4_multi_file,
     "t5": t5_path_boundary,
+    "t6": t6_edit_existing,
+    "t7": t7_patch_conflict,
 }
 
 

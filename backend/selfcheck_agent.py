@@ -237,6 +237,191 @@ def make_context_standalone(workspace: str, *, authorized: bool = False, approva
 
 
 # --------------------------------------------------------------------------- #
+# [A2] edit_file —— v0.1b 的局部修改工具
+# --------------------------------------------------------------------------- #
+async def test_edit_file(sb: Sandbox) -> None:
+    """
+    ★ 为什么这一节要写这么多断言？
+    ────────────────────────────────────────────────────────────
+    edit_file 的失败**不会崩**，它只会：改错地方、或者改不动。
+    而"改错地方"是这套工具里后果最严重的失败 —— 用户以为只改了一处，
+    实际破坏了无关代码，而且**磁盘上已经写下去了**。
+
+    所以每条失败路径都要钉死：不只是"没崩"，
+    而是断言**错误类型**、**文件是否被动过**、以及
+    **给模型的 hint 是否足以让它自我修正**。
+    """
+    from backend.tools.mutating._shared import sha256_file
+
+    print("\n[A2] ★ edit_file（局部修改：唯一匹配 / patch 冲突 / stale 检测）")
+
+    reg = build_default_registry()
+    ctx = make_context_standalone(sb.dir, authorized=True, approval_id="apr_edit")
+    tool = reg.require("edit_file")
+
+    sb._write("edit_me.py", "def greet(name):\n    print('hi', name)\n\n\ndef other():\n    return 1\n")
+
+    # ---- ① 未授权必须被拒（纵深防御）----
+    naked = make_context_standalone(sb.dir)          # authorized=False
+    r = await tool.run(
+        {"path": "edit_me.py", "old_string": "return 1", "new_string": "return 2"}, naked
+    )
+    check(not r.ok and r.error["kind"] == "permission_denied",
+          "★ 未授权直接调 edit_file 被拒（纵深防御）")
+
+    # ---- ② 正常替换（唯一匹配）----
+    r = await tool.run(
+        {"path": "edit_me.py", "old_string": "print('hi', name)", "new_string": "print('hello', name)"},
+        ctx,
+    )
+    check(r.ok, f"唯一匹配替换成功：{r.summary[:56]}")
+    check("print('hello', name)" in sb.read("edit_me.py"), "★ 磁盘内容已更新")
+    check("return 1" in sb.read("edit_me.py"), "★★ 文件其余部分没被动过（局部修改的意义）")
+    check(r.data["action"] == "edit", "ChangeRecord.action = edit")
+    check(r.data["replaced"] == 1, "替换 1 处")
+    check(r.data["removed_lines"] == 1 and r.data["added_lines"] == 1, "行数统计正确（1 → 1）")
+    check(bool(r.data["change"]["backup_path"]), "★ 改前已备份")
+
+    # ---- ③ 备份里是改动前的原内容（可还原）----
+    # 注意：不能用 lstrip("./") —— lstrip 会去掉**所有**前导的 `.` 和 `/`，
+    # 把 "./.loom_backup/..." 啃成 "loom_backup/..."（少了一层目录）。
+    bp = r.data["change"]["backup_path"]
+    rel_b = (bp[2:] if bp.startswith("./") else bp).replace("/", os.sep)
+    with open(os.path.join(sb.dir, rel_b), encoding="utf-8") as f:
+        check("print('hi', name)" in f.read(), "★ 备份内容 = 改动前原文件（能还原）")
+
+    # ---- ④ old_string 未找到 → patch_conflict ----
+    r = await tool.run(
+        {"path": "edit_me.py", "old_string": "这段内容根本不存在", "new_string": "x"}, ctx
+    )
+    check(not r.ok and r.error["kind"] == "patch_conflict",
+          f"未找到 → patch_conflict（实际 {r.error['kind']}）")
+    check(r.error["retryable"] is True, "★ patch_conflict 标为可重试（改 old_string 就能成功）")
+    check("read_file" in r.error["hint"], "★ hint 让模型先 read_file 确认实际内容")
+    check("第" in r.error["hint"] or "行" in r.error["hint"], "★ hint 给出了行号线索")
+
+    # ---- ⑤ ★ 缩进不一致时，hint 要能指出来（模型最常犯的错）----
+    r = await tool.run(
+        {"path": "edit_me.py",
+         "old_string": "        print('hello', name)",          # 8 个空格，文件里只有 4 个
+         "new_string": "        print('x', name)"},
+        ctx,
+    )
+    check(not r.ok and r.error["kind"] == "patch_conflict", "缩进不一致 → patch_conflict")
+    check("缩进" in r.error["hint"] or "空格" in r.error["hint"],
+          "★★ hint 指出是缩进/空格问题（否则模型猜不到为什么'看起来一样'却匹配不上）")
+
+    # ---- ⑥ ★★ 唯一性：出现多次必须拒绝（本工具最重要的一条）----
+    sb._write("dup.py", "x = 1\ny = 1\nz = 1\n")
+    r = await tool.run({"path": "dup.py", "old_string": "= 1", "new_string": "= 2"}, ctx)
+    check(not r.ok and r.error["kind"] == "patch_conflict", "★ 多处匹配 → 拒绝")
+    check("3" in r.summary, f"summary 说明了出现次数：{r.summary[:50]}")
+    check(bool(r.data and r.data.get("lines")), f"★ data 给出各匹配的行号：{r.data.get('lines')}")
+    check("上下文" in r.error["hint"] and "replace_all" in r.error["hint"],
+          "★★ hint 给出两条出路：补上下文 或 replace_all=true")
+    check(sb.read("dup.py") == "x = 1\ny = 1\nz = 1\n",
+          "★★★ 被拒绝时文件必须**原封不动**（不许改一半）")
+
+    # ---- ⑦ replace_all=true → 全部替换 ----
+    r = await tool.run(
+        {"path": "dup.py", "old_string": "= 1", "new_string": "= 2", "replace_all": True}, ctx
+    )
+    check(r.ok and r.data["replaced"] == 3, f"replace_all 替换 3 处（实际 {r.data.get('replaced')}）")
+    check(sb.read("dup.py") == "x = 2\ny = 2\nz = 2\n", "替换结果正确")
+    check(r.data["removed_lines"] == 3 and r.data["added_lines"] == 3,
+          "多处替换时行数统计按倍率算对")
+
+    # ---- ⑧ old_string 为空 → 必须拦（否则等于往文件开头插入）----
+    r = await tool.run({"path": "dup.py", "old_string": "", "new_string": "X"}, ctx)
+    check(not r.ok and r.error["kind"] == "invalid_arguments", "★ old_string 为空被拒")
+
+    # ---- ⑨ old == new → 无意义 ----
+    r = await tool.run({"path": "dup.py", "old_string": "x = 2", "new_string": "x = 2"}, ctx)
+    check(not r.ok and r.error["kind"] == "invalid_arguments", "old_string == new_string 被拒")
+
+    # ---- ⑩ new_string 留空 = 删除该段 ----
+    r = await tool.run({"path": "dup.py", "old_string": "z = 2\n", "new_string": ""}, ctx)
+    check(r.ok, "new_string 留空表示删除这段")
+    check("z = 2" not in sb.read("dup.py"), "★ 该段确实被删掉了（不是留了个空行）")
+
+    # ---- ⑪ 文件不存在 → not_found（edit 不负责创建）----
+    r = await tool.run({"path": "no_such.py", "old_string": "a", "new_string": "b"}, ctx)
+    check(not r.ok and r.error["kind"] == "not_found", "文件不存在 → not_found")
+    check("write_file" in r.error["hint"], "★ hint 建议改用 write_file 建新文件")
+
+    # ---- ⑫ ★★ stale_content：文件在读取之后被改过 ----
+    sb._write("stale.py", "value = 1\n")
+    stale_old_hash = sha256_file(sb.path("stale.py"))
+    sb._write("stale.py", "value = 1  # 别人改了这一行\n")     # 模拟"这期间文件被改了"
+    r = await tool.run(
+        {"path": "stale.py", "old_string": "value = 1", "new_string": "value = 2",
+         "expect_hash": stale_old_hash},
+        ctx,
+    )
+    check(not r.ok and r.error["kind"] == "stale_content",
+          f"★ hash 不符 → stale_content（实际 {r.error['kind']}）")
+    check("read_file" in r.error["hint"], "★ hint 让模型重新读取最新内容")
+    check("别人" in sb.read("stale.py"), "★★ 拒绝时文件没被改动")
+
+    # ---- ⑬ hash 匹配时正常执行 ----
+    good_hash = sha256_file(sb.path("stale.py"))
+    r = await tool.run(
+        {"path": "stale.py", "old_string": "value = 1", "new_string": "value = 2",
+         "expect_hash": good_hash},
+        ctx,
+    )
+    check(r.ok, "hash 匹配时正常执行")
+
+    # ---- ⑭ ★★ CRLF 文件：行尾风格必须保留 ----
+    # 模型输出的换行永远是 \n，而 Windows 文件常常是 \r\n。
+    # 如果内部不归一化，这种编辑会永远失败；如果写回不还原，会把整篇文件的行尾改掉。
+    with open(sb.path("crlf.txt"), "wb") as f:
+        f.write(b"line1\r\nline2\r\nline3\r\n")
+    r = await tool.run(
+        {"path": "crlf.txt", "old_string": "line2\n", "new_string": "LINE-TWO\n"}, ctx
+    )
+    check(r.ok, "★ 模型给 \\n 也能改 \\r\\n 的文件（内部做了归一化）")
+    with open(sb.path("crlf.txt"), "rb") as f:
+        crlf_raw = f.read()
+    check(crlf_raw == b"line1\r\nLINE-TWO\r\nline3\r\n",
+          f"★★ 行尾保持 CRLF 没被整篇改成 LF（实际 {crlf_raw!r}）")
+
+    # ---- ⑮ 越界路径 ----
+    r = await tool.run({"path": "../outside.py", "old_string": "a", "new_string": "b"}, ctx)
+    check(not r.ok and r.error["kind"] == "path_outside_workspace", "越界路径被拦")
+    check(r.error["security"] is True, "标记为安全事件")
+
+    # ---- ⑯ 二进制文件被拒 ----
+    with open(sb.path("bin2.dat"), "wb") as f:
+        f.write(b"\x00\x01\x02")
+    r = await tool.run({"path": "bin2.dat", "old_string": "a", "new_string": "b"}, ctx)
+    check(not r.ok, f"二进制文件被拒（{r.error['kind']}）")
+
+    # ---- ⑰ ★★ 审批展示：给的是 diff，不是整篇内容 ----
+    sb._write("preview.py", "a = 1\nb = 2\nc = 3\n")
+    info = tool.describe_action(
+        {"path": "preview.py", "old_string": "b = 2", "new_string": "b = 99"}, ctx
+    )
+    check(info["action"] == "修改文件", f"action = {info['action']}")
+    check("preview.py" in info["target"], f"target = {info['target']}（相对路径，不泄露目录结构）")
+    check("- b = 2" in info["preview"] and "+ b = 99" in info["preview"],
+          "★★ 预览是 diff（- 旧 / + 新），不是整篇内容")
+    check("将修改" in info["impact"] and "备份" in info["impact"], "影响说明含处数与备份提示")
+
+    # ---- ⑱ ★★ 审不到就提前警告：让用户别白批一次 ----
+    info2 = tool.describe_action(
+        {"path": "preview.py", "old_string": "找不到的内容", "new_string": "x"}, ctx
+    )
+    check("找不到" in info2["impact"] or "失败" in info2["impact"],
+          "★★ old_string 匹配不上时，审批界面提前警告（用户不必白批一次）")
+
+    info3 = tool.describe_action(
+        {"path": "preview.py", "old_string": "a = 1\nb = 2", "new_string": "a = 1\nb = 2\nc = 9"}, ctx
+    )
+    check("1 处" in info3["impact"], f"唯一匹配时说明替换处数：{info3['impact'][:50]}")
+
+
+# --------------------------------------------------------------------------- #
 # [B] Policy 层
 # --------------------------------------------------------------------------- #
 async def test_policy(sb: Sandbox) -> None:
@@ -1138,6 +1323,7 @@ async def main() -> int:
     print(f"沙盒工作区：{sb.dir}")
     try:
         await test_tools(sb)
+        await test_edit_file(sb)
         await test_policy(sb)
         await test_approval()
         await test_context(sb)

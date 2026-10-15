@@ -40,10 +40,7 @@ C4 要求展示三要素。这里逐个落实：
 
 from __future__ import annotations
 
-import hashlib
 import os
-import shutil
-import time
 from typing import Any
 
 from ..base import ErrorKind, Tool, ToolContext, ToolResult, timed
@@ -55,51 +52,11 @@ from ..path_safety import (
     resolve_in_workspace,
 )
 from ...agent.state import ChangeRecord, RiskLevel
+from ._shared import make_backup, sha256_file, sha256_text
 
 
 MAX_CONTENT_CHARS = 200_000       # 单次写入上限（字符）
 PREVIEW_LINES = 40                # 审批时预览的行数
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
-
-
-def _sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-    except OSError:
-        return ""
-    return h.hexdigest()[:16]
-
-
-def _make_backup(abs_path: str, ctx: ToolContext) -> tuple[str, str]:
-    """
-    备份原文件。返回 (备份绝对路径, 错误信息)。
-
-    备份目录结构：
-        <workspace>/.loom_backup/20261012-143022/src/main.py
-
-    ★ 为什么备份目录放在工作区内（而不是 %TEMP%）？
-      ① 用户可以自己去翻、去还原，路径可预期
-      ② 不跨盘复制，快
-      ③ 工作区整体拷走时备份跟着走
-      代价是需要在 .gitignore 里排除它（已配）。
-    """
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    rel = os.path.relpath(abs_path, ctx.workspace)
-    dst_dir = os.path.join(ctx.workspace, ctx.backup_dir_name or ".loom_backup", stamp)
-    dst = os.path.join(dst_dir, rel)
-
-    try:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(abs_path, dst)
-    except OSError as exc:
-        return "", f"备份失败（{exc}），已放弃写入以保护原文件"
-    return dst, ""
 
 
 class WriteFileTool(Tool):
@@ -209,8 +166,8 @@ class WriteFileTool(Tool):
             backup_path = ""
             before_hash = ""
             if existed:
-                before_hash = _sha256_file(rp.absolute)
-                backup_path, err = _make_backup(rp.absolute, ctx)
+                before_hash = sha256_file(rp.absolute)
+                backup_path, err = make_backup(rp.absolute, ctx)
                 if err:
                     return ToolResult.failure(
                         self.name, ErrorKind.EXECUTION_ERROR, err, duration_ms=t.ms
@@ -243,7 +200,7 @@ class WriteFileTool(Tool):
                 path=rp.relative,
                 action=action,
                 before_hash=before_hash,
-                after_hash=_sha256_text(content),
+                after_hash=sha256_text(content),
                 added=new_lines,
                 approval_id=ctx.approval_id,
                 backup_path=display_path(ctx.workspace, backup_path) if backup_path else "",

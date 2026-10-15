@@ -154,11 +154,11 @@ class ToolRegistry:
 # --------------------------------------------------------------------------- #
 def build_default_registry(*, include_mutating: bool = True) -> ToolRegistry:
     """
-    构建 v0.1a 的默认工具集。
+    构建默认工具集。
 
-        readonly : list_files, read_file      （自动执行）
-        mutating : write_file                 （需审批）
-        —— v0.1b 会补 edit_file / delete_file
+        readonly : list_files, read_file       （自动执行）
+        mutating : write_file, edit_file       （需审批）
+        —— 后续会补 delete_file / run_command
 
     参数 include_mutating 允许「只读模式」：实验时可一键关掉所有写能力。
     """
@@ -170,9 +170,13 @@ def build_default_registry(*, include_mutating: bool = True) -> ToolRegistry:
     reg.register(make_read(), group="readonly")
 
     if include_mutating:
+        from .mutating.edit_file import make as make_edit
         from .mutating.write_file import make as make_write
 
+        # ★ 注册顺序不影响模型看到的顺序（to_specs 会按名字排序），
+        #   这里 write 在前只是因为它是先写的。
         reg.register(make_write(), group="mutating")
+        reg.register(make_edit(), group="mutating")
 
     return reg
 
