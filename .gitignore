@@ -1,0 +1,46 @@
+# ---- 密钥（★ 绝对不要提交）----
+.env
+.env.local
+*.key
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Agent 运行时产物 ----
+.loom_backup/
+*.loom.log
+
+# ---- 启动器状态 ----
+# loom.bat 会把上次选的工作目录记在这里，方便下次直接回车复用。
+# 属于个人本机状态，不该进版本库（换台机器路径就不一样了）。
+.loom_last_workspace
+
+# ---- 沙箱 / 真实模型跑批的输出 ----
+sandbox/live/
+sandbox/*.bin
+sandbox/*.log
+
+# ---- 内部文档（面向项目作者，含本机环境细节，不适合放进公开仓库）----
+README(to us).md
+
+# ---- 前端 / Node ----
+node_modules/
+frontend/dist/
+frontend/src-tauri/target/
+npm-debug.log*
+yarn-error.log*
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

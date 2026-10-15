@@ -1,0 +1,21 @@
+# ============================================================
+# Loom Agent v0.1 · Python 依赖
+# 安装：.venv/Scripts/python.exe -m pip install -r requirements.txt
+# 国内加速：-i https://pypi.tuna.tsinghua.edu.cn/simple
+# ============================================================
+
+# ---- Web 服务层（P10 起用；v0.1a CLI 阶段不强制） ----
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# ---- 模型调用（百炼 / DeepSeek 都走 OpenAI 兼容协议，C5） ----
+openai>=1.30.0
+httpx>=0.27.0
+
+# ---- 配置 ----
+pydantic>=2.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+
+# ---- HTTPS 证书（替代旧项目的 verify=False，见 Step1 分析报告） ----
+certifi

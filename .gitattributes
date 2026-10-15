@@ -1,0 +1,11 @@
+# 统一换行符处理，避免跨平台 checkout 出乱子
+* text=auto
+
+# ★ 批处理文件必须保持 CRLF
+#   cmd 读 .bat 时对行尾敏感，而 git 默认的 autocrlf 在不同环境下
+#   （Windows / WSL / macOS）行为不一致，会让同一个仓库检出的 .bat 行尾不同。
+#   这里显式钉死，谁都别改。
+*.bat text eol=crlf
+
+# Shell 脚本用 LF
+*.sh text eol=lf
