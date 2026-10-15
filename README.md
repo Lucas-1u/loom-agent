@@ -75,8 +75,8 @@ Loom 反过来做：不用 LangChain 之类的编排层，核心机制全部手�
 ### 先看它跑（不需要 API Key）
 
 ```bash
-git clone <REPO_URL>
-cd loom
+git clone https://github.com/Lucas-1u/loom-agent.git
+cd loom-agent
 
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt      # Windows
@@ -452,4 +452,4 @@ python -m backend.test_approval_live       # 真实交互式审批（管道喂 s
 
 ## License
 
-暂未指定。
+[MIT](LICENSE) —— 随意使用、修改、分发，保留版权声明即可。
