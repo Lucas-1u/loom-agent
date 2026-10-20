@@ -1,5 +1,4 @@
 import type { EventEnvelope } from "../types/events";
-import { sortBySeq } from "../features/task/selectors";
 import { EventCard } from "./EventCard";
 
 /**
@@ -15,7 +14,7 @@ export function EventTimeline({
   events: EventEnvelope[];
   onApprovalResolve?: (id: string, approved: boolean) => void;
 }) {
-  const ordered = sortBySeq(events);
+  const ordered = [...events].sort((a, b) => a.seq - b.seq);
 
   return (
     <div className="relative">

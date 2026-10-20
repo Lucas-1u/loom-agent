@@ -1,21 +1,21 @@
-import type { ChatMessage as ChatMessageT } from "../types/chat";
+import type { Message } from "../features/session/types";
 import { Markdown } from "./Markdown";
 
 /**
  * 单条聊天消息
  *
- * 三种角色的视觉差异（用户是从「谁说的」判断的，不是从颜色猜的）：
- *   user      → 右对齐气泡，蓝色调，让人一眼看到自己说了什么
+ * 三种角色的视觉差异（用户靠"谁说"判断，不靠颜色猜）：
+ *   user      → 右对齐气泡，蓝色调
  *   assistant → 左对齐，无气泡，接近文档排版（长文更好读）
  *   system    → 居中窄条，用于错误/系统提示
  */
-export function ChatMessage({ msg }: { msg: ChatMessageT }) {
+export function ChatMessage({ msg }: { msg: Message }) {
   if (msg.role === "user") {
     return (
       <div className="loom-enter flex justify-end">
         <div className="max-w-[76%] rounded-2xl rounded-br-md border border-tone-blue/25 bg-tone-blue/10 px-3.5 py-2">
           <p className="selectable whitespace-pre-wrap break-words text-[13px] leading-[1.7] text-slate-100">
-            {msg.text}
+            {msg.content}
           </p>
         </div>
       </div>
@@ -26,13 +26,12 @@ export function ChatMessage({ msg }: { msg: ChatMessageT }) {
     return (
       <div className="loom-enter flex justify-center">
         <div className="rounded-md border border-tone-red/25 bg-tone-red/5 px-3 py-1.5">
-          <p className="selectable text-[11.5px] text-tone-red/90">{msg.text}</p>
+          <p className="selectable text-[11.5px] text-tone-red/90">{msg.content}</p>
         </div>
       </div>
     );
   }
 
-  // assistant
   return (
     <div className="loom-enter flex gap-2.5">
       <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-ink-700 bg-ink-850">
@@ -42,7 +41,7 @@ export function ChatMessage({ msg }: { msg: ChatMessageT }) {
         </svg>
       </div>
       <div className="min-w-0 flex-1 pt-0.5">
-        <Markdown text={msg.text} />
+        <Markdown text={msg.content} />
       </div>
     </div>
   );

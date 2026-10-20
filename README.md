@@ -141,27 +141,42 @@ python -m backend.cli -w D:/some/project "分析这个项目的结构"
 ```bash
 cd frontend
 npm install
-npm run dev          # http://localhost:5173
+npm run dev              # http://localhost:5173
+npm run test:workspace   # 路径规范化 / 分组逻辑的单元测试（26 项）
 ```
 
-**两个视图，同一份状态：**
+**三栏布局：左侧按工作目录分组的会话列表 + 中央双视图 + 底部工作区与输入框。**
 
 | 视图 | 看什么 |
 |---|---|
 | 聊天视图 | 日常对话：用户消息、Markdown 答复、运行状态 |
 | 执行流 | Agent 的每一步：PLAN / TOOL_CALL / TOOL_RESULT / 审批 / 最终回答 |
 
-切换视图**只换渲染方式**，事件数组原地不动 —— 所以「切换不丢数据、不中断任务」
-是结构性保证，而不是靠同步两份状态做到的。
+**四层数据模型**（详细说明见 `frontend/src/features/session/`）：
 
-**调试参数**（便于截图和分享某一屏）：
+```
+Session（有自己的工作目录）
+  └── Task（一次具体执行，有自己的 task_id 和事件流）
+        ├── Message（可读对话，不是每条事件都算）
+        └── AgentEvent（执行过程）
+```
+
+**几条硬规则：**
+
+- **历史会话按工作目录分组**，不按时间。分组 key 是**完整规范化路径**，
+  所以 `D:\Projects\demo-app` 和 `E:\Experiments\demo-app` 是两组（界面会自动加长显示名区分）。
+- **切换视图只换渲染**，`SET_VIEW` 只改一个字段，不碰任何数据。
+- **切换会话不重新执行任务**，`SET_ACTIVE_SESSION` 只改选中项。
+- **同一会话多个 Task 时**，执行流顶部会出现任务选择器，事件不会串台。
+
+**调试参数**：
 
 | 参数 | 作用 |
 |---|---|
 | `?view=execution` | 直接打开执行流视图 |
 | `?view=execution&scroll=top` | 从时间线开头看，而不是贴底 |
 
-**当前进度**：布局骨架 / 双视图 / 事件语义配色 / 长内容折叠 / 自动滚动 / 响应式都已就绪。
+**当前进度**：布局 / 会话分组 / 双视图 / 事件配色 / 折叠 / 自动滚动 / 响应式都已就绪。
 **下一步**（Phase 3）：FastAPI + SSE 桥，把演示数据换成真实事件；随后接审批交互。
 
 ---

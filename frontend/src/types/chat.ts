@@ -30,6 +30,15 @@ export interface ChatMessage {
 
 /** 前端侧的审批条目（比后端多几个 UI 状态字段） */
 export interface ApprovalItem extends ApprovalRequestData {
+  /**
+   * ★ 归属信息 —— 后端事件契约里没有这两个字段，
+   *   但前端在 reducer 里从 `event.task_id` 反查出 session 后补上。
+   *   作用：切换会话时，**绝不能**把别的 Session 的待审批显示出来，
+   *        也绝不能把按钮接到错误的 task 上。
+   */
+  session_id?: string;
+  task_id?: string;
+
   /** 已提交决策、等待后端确认 —— 用于禁用按钮防重复点击 */
   submitting?: boolean;
   /** 本地已知的最终状态 */

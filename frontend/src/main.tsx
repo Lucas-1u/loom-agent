@@ -2,7 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import App from "./App.tsx";
-import { TaskProvider } from "./features/task/store";
+import { LoomProvider } from "./features/session/store";
 
 /**
  * 入口
@@ -12,8 +12,8 @@ import { TaskProvider } from "./features/task/store";
  */
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <TaskProvider>
+    <LoomProvider>
       <App />
-    </TaskProvider>
+    </LoomProvider>
   </StrictMode>,
 );

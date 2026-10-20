@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+screenshots/
+
+# 测试转译产物
+.tmp/

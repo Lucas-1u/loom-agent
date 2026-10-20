@@ -1,12 +1,13 @@
-import type { ApprovalItem, ChatMessage as ChatMessageT } from "../types/chat";
-import type { RunHint } from "../features/task/selectors";
+import type { Message } from "../features/session/types";
+import type { ApprovalItem } from "../types/chat";
+import type { RunHint } from "../features/events/runHint";
 import { useAutoScroll } from "../hooks/useAutoScroll";
 import { ChatMessage } from "./ChatMessage";
 
 /**
  * 聊天视图
  *
- * 它只消费两样东西：`messages`（从事件投影）和 `runHint`（从最后一条事件推断）。
+ * 它只消费两样东西：`messages`（当前 Session 的 Message）和 `runHint`（从当前 Task 的最后一条事件推断）。
  * ★ 没有任何"前端计时器假装在跑"的逻辑 —— 状态一律来自真实事件。
  */
 export function ChatView({
@@ -15,7 +16,7 @@ export function ChatView({
   pendingApprovals,
   onGoToExecution,
 }: {
-  messages: ChatMessageT[];
+  messages: Message[];
   runHint: RunHint | null;
   pendingApprovals: ApprovalItem[];
   onGoToExecution: () => void;
@@ -52,7 +53,7 @@ export function ChatView({
       <div ref={ref} onScroll={onScroll} className="h-full overflow-y-auto overscroll-contain">
         <div className="mx-auto max-w-[820px] space-y-5 px-5 py-5">
           {messages.map((m) => (
-            <ChatMessage key={m.id} msg={m} />
+            <ChatMessage key={m.message_id} msg={m} />
           ))}
 
           {/* 运行状态（真实事件推断，不是假动画） */}
