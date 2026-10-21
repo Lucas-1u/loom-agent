@@ -224,7 +224,6 @@ export default function App() {
         onModelChange={(m) => dispatch({ type: "SET_MODEL", model: m })}
         connection={state.connection}
         demo={state.demo}
-        taskRunning={busy}
       />
 
       <div className="flex min-h-0 flex-1">
