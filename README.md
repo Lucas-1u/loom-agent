@@ -133,6 +133,24 @@ python -m backend.cli -w D:/some/project "分析这个项目的结构"
 
 工作目录支持**拖文件夹进窗口**，也支持**直接回车复用上次的**（记忆在 `.loom_last_workspace`）。
 
+**想让 GUI 也能一键启动？**
+
+`loom.bat` 是命令行版。GUI 版是根目录的 `loom-gui.bat`（会装依赖、查端口、起 Vite、自动开浏览器）。
+
+如果不想每次都先进到项目目录，可以把启动器装到桌面：
+
+```bash
+python dev/install_desktop.py            # 装到桌面（生成 Loom.bat）
+python dev/install_desktop.py --where    # 只看会装到哪，不写文件
+python dev/install_desktop.py --remove   # 卸载
+```
+
+桌面上的 `Loom.bat` 只是**跳板**：切到项目目录后 `call loom-gui.bat`。
+真正的启动逻辑只在项目里维护一份，不会出现「桌面版和项目版行为不一致」。
+
+> 安装时会把 `__LOOM_HOME__` 占位符替换成当前项目路径 —— 不用手改。
+> 项目挪了位置，重跑一次安装脚本即可。
+
 ### GUI 界面（Phase 2 · 演示数据）
 
 前端已可用，但**还没接后端** —— 界面里的事件是手写的演示数据，不是真实执行记录。

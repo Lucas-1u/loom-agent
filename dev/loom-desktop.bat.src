@@ -1,0 +1,39 @@
+@echo off
+chcp 936 >nul
+setlocal
+
+REM ==========================================================================
+REM  Loom 桌面启动器
+REM
+REM  作用：从桌面（或任意位置）一键启动 Loom GUI。
+REM
+REM  ★ 为什么不直接把 loom-gui.bat 复制到桌面？
+REM    因为那玩意儿用 %~dp0 定位项目（"脚本自己所在的目录"）。
+REM    复制到桌面后 %~dp0 变成桌面，它就会去找 桌面\frontend\ —— 找不到。
+REM
+REM  ★ 这个脚本只做两件事：切到项目目录 + 调用项目里的 loom-gui.bat。
+REM    真正的启动逻辑（装依赖 / 查端口 / 起 vite）只在那边维护一份，
+REM    不会出现"桌面版和项目版行为不一致"。
+REM
+REM  ★ 如果哪天把项目挪了位置，改下面这一行就行
+REM    （或者重新跑一次 dev/install_desktop.py，它会自动填成当前路径）
+REM ==========================================================================
+
+set "LOOM_HOME=__LOOM_HOME__"
+
+if not exist "%LOOM_HOME%\loom-gui.bat" (
+    echo.
+    echo   [X] 找不到 Loom 项目：
+    echo       %LOOM_HOME%
+    echo.
+    echo       可能是项目被移动或改名了。
+    echo       请用记事本打开本文件，把上面那行 LOOM_HOME 改成实际路径。
+    echo.
+    pause
+    exit /b 1
+)
+
+cd /d "%LOOM_HOME%"
+call loom-gui.bat
+
+exit /b 0
