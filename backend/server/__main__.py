@@ -26,7 +26,7 @@ import sys
 import uvicorn
 
 from ..agent.core import AgentConfig
-from ..config import Config, load_dotenv_if_present
+from ..config import PROJECT_ROOT, Config, load_dotenv_if_present
 from ..models.openai_compat import OpenAICompatAdapter
 from ..tools.registry import build_default_registry
 from .app import create_app
@@ -75,7 +75,7 @@ async def amain(args: argparse.Namespace) -> int:
 
     host = args.host or cfg.server.host
     port = args.port or cfg.server.port
-    db_path = args.db or str(cfg.paths.root / "sandbox" / "loom.db")
+    db_path = args.db or str(PROJECT_ROOT / "sandbox" / "loom.db")
 
     # ---- ① 端口冲突（先查，别让 uvicorn 抛栈）----
     if not port_available(host, port):

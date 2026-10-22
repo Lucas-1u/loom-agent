@@ -156,7 +156,19 @@ class TaskRuntime:
         ★ 这个函数里**没有任何真正的 await 让出点**（hub.publish 内部只有
           deque.append 和 queue.put_nowait），所以多个投递协程不会交错，
           事件的先后顺序与 emit 顺序一致。
+
+        ★ 为什么要把 `ev.task_id` 改掉？
+          `AgentCore.run()` 内部会创建自己的 `TaskState`（自带一个新 task_id），
+          并调用 `bus.bind_task(state.task_id)` —— 于是事件里的 task_id 是
+          **Core 生成的**，和调度器分配的 task_id 不是同一个。
+          对前端来说这是致命的：按 event.task_id 去 store 里查任务会找不到。
+
+          所以这里统一改写成运行时（= 调度器/数据库）的 task_id。
+          不改 Core —— 它自己的 id 在内部仍然自洽。
         """
+        if ev.task_id != self.task_id:
+            ev.task_id = self.task_id
+
         # ---- 顺带维护服务层状态 ----
         if ev.type == "approval.request":
             self.status = "awaiting_approval"
