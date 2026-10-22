@@ -422,6 +422,96 @@ async def test_edit_file(sb: Sandbox) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [A3] read_file ↔ edit_file 的 hash 口径一致性
+# --------------------------------------------------------------------------- #
+async def test_read_hash(sb: Sandbox) -> None:
+    """
+    ★ 这条链路的实际用途：
+
+        read_file → 拿到 hash → 组织 old_string → edit_file(expect_hash=hash)
+
+    如果两边的算法、字节口径、截取长度有**任何一处**不同，链子就断了：
+      · 永远 stale  → 模型再也改不了文件（比不校验更糟）
+      · 永远匹配    → 校验形同虚设，拦不住"用旧内容覆盖新内容"
+
+    所以这里既测"能对上"，也测"该拒的时候必须拒，且不能改坏文件"。
+    """
+    from backend.tools.hashing import sha256_file
+
+    print("\n[A3] read_file ↔ edit_file 的 hash 口径")
+
+    reg = build_default_registry()
+    ctx = make_context_standalone(sb.dir, authorized=True, approval_id="apr_hash")
+
+    sb._write("hash_me.txt", "alpha\nbeta\n")
+    abs_path = sb.path("hash_me.txt")
+
+    # ---- ① read_file 的 hash == sha256_file 直算 ----
+    r = await reg.require("read_file").run({"path": "hash_me.txt"}, ctx)
+    check(r.ok, "read_file 成功")
+
+    direct = sha256_file(abs_path)
+    got = r.data.get("hash", "")
+    check(bool(direct), f"直算 hash = {direct}")
+    check(got == direct, f"★★ read_file 返回的 hash 与 sha256_file 一致（{got}）")
+
+    # ---- ② 截取规则与格式 ----
+    check(len(got) == 16, f"截取 16 位十六进制（实际 {len(got)} 位）")
+    check(all(c in "0123456789abcdef" for c in got), "全是十六进制小写字符")
+
+    # ---- ③ 分段读返回的仍是「整个文件」的 hash ----
+    r2 = await reg.require("read_file").run(
+        {"path": "hash_me.txt", "offset": 1, "limit": 1}, ctx
+    )
+    check(r2.ok and r2.data.get("range") == [1, 1], "分段读成功（只拿到第 1 行）")
+    check(r2.data.get("hash") == direct, "★★ 分段读的 hash = 整个文件的 hash（不是这段的）")
+
+    # ---- ④ 内容变化 → hash 变化 ----
+    sb._write("hash_me.txt", "alpha\nbeta\n# changed\n")
+    after = sha256_file(abs_path)
+    check(after != direct, f"内容变化后 hash 变化（{direct} → {after}）")
+
+    # ---- ⑤ 拿「读取时」的旧 hash 去编辑 → 必须 stale，且不改文件 ----
+    before_body = sb.read("hash_me.txt")
+    r3 = await reg.require("edit_file").run(
+        {
+            "path": "hash_me.txt",
+            "old_string": "beta\n",
+            "new_string": "BETA\n",
+            "expect_hash": direct,          # ← 过期
+        },
+        ctx,
+    )
+    check(not r3.ok and r3.error["kind"] == "stale_content",
+          f"★★ 旧 hash → stale_content（实际 {r3.error['kind']}）")
+    check("read_file" in r3.error.get("hint", ""), "★ hint 让模型重新读取")
+    check(sb.read("hash_me.txt") == before_body, "★★ 拒绝时文件原封不动（没覆盖新内容）")
+
+    # ---- ⑥ 重新读 → 用新 hash 编辑 → 通过 ----
+    r4 = await reg.require("read_file").run({"path": "hash_me.txt"}, ctx)
+    fresh = r4.data["hash"]
+    check(fresh == after, "重新读取拿到的就是当前 hash")
+
+    r5 = await reg.require("edit_file").run(
+        {
+            "path": "hash_me.txt",
+            "old_string": "beta\n",
+            "new_string": "BETA\n",
+            "expect_hash": fresh,           # ← 新鲜
+        },
+        ctx,
+    )
+    check(r5.ok, f"★★ 新鲜 hash → 编辑通过（{r5.summary[:44]}）")
+    check("BETA" in sb.read("hash_me.txt"), "编辑确实写进去了")
+
+    # ---- ⑦ 不带 expect_hash 时照旧能编辑（向后兼容）----
+    r6 = await reg.require("edit_file").run(
+        {"path": "hash_me.txt", "old_string": "alpha\n", "new_string": "ALPHA\n"}, ctx
+    )
+    check(r6.ok, "★ 不传 expect_hash 仍然可以编辑（不破坏原有调用方式）")
+
+
+# --------------------------------------------------------------------------- #
 # [B] Policy 层
 # --------------------------------------------------------------------------- #
 async def test_policy(sb: Sandbox) -> None:
@@ -1324,6 +1414,7 @@ async def main() -> int:
     try:
         await test_tools(sb)
         await test_edit_file(sb)
+        await test_read_hash(sb)
         await test_policy(sb)
         await test_approval()
         await test_context(sb)

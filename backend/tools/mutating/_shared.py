@@ -14,7 +14,6 @@ mutating 工具的公共部件：哈希、备份、文本读取。
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import time
@@ -22,25 +21,10 @@ from dataclasses import dataclass
 
 from ..base import ToolContext
 
-
-# --------------------------------------------------------------------------- #
-# 哈希
-# --------------------------------------------------------------------------- #
-def sha256_text(text: str) -> str:
-    """内容哈希（16 位十六进制前缀，够用且好读）。"""
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
-
-
-def sha256_file(path: str) -> str:
-    """文件哈希。读不到时返回空串（调用方据此判断"没有原内容"）。"""
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-    except OSError:
-        return ""
-    return h.hexdigest()[:16]
+# ★ 哈希实现已提到 tools/hashing.py（read_file 也要用），
+#   这里 re-export 保持 write_file / edit_file 的 import 不变。
+#   关键是**同一个函数**：三处各写一份实现迟早会漂。
+from ..hashing import sha256_file, sha256_text  # noqa: F401
 
 
 # --------------------------------------------------------------------------- #

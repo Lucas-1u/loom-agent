@@ -27,6 +27,7 @@ import os
 from typing import Any
 
 from ..base import ErrorKind, Tool, ToolContext, ToolResult, timed
+from ..hashing import sha256_file
 from ..path_safety import (
     PathViolation,
     human_size,
@@ -246,6 +247,12 @@ class ReadFileTool(Tool):
                 "range": [start_idx + 1, end_idx],
                 "encoding": encoding,
                 "size": size,
+                # ★ 整个文件的 hash（不是这段内容的、也不是解码后字符串的）——
+                #   口径与 edit_file 的 expect_hash 完全一致：
+                #   同一个 sha256_file()，同一份原始字节，同样取前 16 位。
+                #   模型可以把它原样传给 edit_file；文件在这期间被改过就会被
+                #   stale_content 挡住，不会拿旧内容覆盖新内容。
+                "hash": sha256_file(rp.absolute),
             }
             if truncated_by_chars:
                 data["truncated"] = True
