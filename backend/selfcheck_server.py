@@ -280,7 +280,7 @@ async def test_hub() -> None:
     check(buffered_data.get("_truncated") is True, "★★ 缓冲副本标记 _truncated")
     check("_original_bytes" in buffered_data, f"★ 记录了原始大小（{buffered_data.get('_original_bytes')} B）")
 
-    pushed = q.get_nowait()
+    pushed = q.queue.get_nowait()
     check(pushed["event"]["data"].get("_truncated") is None, "★★ 在线广播收到的仍是原始事件（没被截断）")
     check(len(pushed["event"]["data"].get("pad", "")) == 8_000, "★ 原始 data 完整")
 
@@ -296,10 +296,10 @@ async def test_hub() -> None:
     q1 = h2.subscribe()
     q2 = h2.subscribe()
     await h2.publish("t", "s", mk("t", 1))
-    check(q1.qsize() == 1 and q2.qsize() == 1, "★ 多个订阅者都收到")
+    check(q1.queue.qsize() == 1 and q2.queue.qsize() == 1, "★ 多个订阅者都收到")
     h2.unsubscribe(q2)
     await h2.publish("t", "s", mk("t", 2))
-    check(q1.qsize() == 2 and q2.qsize() == 1, "退订后不再收到")
+    check(q1.queue.qsize() == 2 and q2.queue.qsize() == 1, "退订后不再收到")
 
 
 # --------------------------------------------------------------------------- #
@@ -356,8 +356,8 @@ async def test_runtime(db: TmpDB) -> None:
 
         # ---- 事件确实流到了 hub ----
         collected = []
-        while not q.empty():
-            collected.append(q.get_nowait())
+        while not q.queue.empty():
+            collected.append(q.queue.get_nowait())
         types = [c["event"]["type"] for c in collected]
         check("task.start" in types, "★ hub 收到了 task.start")
         check("tool.call" in types, "★ 收到了 tool.call")
@@ -394,20 +394,29 @@ async def test_runtime(db: TmpDB) -> None:
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
-async def main() -> int:
+async def run_async_suites(db: TmpDB) -> None:
+    """这几节都是纯 async，跑在同一个 loop 里。"""
+    await test_store(db)
+    await test_hub()
+    await test_runtime(db)
+    await test_scheduler(db)
+
+
+def main() -> int:
     global VERBOSE
     VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 
     print("=" * 78)
-    print("Loom Phase 3a · 服务层自检（SQLite + Hub + Runtime，全离线）")
+    print("Loom 服务层自检（Phase 3a + 3b，全离线）")
     print("=" * 78)
 
     db = TmpDB()
     print(f"临时数据库：{db.path}")
     try:
-        await test_store(db)
-        await test_hub()
-        await test_runtime(db)
+        asyncio.run(run_async_suites(db))
+        # ★ 同步跑 [F]：TestClient 会开自己的 loop，
+        #   如果此时已经在 asyncio.run 里，会报 "another loop is running"
+        test_http_and_sse(db)
     finally:
         db.cleanup()
 
@@ -424,5 +433,356 @@ async def main() -> int:
     return 0 if ok == total else 1
 
 
+
+
+# =========================================================================== #
+# Phase 3b：调度器 / SSE / HTTP
+# =========================================================================== #
+from backend.models.adapter import ModelAdapter, StreamDelta  # noqa: E402
+from backend.server.app import create_app  # noqa: E402
+from backend.server.scheduler import TaskScheduler  # noqa: E402
+
+
+class SlowAdapter(ModelAdapter):
+    """每次模型调用慢一点，用来制造真实的并发与排队窗口。"""
+
+    name = "slow"
+
+    def __init__(self, delay: float = 0.2, rounds: int = 30) -> None:
+        self.model = "slow-1"
+        self.delay = delay
+        self._inner = FakeAdapter([ModelReply(content="做完了。") for _ in range(rounds)])
+
+    async def chat_stream(self, messages, tools=None, *, temperature=None, max_tokens=None):
+        await asyncio.sleep(self.delay)
+        async for d in self._inner.chat_stream(messages, tools=tools):
+            yield d
+
+
+async def wait_until(pred, timeout: float = 10.0, interval: float = 0.05) -> bool:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if pred():
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+async def test_scheduler(db: TmpDB) -> None:
+    print("\n[D] TaskScheduler（并发上限 / 排队 / 槽位释放 / 审批校验）")
+
+    ws = tempfile.mkdtemp(prefix="loom_ws_")
+    try:
+        store = db.store()
+        await store.init()
+        for sid in ("s1", "s2", "s3"):
+            await store.upsert_session(mk_session(sid, ws=ws))
+
+        hub = EventHub()
+        sch = TaskScheduler(
+            store=store,
+            hub=hub,
+            adapter=SlowAdapter(delay=0.6),
+            registry=build_default_registry(),
+            config=AgentConfig(max_turns=2, max_seconds=20, approval_timeout_s=2, min_evidence=0),
+            max_global=2,
+        )
+
+        base_count = len(await store.list_tasks())
+
+        # ---- ① 全局上限 2 ----
+        a = await sch.submit(session_id="s1", goal="任务A", workspace=ws)
+        b = await sch.submit(session_id="s2", goal="任务B", workspace=ws)
+        c = await sch.submit(session_id="s3", goal="任务C", workspace=ws)
+
+        check(a["status"] == "running", f"A 立即 running（{a['status']}）")
+        check(b["status"] == "running", f"B 立即 running（{b['status']}）")
+        check(c["status"] == "created", f"★★ C 排队（status=created，实际 {c['status']}）")
+        check(c["queued"] is True and c["queue_position"] == 1, f"★ 排队位置 1（实际 {c.get('queue_position')}）")
+        check(sch.stats()["running"] == 2, f"全局 running = 2（实际 {sch.stats()['running']}）")
+
+        # ---- ② 同 Session 上限 1 ----
+        d = await sch.submit(session_id="s1", goal="任务D", workspace=ws)   # s1 已有 A
+        check(d["status"] == "created", "★★ 同 session 已有任务在跑 → 新任务排队")
+        check(sch.stats()["running"] == 2, "没有突破全局上限")
+
+        # ---- ③ 排队任务自动启动 ----
+        ok = await wait_until(lambda: sch.stats()["running"] >= 1 and sch.stats()["queued"] < 2, timeout=15)
+        check(ok, "★ 有槽位释放后自动拉起排队任务")
+
+        # 等本批 4 个都进终态（不看全局计数，避免被历史残留干扰）
+        mine_ids = {a["task_id"], b["task_id"], c["task_id"], d["task_id"]}
+
+        def _all_terminal() -> bool:
+            rows = store.list_tasks_sync()
+            st = {r["task_id"]: r["status"] for r in rows}
+            return all(st.get(tid) in ("done", "aborted", "failed") for tid in mine_ids)
+
+        ok = await wait_until(_all_terminal, timeout=50)
+        check(ok, f"★ 本批 4 个任务全部进入终态（running={sch.stats()['running']}, queued={sch.stats()['queued']}）")
+
+        all_rows = await store.list_tasks()
+        statuses = {r["task_id"]: r["status"] for r in all_rows}
+        # 只看本测试新建的 4 个（db 是共用的，前面 store 测试留下的 failed 不算）
+        mine = {a["task_id"], b["task_id"], c["task_id"], d["task_id"]}
+        bad = [(r["task_id"], r["status"], r["end_reason"]) for r in all_rows
+               if r["task_id"] in mine and r["status"] not in ("done", "aborted")]
+        check(not bad, f"★ 本次 4 个任务全部正常收尾（异常={bad[:2]}）")
+        check(len(statuses) - base_count == 4, f"4 个任务都创建了（实际新增 {len(statuses) - base_count}）")
+
+        # ---- ④ 幂等 ----
+        e1 = await sch.submit(session_id="s1", goal="幂等任务", workspace=ws, idem_key="K1")
+        e2 = await sch.submit(session_id="s1", goal="幂等任务", workspace=ws, idem_key="K1")
+        check(e1["task_id"] == e2["task_id"], "★★ 同幂等键 → 同一个 task_id")
+        check(e2.get("idempotent_replay") is True, "★ 标记为幂等重放")
+        check(len(await store.list_tasks()) - base_count == 5, "★ 没有多创建任务")
+
+        # ---- ⑤ 取消：排队中的任务可以直接出队 ----
+        # ★ 先等所有任务停下来 —— 否则同 session 限制会让 f1 也被排进队列
+        drained = await wait_until(_all_terminal, timeout=40)
+        check(drained, "★ 上一批任务已收尾（为并发测试腾出干净状态）")
+        # ★ 再等全局放空 —— 幂等任务 e1 不属于 mine_ids，要单独等它结束，
+        #   否则 f1(s1) 会被同 session 限制排进队列，取消测试就打不到运行中的任务
+        await wait_until(lambda: sch.stats()["running"] == 0, timeout=30)
+        await asyncio.sleep(0.2)
+
+        # 先占满两个槽位
+        f1 = await sch.submit(session_id="s1", goal="占用1", workspace=ws)
+        f2 = await sch.submit(session_id="s2", goal="占用2", workspace=ws)
+        g = await sch.submit(session_id="s3", goal="排队待取消", workspace=ws)
+        check(g["queued"] is True, "G 在排队")
+
+        r = await sch.cancel(g["task_id"])
+        check(r["accepted"] is True, "★ 排队任务取消被接受")
+        check(r["state"] == "aborted", f"★ 直接进入 aborted（实际 {r['state']}）")
+        check("未执行任何步骤" in r["note"], "★ 说明它一步都没跑")
+
+        # ---- ⑥ 取消运行中的任务：accepted 但终态要等 ----
+        r2 = await sch.cancel(f1["task_id"])
+        check(r2["accepted"] is True, f"★ 运行中的任务取消被接受（accepted={r2['accepted']}, state={r2['state']}, note={r2['note'][:40]}）")
+        check("循环边界" in r2["note"] or "aborted" in r2["note"],
+              f"★ 明确说明要到终态才算停（note={r2['note'][:46]}）")
+        # 轮询真实状态
+        stopped = await wait_until(
+            lambda: asyncio.get_event_loop().is_running() and _status_of(sch, store, f1["task_id"]) == "aborted",
+            timeout=10,
+        )
+        check(stopped, "★★ 最终状态确实变成 aborted（不是 accept 就算停）")
+
+        # ---- ⑦ 已结束任务不能取消 / 审批 ----
+        done_id = a["task_id"]
+        r3 = await sch.cancel(done_id)
+        check(r3["accepted"] is False, "★ 已结束的任务 cancel 返回 False")
+
+        r4 = await sch.resolve_approval(done_id, "apr_x", "approved")
+        check(r4["accepted"] is False and r4["reason"] in ("task_not_running", "task_finished"),
+              f"★ 已结束任务审批被拒（{r4.get('reason')}）")
+
+        # ---- ⑧ 审批 id 不匹配 ----
+        # 用一个假 runtime 直接测校验分支（不起真审批，节省时间）
+        r5 = await sch.resolve_approval("no_such_task", "apr_x", "approved")
+        check(r5["accepted"] is False, "★ 不存在的任务审批被拒")
+
+        await sch.shutdown(timeout=3)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+def _status_of(sch, store, task_id: str) -> str:
+    rt = sch.runtime_of(task_id)
+    if rt is not None:
+        return rt.status
+    row = store.get_task_sync(task_id)
+    return row["status"] if row else ""
+
+
+
+
+def test_http_and_sse(db: TmpDB) -> None:
+    """HTTP 端点 + SSE（同步 TestClient，它内部有自己的 loop）。"""
+    import asyncio as _aio
+    from fastapi.testclient import TestClient
+    from backend.server.app import sse_frame
+
+    print("\n[F] HTTP 端点 + SSE")
+
+    ws = tempfile.mkdtemp(prefix="loom_ws_")
+    try:
+        store = db.store()
+        store.init_sync()
+        store.upsert_session_sync(mk_session("s_http", ws=ws))
+
+        hub = EventHub()
+        sch = TaskScheduler(
+            store=store, hub=hub, adapter=SlowAdapter(delay=0.1),
+            registry=build_default_registry(),
+            config=AgentConfig(max_turns=2, max_seconds=20, approval_timeout_s=2, min_evidence=0),
+            max_global=2,
+        )
+        app = create_app(store=store, hub=hub, scheduler=sch)
+        client = TestClient(app)
+
+        # ---- health ----
+        r = client.get("/api/health")
+        check(r.status_code == 200, f"health 200（{r.status_code}）")
+        body = r.json()
+        check(body["ok"] is True and "scheduler" in body and "hub" in body, "health 含调度/缓冲信息")
+
+        # ---- sessions ----
+        r = client.get("/api/sessions")
+        check(r.status_code == 200 and any(s["session_id"] == "s_http" for s in r.json()["sessions"]),
+              "会话列表包含已建会话")
+
+        r = client.post("/api/sessions", json={"title": "新会话", "workspace": ws})
+        check(r.status_code == 200 and r.json()["session_id"], "新建会话")
+        new_sid = r.json()["session_id"]
+
+        # ---- 创建任务 ----
+        r = client.post("/api/tasks", json={"goal": "看看目录", "session_id": "s_http", "workspace": ws})
+        check(r.status_code == 200, f"创建任务 200（{r.status_code}）")
+        created = r.json()
+        tid = created["task_id"]
+        check(created["session_id"] == "s_http", "任务带对的 session_id")
+        check(created["status"] in ("running", "created"), f"初始状态 {created['status']}")
+
+        # ---- 异常：会话不存在 ----
+        r = client.post("/api/tasks", json={"goal": "x", "session_id": "nope", "workspace": ws})
+        check(r.status_code == 404, f"★ 不存在的会话 → 404（{r.status_code}）")
+
+        # ---- 异常：goal 为空 ----
+        r = client.post("/api/tasks", json={"goal": "", "session_id": "s_http", "workspace": ws})
+        check(r.status_code == 422, f"★ 空 goal → 422（{r.status_code}）")
+
+        # ---- 幂等：同 key 两次 ----
+        r1 = client.post("/api/tasks", json={"goal": "幂等", "session_id": new_sid, "workspace": ws},
+                         headers={"Idempotency-Key": "H1"})
+        r2 = client.post("/api/tasks", json={"goal": "幂等", "session_id": new_sid, "workspace": ws},
+                         headers={"Idempotency-Key": "H1"})
+        check(r1.json()["task_id"] == r2.json()["task_id"], "★★ HTTP 层幂等：同 key 同 task")
+        check(r2.json().get("idempotent_replay") is True, "★ 标记幂等重放")
+
+        # ---- 任务快照 ----
+        r = client.get(f"/api/tasks/{tid}")
+        check(r.status_code == 200, "任务快照 200")
+        snap = r.json()
+        check(snap["task_id"] == tid and snap["session_id"] == "s_http", "快照字段正确")
+        check("events_available" in snap, "★ 快照带事件可用性")
+
+        r = client.get("/api/tasks/no_such_task")
+        check(r.status_code == 404, "★ 不存在的任务 → 404")
+
+        # ---- 任务列表（按 session 过滤）----
+        r = client.get("/api/tasks", params={"session_id": "s_http"})
+        check(r.status_code == 200, "任务列表 200")
+        check(all(t["session_id"] == "s_http" for t in r.json()["tasks"]), "★ 列表按 session 过滤")
+
+        # ---- 取消 ----
+        r = client.post(f"/api/tasks/{tid}/cancel")
+        check(r.status_code == 200, "取消 200")
+        check("accepted" in r.json() and "note" in r.json(), "★ 取消返回 accepted + note（不假装已停）")
+
+        # ---- 审批：不匹配的 task → 409 ----
+        r = client.post("/api/approvals/apr_nope/decision",
+                        json={"task_id": tid, "decision": "approved", "reason": ""})
+        check(r.status_code == 409, f"★★ 审批不匹配 → 409（{r.status_code}）")
+        check("reason" in r.json()["detail"], "★ 409 里给出具体原因")
+
+        # ---- SSE 帧格式 ----
+        frame = sse_frame("tool.call", {"a": 1}, eid=7)
+        check(frame.startswith("id: 7\nevent: tool.call\ndata: "), "SSE 帧含 id/event/data")
+        check(frame.endswith("\n\n"), "SSE 帧以空行结束")
+        gap_frame = sse_frame("stream.gap", {"reason": "evicted"})
+        check(not gap_frame.startswith("id:"), "★★ gap 帧不写 id（不污染 Last-Event-ID）")
+
+        # ---- 补发逻辑（直接调 hub.replay，不跨 loop）----
+        from backend.events import Event as _Ev
+
+        # ★ 用一个**干净的新 hub** 测补发，避免被前面端点测试产生的事件干扰
+        iso_hub = EventHub()
+        loop = _aio.new_event_loop()
+        try:
+            async def seed():
+                for i in range(3):
+                    ev = _Ev.make("thinking", {"text": f"步骤{i}", "phase": "", "done": True},
+                                  task_id="task_sse")
+                    ev.seq = i + 1          # Event.make 不分配 seq，这里手动给
+                    await iso_hub.publish("task_sse", "s_http", ev)
+            loop.run_until_complete(seed())
+        finally:
+            loop.close()
+
+        replay, gap = iso_hub.replay(0)
+        check(gap is None, "未淘汰时不产生 gap")
+        check(len(replay) == 3, f"★ since=0 补发全部 3 条（实际 {len(replay)}）")
+        check(all("id" in r for r in replay), "★ 每条补发记录都带全局 id")
+        check(all("seq" in r["event"] for r in replay), "★★ data 里保留 event.seq（任务内序号）")
+        check(replay[0]["id"] < replay[-1]["id"], "★ 全局 id 递增")
+
+        # Last-Event-ID 语义：只补 after 的部分
+        mid = replay[1]["id"]
+        replay2, _ = iso_hub.replay(mid)
+        check(len(replay2) == 1, f"★★ Last-Event-ID=mid → 只补后面 1 条（实际 {len(replay2)}）")
+
+        # ---- 淘汰后 since 太旧 → gap ----
+        small_hub = EventHub(max_events=2)
+        loop2 = _aio.new_event_loop()
+        try:
+            async def seed_many():
+                for i in range(6):
+                    await small_hub.publish(
+                        "t", "s_http", _Ev.make("thinking", {"text": str(i)}, task_id="t")
+                    )
+            loop2.run_until_complete(seed_many())
+        finally:
+            loop2.close()
+
+        evs_gap, gap2 = small_hub.replay(0)
+        check(evs_gap == [], "★ 已淘汰的历史不补发")
+        check(gap2 is not None and gap2["type"] == "stream.gap", "★★ 淘汰后 → stream.gap")
+        check(gap2["data"]["reason"] == "evicted", "★ gap 说明原因 evicted")
+        check("快照" in gap2["data"]["note"], "★ gap 提示走快照恢复")
+        check("oldest_available" in gap2["data"], "★ 告知最旧可用 id")
+
+        # ---- 慢客户端：队列满了丢最旧、保留最新，并置 need_gap ----
+        slow_hub = EventHub(max_events=100, sub_queue_size=3)
+        slow_sub = slow_hub.subscribe()
+        loop3 = _aio.new_event_loop()
+        try:
+            async def flood():
+                for i in range(6):
+                    await slow_hub.publish(
+                        "t", "s", _Ev.make("thinking", {"text": f"e{i}"}, task_id="t")
+                    )
+            loop3.run_until_complete(flood())
+        finally:
+            loop3.close()
+
+        check(slow_sub.queue.qsize() == 3, f"★ 队列达到上限（{slow_sub.queue.qsize()}/3）")
+        check(slow_sub.need_gap is True, "★★ 慢客户端被标记 need_gap（下次读会收到 gap 帧）")
+        check(slow_sub.dropped >= 3, f"★ 记录丢弃数（{slow_sub.dropped}）")
+        # 保留的是最新的三条
+        last = slow_sub.queue.get_nowait()
+        texts = []
+        while not slow_sub.queue.empty():
+            texts.append(slow_sub.queue.get_nowait()["event"]["data"]["text"])
+        check("e5" in texts, f"★★ 保留的是最新事件（{texts}）")
+
+        # ---- 事件历史接口：不可用时明确告知 ----
+        r = client.get("/api/tasks/task_sse/events")   # 这个 task 不在 store 里
+        check(r.status_code == 404, f"★ 不存在的任务查事件 → 404（{r.status_code}）")
+
+        # ★ 收尾：把两个 scheduler 里还在跑的任务停掉，否则它们会继续写
+        #   已经被 cleanup 删掉的数据库 → "readonly database"
+        client.close()
+        loop_sd = _aio.new_event_loop()
+        try:
+            loop_sd.run_until_complete(sch.shutdown(timeout=3))
+        finally:
+            loop_sd.close()
+
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(main())

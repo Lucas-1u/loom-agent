@@ -70,11 +70,15 @@ class TaskStore:
 
         ★ `with conn:` 在 sqlite3 里是**事务上下文**（不是普通上下文管理器），
           进入时隐式 BEGIN，正常退出 commit，抛异常 rollback。
+
+        ★ 为什么这里不设 `PRAGMA journal_mode=WAL`？
+          WAL 是**数据库级持久设置**，写一次就存在文件头里。每次连接都设一遍
+          会在并发连接时争抢 WAL 头（实测偶发 `attempt to write a readonly
+          database`）。只在 `init_sync()` 里设一次即可。
         """
         conn = sqlite3.connect(self.db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA synchronous=NORMAL")
             with conn:
@@ -87,6 +91,8 @@ class TaskStore:
     # ===================================================================== #
     def init_sync(self) -> None:
         with self._tx() as conn:
+            # WAL 是**持久设置**，写一次就够（详见 _tx 的说明）
+            conn.execute("PRAGMA journal_mode=WAL")
             ver = conn.execute("PRAGMA user_version").fetchone()[0]
 
             if ver == 0:

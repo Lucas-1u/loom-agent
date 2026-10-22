@@ -52,6 +52,31 @@ SUB_QUEUE_SIZE = 2000
 PREVIEW_CHARS = 400
 
 
+class Subscriber:
+    """
+    一个 SSE 消费者。
+
+    ★ 慢客户端策略
+    ────────────────────────────────────────────────────────────
+    队列满了怎么办？**丢最旧的，保留最新的** —— 因为对"观察 Agent 执行过程"
+    这个场景来说，最新的状态比丢失的中间步骤更重要（而且丢了中间步骤还能
+    靠 gap 信号 + 快照恢复）。
+
+    同时置 `need_gap=True`：生成器下一次循环会先推一条 `stream.gap`，
+    明确告诉客户端"你中间丢了内容"。**绝不静默**。
+
+    ★ 一个客户端慢不能拖累别人：每个订阅者独立队列，
+      `put_nowait` 永不阻塞发布方（也就是永远不会阻塞 Agent）。
+    """
+
+    __slots__ = ("queue", "need_gap", "dropped")
+
+    def __init__(self, maxsize: int) -> None:
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        self.need_gap = False
+        self.dropped = 0
+
+
 class EventHub:
     """所有任务的全局事件流。单进程、单实例。"""
 
@@ -61,15 +86,17 @@ class EventHub:
         max_events: int = MAX_EVENTS,
         max_event_bytes: int = MAX_EVENT_BYTES,
         max_total_bytes: int = MAX_TOTAL_BYTES,
+        sub_queue_size: int = SUB_QUEUE_SIZE,
     ) -> None:
         self.max_events = max_events
         self.max_event_bytes = max_event_bytes
         self.max_total_bytes = max_total_bytes
+        self.sub_queue_size = sub_queue_size
 
         self._gid = 0
         self._buf: deque[dict[str, Any]] = deque()
         self._bytes = 0
-        self._subs: set[asyncio.Queue] = set()
+        self._subs: set[Subscriber] = set()
 
         # 统计（便于测试和 /api/health 观察）
         self.evicted = 0        # 被容量上限挤掉的事件数
@@ -106,16 +133,27 @@ class EventHub:
         self._trim()
 
         # ---- 广播原始事件（完整 data）----
-        for q in list(self._subs):
-            payload = {
-                "id": gid,
-                "task_id": task_id,
-                "session_id": session_id,
-                "event": event_dict,
-            }
+        payload = {
+            "id": gid,
+            "task_id": task_id,
+            "session_id": session_id,
+            "event": event_dict,
+        }
+        for sub in list(self._subs):
             try:
-                q.put_nowait(payload)
+                sub.queue.put_nowait(payload)
             except asyncio.QueueFull:
+                # 丢最旧，保留最新；并标记"需要补 gap 通知"
+                try:
+                    sub.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    sub.queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    pass
+                sub.need_gap = True
+                sub.dropped += 1
                 self.dropped += 1
 
         return rec
@@ -155,13 +193,13 @@ class EventHub:
     # ===================================================================== #
     # 订阅（SSE 消费者）
     # ===================================================================== #
-    def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=SUB_QUEUE_SIZE)
-        self._subs.add(q)
-        return q
+    def subscribe(self) -> Subscriber:
+        sub = Subscriber(self.sub_queue_size)
+        self._subs.add(sub)
+        return sub
 
-    def unsubscribe(self, q: asyncio.Queue) -> None:
-        self._subs.discard(q)
+    def unsubscribe(self, sub: Subscriber) -> None:
+        self._subs.discard(sub)
 
     @property
     def subscriber_count(self) -> int:
@@ -210,6 +248,21 @@ class EventHub:
 
         out = [r for r in self._buf if r["id"] > since]
         return out, None
+
+    # ===================================================================== #
+    # 按任务查询
+    # ===================================================================== #
+    def buffered_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        """
+        目标任务的缓冲记录（时间正序）。
+
+        O(n) 遍历 —— 缓冲上限 3000，快照调用也不频繁，够用。
+        真要优化可以再维护 task → index 的映射，但现在没必要。
+        """
+        return [r for r in self._buf if r["task_id"] == task_id]
+
+    def has_events_for(self, task_id: str) -> bool:
+        return any(r["task_id"] == task_id for r in self._buf)
 
     # ===================================================================== #
     # 统计

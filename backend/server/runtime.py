@@ -222,6 +222,10 @@ class TaskRuntime:
         state = self.core.state
         base = state.to_dict() if state else {}
 
+        # ★ 事件可用性：**看 hub 里是不是真的还有这个任务的事件**
+        #   （之前这里是 `... or True` 的恒真占位，语义是错的）
+        buffered = self._hub.buffered_for_task(self.task_id)
+
         return {
             **base,
             "task_id": self.task_id,
@@ -234,8 +238,10 @@ class TaskRuntime:
             "ended_at": self.ended_at,
             "end_reason": self.end_reason,
             "result": self.result,
-            # 告诉前端：这个任务的事件历史是否还在内存里
-            "events_available": self.status not in ("done", "aborted", "failed") or True,
+            # ---- 事件可用性（内存视角）----
+            # available=false 时前端要明确提示"事件历史不可用"，不能假装完整
+            "events_available": bool(buffered),
+            "events_buffered": len(buffered),
         }
 
     # ===================================================================== #
