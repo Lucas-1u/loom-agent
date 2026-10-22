@@ -1,10 +1,11 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppHeader } from "./components/AppHeader";
 import { ChatView } from "./components/ChatView";
 import { ExecutionFlowView } from "./components/ExecutionFlowView";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { TaskComposer } from "./components/TaskComposer";
 import { WorkspaceSelector } from "./components/WorkspaceSelector";
+import { BackendBanner } from "./components/BackendBanner";
 import {
   useActiveEvents,
   useActiveMessages,
@@ -15,27 +16,35 @@ import {
 } from "./features/session/store";
 import { disambiguateGroupLabels, groupSessionsByWorkspace } from "./features/session/selectors";
 import { deriveRunHint } from "./features/events/runHint";
-import type { Session, Task, Message } from "./features/session/types";
-import { DEMO_MODE } from "./services/config";
-import type { EventEnvelope } from "./types/events";
+import type { Session } from "./features/session/types";
+import * as api from "./services/api";
+import { DEMO_ALLOWED } from "./services/config";
+import { openEventStream, type GapInfo, type StreamEvent } from "./services/eventStream";
 
 /**
  * 应用外壳
  *
- * ★ 只做三件事：布局 / 从 store 派生视图数据 / 把用户操作翻译成 dispatch。
- *   具体渲染全在子组件里 —— App 不写任何事件渲染逻辑。
+ * ★ 启动顺序（真实后端优先）
+ *   1. mode="checking" → 打 /api/health
+ *   2. 通 → mode="real"：拉会话列表 → 选中第一个 → 拉消息与任务 → 连 SSE
+ *   3. 不通 → mode="offline"：显示「后端未启动」+ 重试 + 查看演示数据
+ *
+ *   **绝不自动进演示模式。** 演示是用户点的，而且和真实数据完全隔离。
  */
 export default function App() {
   const { state, dispatch } = useLoom();
 
-  // ---- 当前上下文 ----
   const session = useActiveSession();
   const messages = useActiveMessages();
   const task = useActiveTask();
   const events = useActiveEvents();
   const tasks = useActiveTasks();
 
-  // ---- 派生 ----
+  const [banner, setBanner] = useState<string>("");
+
+  // ------------------------------------------------------------------ //
+  // 派生
+  // ------------------------------------------------------------------ //
   const groups = useMemo(
     () => disambiguateGroupLabels(groupSessionsByWorkspace(Object.values(state.sessions))),
     [state.sessions],
@@ -46,11 +55,6 @@ export default function App() {
     [events, task],
   );
 
-  /**
-   * ★ 待审批只取**当前会话**的。
-   *   审批条目在 store 里带 `session_id` / `task_id`（reducer 从 event.task_id 反查补上），
-   *   所以这里过滤可靠 —— 不会出现"切到另一个会话，却看到上个会话的审批"。
-   */
   const pendingApprovals = useMemo(
     () =>
       Object.values(state.approvals).filter(
@@ -59,7 +63,6 @@ export default function App() {
     [state.approvals, state.activeSessionId],
   );
 
-  /** 侧栏小圆点：哪些会话有任务在跑 */
   const runningSessionIds = useMemo(() => {
     const set = new Set<string>();
     for (const t of Object.values(state.tasks)) {
@@ -70,24 +73,185 @@ export default function App() {
 
   const busy = task?.status === "running" || task?.status === "awaiting_approval";
 
-  // ---- 操作 ----
+  // ------------------------------------------------------------------ //
+  // ① 启动：健康检查 + 加载会话
+  // ------------------------------------------------------------------ //
+  const boot = useCallback(async () => {
+    dispatch({ type: "SET_MODE", mode: "checking" });
+    dispatch({ type: "SET_CONNECTION", connection: "connecting" });
+    setBanner("");
+
+    try {
+      const h = await api.health();
+      dispatch({ type: "SET_MODE", mode: "real" });
+      dispatch({ type: "SET_CONNECTION", connection: "connected" });
+      if (h.model) dispatch({ type: "SET_MODEL", model: h.model });
+
+      const sessions = await api.listSessions();
+      dispatch({ type: "HYDRATE_SESSIONS", sessions });
+
+      if (sessions.length > 0) {
+        dispatch({ type: "SET_ACTIVE_SESSION", sessionId: sessions[0].session_id });
+      }
+    } catch (exc) {
+      dispatch({ type: "SET_MODE", mode: "offline" });
+      dispatch({ type: "SET_CONNECTION", connection: "error" });
+      setBanner(exc instanceof api.ApiError ? exc.note : String(exc));
+    }
+  }, [dispatch]);
+
+  // 只跑一次（演示模式下完全不碰后端）
+  useEffect(() => {
+    if (state.mode === "demo") return;
+    void boot();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ------------------------------------------------------------------ //
+  // ② SSE 订阅（只依赖 mode —— 不依赖 lastEventId，否则会疯狂重连）
+  // ------------------------------------------------------------------ //
+  const cursorRef = useRef(0);
+  cursorRef.current = state.lastEventId;
+
+  useEffect(() => {
+    if (state.mode !== "real") return;
+    // 调试开关：?nostream=1 不建 SSE（用于离线截图 / 排查事件流问题）
+    if (new URLSearchParams(window.location.search).get("nostream") === "1") return;
+
+    const close = openEventStream({
+      since: cursorRef.current > 0 ? cursorRef.current : null,
+      handlers: {
+        onEvent: (ev: StreamEvent) => {
+          dispatch({ type: "APPEND_STREAM_EVENT", sseId: ev.id, event: ev.event });
+        },
+        onGap: (info: GapInfo) => {
+          dispatch({ type: "MARK_GAP", gap: info });
+          if (info.reason === "evicted" || info.reason === "slow_client") {
+            setBanner(
+              "事件流出现缺口（服务重启或缓冲淘汰）。补不回来的部分会在执行流里明确标注，" +
+                "任务结论仍以快照为准。",
+            );
+          }
+        },
+        onState: (s) => dispatch({ type: "SET_STREAM_STATE", state: s }),
+      },
+    });
+
+    return close;
+  }, [state.mode, dispatch]);
+
+  // ------------------------------------------------------------------ //
+  // ③ 切换会话：拉该会话的消息和任务
+  // ------------------------------------------------------------------ //
+  useEffect(() => {
+    if (state.mode !== "real") return;
+    const sid = state.activeSessionId;
+    if (!sid) return;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [msgs, raw] = await Promise.all([api.sessionMessages(sid), api.listTasks(sid)]);
+        if (cancelled) return;
+        dispatch({ type: "APPEND_MESSAGES", sessionId: sid, messages: msgs });
+        dispatch({ type: "UPSERT_TASKS", tasks: raw.map(api.toTask) });
+
+        // ★ 任务加载完之后才能选任务 —— SET_ACTIVE_SESSION 是在 listTasks 之前
+        //   dispatch 的，那时 tasks 还是空的，activeTaskId 会停在 null。
+        //   这里补一次：没选中就选该会话最近的一个（后端按 created_at 升序返回）。
+        if (raw.length > 0) {
+          dispatch({ type: "SET_ACTIVE_TASK", taskId: raw[raw.length - 1].task_id });
+        }
+      } catch (exc) {
+        if (cancelled) return;
+        setBanner(exc instanceof api.ApiError ? exc.note : String(exc));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [state.activeSessionId, state.mode, dispatch]);
+
+  // ------------------------------------------------------------------ //
+  // ③b 选中任务时补齐历史事件（刷新页面后执行流不能是空的）
+  // ------------------------------------------------------------------ //
+  useEffect(() => {
+    if (state.mode !== "real") return;
+    const tid = state.activeTaskId;
+    if (!tid) return;
+    // 已经有事件了就不重复拉（实时流已经在往里塞）
+    if ((state.events[tid]?.length ?? 0) > 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await api.taskEvents(tid);
+        if (cancelled) return;
+
+        if (!r.available) {
+          // ★ 明确告知：事件历史补不回来。不能假装完整。
+          setBanner(
+            `任务 ${tid} 的事件历史不可用（${r.reason}）。${
+              r.note ?? "服务重启或缓冲淘汰后事件不保留，但任务结论仍在。"
+            }`,
+          );
+          return;
+        }
+
+        // 按全局 id 升序灌入，走和 SSE 相同的去重入口
+        for (const rec of r.events) {
+          dispatch({
+            type: "APPEND_STREAM_EVENT",
+            sseId: rec.id,
+            event: rec.event,
+          });
+        }
+      } catch (exc) {
+        if (cancelled) return;
+        setBanner(exc instanceof api.ApiError ? exc.note : String(exc));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [state.activeTaskId, state.mode, state.events, dispatch]);
+
+  // ------------------------------------------------------------------ //
+  // ④ 操作
+  // ------------------------------------------------------------------ //
   const handleViewChange = useCallback(
     (view: "chat" | "execution") => dispatch({ type: "SET_VIEW", view }),
     [dispatch],
   );
 
-  /** 新建会话：继承最近的工作目录，但保存为**自己的一份**配置 */
-  const handleNewSession = useCallback(() => {
-    const now = Date.now() / 1000;
-    const s: Session = {
-      session_id: `s_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-      title: "新建会话",
-      workspace_path: session?.workspace_path ?? "",
-      created_at: now,
-      updated_at: now,
-    };
-    dispatch({ type: "CREATE_SESSION", session: s });
-  }, [dispatch, session]);
+  const handleNewSession = useCallback(async () => {
+    if (state.mode !== "real") {
+      const now = Date.now() / 1000;
+      dispatch({
+        type: "CREATE_SESSION",
+        session: {
+          session_id: `demo_${Date.now().toString(36)}`,
+          title: "演示会话",
+          workspace_path: session?.workspace_path ?? "",
+          created_at: now,
+          updated_at: now,
+        },
+      });
+      return;
+    }
+    try {
+      const s = await api.createSession({
+        title: "新建会话",
+        workspace: session?.workspace_path ?? "",
+      });
+      dispatch({ type: "HYDRATE_SESSIONS", sessions: [...Object.values(state.sessions), s] });
+      dispatch({ type: "SET_ACTIVE_SESSION", sessionId: s.session_id });
+    } catch (exc) {
+      setBanner(exc instanceof api.ApiError ? exc.note : String(exc));
+    }
+  }, [dispatch, session, state.mode, state.sessions]);
 
   const handleSelectSession = useCallback(
     (s: Session) => dispatch({ type: "SET_ACTIVE_SESSION", sessionId: s.session_id }),
@@ -99,132 +263,172 @@ export default function App() {
     [dispatch],
   );
 
-  /** 改工作区：只动当前会话 */
+  /** 改工作区：后端没有 update 接口 → 只改本地，且明确告诉用户不会持久化 */
   const handleWorkspaceChange = useCallback(
     (path: string) => {
       if (!session || busy) return;
       dispatch({ type: "SET_SESSION_WORKSPACE", sessionId: session.session_id, path });
+      if (state.mode === "real") {
+        setBanner(
+          "工作区已在本地切换。后端暂无「更新会话」接口，所以刷新后会回到原值；" +
+            "新建的任务会用这个目录。",
+        );
+      }
     },
-    [dispatch, session, busy],
+    [dispatch, session, busy, state.mode],
   );
 
-  /**
-   * 提交任务。
-   *
-   * Phase 2（演示模式）：创建 Task 与 user Message，插两条说明事件后**立即正常结束** ——
-   *   既不伪造一整套假执行过程冒充真实运行，也不让任务永远停在 "running"。
-   * Phase 3：把 demo 那一段换成 `await api.createTask(...)` + SSE，其余逻辑不变。
-   */
   const handleSubmit = useCallback(
-    (goal: string) => {
+    async (goal: string) => {
       if (!session) return;
+      setBanner("");
 
-      const now = Date.now() / 1000;
-      const taskId = `task_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
-
-      const newTask: Task = {
-        task_id: taskId,
-        session_id: session.session_id, // ★ 明确归属，不靠隐式"当前会话"
-        goal,
-        status: DEMO_MODE ? "done" : "running",
-        started_at: now,
-        ended_at: DEMO_MODE ? now : undefined,
-        end_reason: DEMO_MODE ? "demo_mode" : undefined,
-        result: DEMO_MODE ? "（演示模式）Phase 3 接入后端后，这里会显示真实结果。" : undefined,
-      };
-
-      const userMsg: Message = {
-        message_id: `m_${taskId}_user`,
-        session_id: session.session_id,
-        task_id: taskId,
-        role: "user",
-        content: goal,
-        created_at: now,
-      };
-
-      dispatch({ type: "START_TASK", task: newTask, userMessage: userMsg });
-
-      // 首条消息 → 用 goal 生成简短标题
-      if (!session.title.trim() || session.title === "新建会话") {
+      // ---- 演示模式：不调后端，明确标注 ----
+      if (state.mode === "demo") {
+        const now = Date.now() / 1000;
+        const taskId = `demo_task_${Date.now().toString(36)}`;
         dispatch({
-          type: "SET_SESSION_TITLE",
-          sessionId: session.session_id,
-          title: goal.length > 26 ? `${goal.slice(0, 26)}…` : goal,
+          type: "START_TASK",
+          task: {
+            task_id: taskId,
+            session_id: session.session_id,
+            goal,
+            status: "done",
+            started_at: now,
+            ended_at: now,
+            end_reason: "demo_mode",
+            result: "（演示模式）没有真正执行。真实模式下这里会显示 Agent 的答复。",
+          },
+          userMessage: {
+            message_id: `m_${taskId}_user`,
+            session_id: session.session_id,
+            task_id: taskId,
+            role: "user",
+            content: goal,
+            created_at: now,
+          },
         });
+        return;
       }
 
-      if (!DEMO_MODE) return;
+      if (state.mode !== "real") {
+        setBanner("后端未连接，无法提交任务。点上面的「重试」或先启动后端。");
+        return;
+      }
 
-      // ---- 演示：两条事件说明"没有真的跑"，并正常结束 ----
-      let seq = 1000 + Math.floor(Math.random() * 100000);
-      const mk = (type: EventEnvelope["type"], data: Record<string, unknown>): EventEnvelope => {
-        seq += 1;
-        return { seq, ts: now + (seq % 100) * 0.1, task_id: taskId, turn: 0, type, data };
-      };
+      // ★ 幂等键：一次提交只生成一个，网络重试必须复用它
+      const idemKey = crypto.randomUUID();
 
-      dispatch({
-        type: "APPEND_EVENT",
-        event: mk("task.start", {
-          goal,
-          workspace: session.workspace_path,
-          model: state.model,
-        }),
-      });
-      dispatch({
-        type: "APPEND_EVENT",
-        event: mk("thinking", {
-          text:
-            "（演示模式）这条任务只展示界面反应，并没有真的调用 Agent。\n" +
-            "Phase 3 接入 HTTP + SSE 后，这里会出现真实的 PLAN / TOOL_CALL / 审批 / 最终回答。",
-          phase: "plan",
-          done: true,
-        }),
-      });
-      dispatch({
-        type: "APPEND_EVENT",
-        event: mk("task.end", {
-          status: "done",
-          answer: "（演示模式）未真正执行。",
-          reason: "demo_mode",
-        }),
-      });
+      try {
+        const snap = await api.createTask(
+          { goal, session_id: session.session_id, workspace: session.workspace_path },
+          idemKey,
+        );
+
+        const now = Date.now() / 1000;
+        const t = api.toTask(snap);
+        // ★ createTask 成功只代表"任务被受理"，不代表执行成功。
+        //   这里只登记任务和用户消息，最终状态由事件/快照决定。
+        dispatch({
+          type: "START_TASK",
+          task: t,
+          userMessage: {
+            message_id: `m_${t.task_id}_user`,
+            session_id: session.session_id,
+            task_id: t.task_id,
+            role: "user",
+            content: goal,
+            created_at: now,
+          },
+        });
+      } catch (exc) {
+        const msg = exc instanceof api.ApiError ? exc.note : String(exc);
+        setBanner(`提交失败：${msg}`);
+      }
     },
-    [dispatch, session, state.model],
+    [dispatch, session, state.mode],
   );
 
-  /** 停止任务：Phase 3 接 POST /api/tasks/{id}/cancel（必须带正确的 task_id） */
-  const handleStop = useCallback(() => {
+  const handleStop = useCallback(async () => {
     if (!task) return;
-    window.alert(
-      `停止任务将在 Phase 3 接入。\n\n目标任务：${task.task_id}\n` +
-        `所属会话：${task.session_id}\n\n` +
-        `接入后会调用 POST /api/tasks/${task.task_id}/cancel —— 只取消这一个任务，` +
-        `不影响同会话的其他任务，也不影响其他会话。`,
-    );
-  }, [task]);
+    if (state.mode !== "real") {
+      setBanner("演示模式无法取消任务。");
+      return;
+    }
+    try {
+      const r = await api.cancelTask(task.task_id);
+      // ★ accepted 只代表请求被接受，**不要**在这里把状态改成 aborted
+      setBanner(r.note || (r.accepted ? "取消请求已接受，等待任务停下…" : "取消请求未被接受"));
+    } catch (exc) {
+      setBanner(exc instanceof api.ApiError ? exc.note : String(exc));
+    }
+  }, [task, state.mode]);
 
-  /** 审批决策：Phase 5 接后端 */
-  const handleApprovalResolve = useCallback((approvalId: string, approved: boolean) => {
-    window.alert(
-      `Phase 5 才会把审批结果发给后端。\n\n本次演示：${approved ? "批准" : "拒绝"} ${approvalId}`,
-    );
-  }, []);
+  const handleApprovalResolve = useCallback(
+    async (approvalId: string, approved: boolean) => {
+      const item = state.approvals[approvalId];
+      if (!item || !item.task_id) {
+        setBanner("找不到这条审批的归属任务，已忽略。");
+        return;
+      }
+      if (state.mode !== "real") {
+        setBanner("演示模式的审批按钮不会真的生效。");
+        return;
+      }
+      dispatch({ type: "SET_APPROVAL_SUBMITTING", approvalId, submitting: true });
+      try {
+        const r = await api.decideApproval(approvalId, {
+          task_id: item.task_id,
+          decision: approved ? "approved" : "rejected",
+        });
+        if (!r.accepted) setBanner(`审批未生效：${r.note}`);
+        // 成功时不手动改状态 —— 等后端的 approval.decision 事件回来
+      } catch (exc) {
+        setBanner(exc instanceof api.ApiError ? exc.note : String(exc));
+        dispatch({ type: "SET_APPROVAL_SUBMITTING", approvalId, submitting: false });
+      }
+    },
+    [dispatch, state.approvals, state.mode],
+  );
 
   const handleGoToExecution = useCallback(
     () => dispatch({ type: "SET_VIEW", view: "execution" }),
     [dispatch],
   );
 
+  // ------------------------------------------------------------------ //
+  // 渲染
+  // ------------------------------------------------------------------ //
+  const showBanner = state.mode === "offline" || banner !== "";
+
   return (
     <div className="flex h-full flex-col overflow-hidden bg-ink-950">
       <AppHeader
         viewMode={state.viewMode}
         onViewChange={handleViewChange}
-        model={state.model}
+        model={state.model || (state.mode === "real" ? "—" : "演示")}
         onModelChange={(m) => dispatch({ type: "SET_MODEL", model: m })}
         connection={state.connection}
-        demo={state.demo}
+        demo={state.mode === "demo"}
       />
+
+      {showBanner && (
+        <BackendBanner
+          mode={state.mode}
+          streamState={state.streamState}
+          message={state.mode === "offline" ? "后端未启动" : ""}
+          detail={banner}
+          gaps={state.gaps.length}
+          demoAllowed={DEMO_ALLOWED}
+          onRetry={() => void boot()}
+          onEnterDemo={() => dispatch({ type: "ENTER_DEMO" })}
+          onExitDemo={() => {
+            dispatch({ type: "EXIT_DEMO" });
+            void boot();
+          }}
+          onDismiss={() => setBanner("")}
+        />
+      )}
 
       <div className="flex min-h-0 flex-1">
         <SessionSidebar
@@ -233,7 +437,7 @@ export default function App() {
           collapsedGroups={state.collapsedGroups}
           onToggleGroup={handleToggleGroup}
           onSelectSession={handleSelectSession}
-          onNewSession={handleNewSession}
+          onNewSession={() => void handleNewSession()}
           runningSessionIds={runningSessionIds}
           busy={false}
         />
@@ -252,13 +456,12 @@ export default function App() {
               tasks={tasks}
               activeTaskId={state.activeTaskId}
               onSelectTask={(id) => dispatch({ type: "SET_ACTIVE_TASK", taskId: id })}
-              onApprovalResolve={handleApprovalResolve}
+              onApprovalResolve={(id, ok) => void handleApprovalResolve(id, ok)}
             />
           )}
         </main>
       </div>
 
-      {/* ---- 底部：工作区选择器 + 输入框 ---- */}
       <div className="shrink-0 border-t border-ink-700 bg-ink-900">
         <div className="mx-auto w-full max-w-[1040px] px-4 pt-2.5">
           <WorkspaceSelector
@@ -272,11 +475,17 @@ export default function App() {
         </div>
 
         <TaskComposer
-          onSubmit={handleSubmit}
-          onStop={handleStop}
+          onSubmit={(goal) => void handleSubmit(goal)}
+          onStop={() => void handleStop()}
           running={busy}
           disabled={!session}
-          hint={state.demo ? "演示模式 · 不会真的调用 Agent" : undefined}
+          hint={
+            state.mode === "demo"
+              ? "演示模式 · 不会调用 Agent"
+              : state.mode === "real"
+                ? undefined
+                : "未连接后端"
+          }
         />
       </div>
     </div>

@@ -10,8 +10,27 @@ import type { EventEnvelope, TaskStatus } from "../../types/events";
 import type { ApprovalItem, ConnectionState, ViewMode } from "../../types/chat";
 import type { Message, Session, Task } from "./types";
 import { workspaceKey } from "./workspace";
-import { DEMO_MODE } from "../../services/config";
+import { DEMO_ALLOWED } from "../../services/config";
 import { DEMO_SEED } from "../../services/mock";
+import type { GapInfo, StreamState } from "../../services/eventStream";
+
+/**
+ * 应用运行模式
+ *
+ * ★ 真实后端优先，**绝不自动 fallback 到 mock**：
+ *     checking  → 正在打 /api/health
+ *     real      → 连上了，一切数据来自后端
+ *     offline   → 连不上，显示「后端未启动」+ 重试 + 「查看演示数据」
+ *     demo      → 用户**手动**点进来的，数据来自 mock，与真实数据完全隔离
+ *
+ *   为什么隔离？
+ *     如果把演示数据写进同一个 store，用户会看到"假会话混在真会话里"，
+ *     而且一旦切回真实模式，那些假数据会试图落到后端。
+ */
+export type AppMode = "checking" | "real" | "offline" | "demo";
+
+/** 已终结的任务状态。到达之后不该被增量事件改回运行态。 */
+const TERMINAL_STATUSES = new Set(["done", "aborted", "failed"]);
 
 /**
  * 统一状态中心
@@ -38,9 +57,18 @@ import { DEMO_SEED } from "../../services/mock";
 export interface LoomStore {
   // ---- UI ----
   viewMode: ViewMode;
-  demo: boolean;
+  /** 运行模式：真实后端优先，演示需手动进入 */
+  mode: AppMode;
+  /** SSE 连接状态（真实模式下才有意义） */
+  streamState: StreamState;
+  /** 与后端的粗粒度连接状态（health 的结果） */
   connection: ConnectionState;
   model: string;
+
+  /** 全局 SSE id 游标：去重基准 + 重连补发的 since */
+  lastEventId: number;
+  /** 收到的缺口通知（stream.gap），UI 据此提示"事件不完整" */
+  gaps: GapInfo[];
 
   // ---- 数据 ----
   sessions: Record<string, Session>;
@@ -65,6 +93,8 @@ export interface LoomStore {
 // --------------------------------------------------------------------------- //
 export type LoomAction =
   | { type: "SET_VIEW"; view: ViewMode }
+  | { type: "SET_MODE"; mode: AppMode }
+  | { type: "SET_STREAM_STATE"; state: StreamState }
   | { type: "SET_CONNECTION"; connection: ConnectionState }
   | { type: "SET_MODEL"; model: string }
   | { type: "CREATE_SESSION"; session: Session }
@@ -76,10 +106,25 @@ export type LoomAction =
   /** 开始一次任务：登记 Task + 落一条 user Message */
   | { type: "START_TASK"; task: Task; userMessage: Message }
   | { type: "APPEND_EVENT"; event: EventEnvelope }
+  /** ★ 带全局 id 的事件写入（SSE 用）。id 已见过则整体丢弃。 */
+  | { type: "APPEND_STREAM_EVENT"; sseId: number; event: EventEnvelope }
   | { type: "APPEND_MESSAGES"; sessionId: string; messages: Message[] }
+  /** 用后端列表**合并**任务（不删本地新增的，终态不被降级） */
+  | { type: "UPSERT_TASKS"; tasks: Task[] }
+  /**
+   * 改任务状态。
+   * `authoritative=true` 表示这是 `getTask()` 拉回来的权威状态 ——
+   * 允许它纠正本地误判；否则（增量事件）不得把终态改回运行态。
+   */
+  | { type: "SET_TASK_STATUS"; taskId: string; status: TaskStatus; authoritative?: boolean }
+  /** 用后端 Session 列表覆盖本地（真实来源是后端） */
+  | { type: "HYDRATE_SESSIONS"; sessions: Session[] }
+  | { type: "MARK_GAP"; gap: GapInfo }
+  | { type: "CLEAR_GAPS" }
   | { type: "SET_APPROVAL_SUBMITTING"; approvalId: string; submitting: boolean }
   | { type: "RESOLVE_APPROVAL"; approvalId: string; status: "approved" | "rejected" | "expired" }
-  | { type: "RESET_TO_DEMO" };
+  | { type: "ENTER_DEMO" }
+  | { type: "EXIT_DEMO" };
 
 // --------------------------------------------------------------------------- //
 // 初始状态
@@ -87,9 +132,12 @@ export type LoomAction =
 function emptyStore(): LoomStore {
   return {
     viewMode: "chat",
-    demo: false,
+    mode: "checking",
+    streamState: "closed",
     connection: "idle",
-    model: "qwen3.7-plus",
+    model: "",
+    lastEventId: 0,
+    gaps: [],
     sessions: {},
     tasks: {},
     messages: {},
@@ -105,17 +153,13 @@ function makeInitialState(): LoomStore {
   const q = new URLSearchParams(window.location.search);
   const view: ViewMode = q.get("view") === "execution" ? "execution" : "chat";
 
-  if (!DEMO_MODE) return { ...emptyStore(), viewMode: view };
+  // ★ 默认永远是"检查中"的空状态 —— 要不要进演示模式由用户点，不由代码决定。
+  //   `?demo=1` 留给截图/离线预览用（仍算"手动"）。
+  if (q.get("demo") === "1" && DEMO_ALLOWED) {
+    return { ...emptyStore(), ...DEMO_SEED(), viewMode: view, mode: "demo", collapsedGroups: {} };
+  }
 
-  const seeded = DEMO_SEED();
-  return {
-    ...emptyStore(),   // 先铺默认值（connection / model / 空的各类 Record）
-    ...seeded,         // 再用种子数据覆盖
-    viewMode: view,
-    demo: true,
-    // 演示模式下侧栏全部展开，方便一眼看到分组效果
-    collapsedGroups: {},
-  };
+  return { ...emptyStore(), viewMode: view };
 }
 
 // --------------------------------------------------------------------------- //
@@ -189,6 +233,29 @@ function reducer(state: LoomStore, action: LoomAction): LoomStore {
     case "SET_VIEW":
       // ★ 只改渲染模式。不碰 sessions / tasks / messages / events。
       return { ...state, viewMode: action.view };
+
+    case "SET_MODE":
+      return { ...state, mode: action.mode };
+
+    case "SET_STREAM_STATE":
+      return { ...state, streamState: action.state };
+
+    case "MARK_GAP":
+      // 缺口要留着让用户看见，不能悄悄吞掉
+      return { ...state, gaps: [...state.gaps, action.gap].slice(-20) };
+
+    case "CLEAR_GAPS":
+      return { ...state, gaps: [] };
+
+    case "ENTER_DEMO": {
+      // ★ 演示模式与真实数据隔离：进去时**整个换掉**，不是叠加
+      const seeded = DEMO_SEED();
+      return { ...emptyStore(), ...seeded, viewMode: state.viewMode, mode: "demo" };
+    }
+
+    case "EXIT_DEMO":
+      // 退出时同样整个清空 —— 演示数据绝不带进真实模式
+      return { ...emptyStore(), viewMode: state.viewMode, mode: "checking" };
 
     case "SET_CONNECTION":
       return { ...state, connection: action.connection };
@@ -345,6 +412,96 @@ function reducer(state: LoomStore, action: LoomAction): LoomStore {
       return next;
     }
 
+    case "APPEND_STREAM_EVENT": {
+      /**
+       * SSE 专用入口：先用**全局 id** 挡掉重复投递。
+       *
+       * 为什么不能只靠 (task_id, seq)？
+       *   两者都要用，但职责不同：
+       *     全局 id  → 断线重连补发时可能整段重来，用它快速挡掉
+       *     (task, seq) → 单任务内部的事件缺口检测（seq 是连续编号）
+       *
+       * 这里先做全局 id 判断，再交给 APPEND_EVENT 做 (task, seq) 去重。
+       */
+      if (action.sseId > 0 && action.sseId <= state.lastEventId) {
+        return state;                       // 重复投递
+      }
+      const next = reducer(state, { type: "APPEND_EVENT", event: action.event });
+      if (next === state) {
+        // 事件被 (task, seq) 判重了，但游标仍要前进，否则下次重连还会补发它
+        return action.sseId > state.lastEventId
+          ? { ...state, lastEventId: action.sseId }
+          : state;
+      }
+      return action.sseId > next.lastEventId
+        ? { ...next, lastEventId: action.sseId }
+        : next;
+    }
+
+    case "UPSERT_TASKS": {
+      /**
+       * 合并后端任务列表。
+       *
+       * ★ 不能直接覆盖：本地可能有刚提交、后端列表还没收录的任务；
+       *   也不能让列表里的旧状态把本地终态降级（列表可能略滞后）。
+       */
+      const tasks = { ...state.tasks };
+      for (const incoming of action.tasks) {
+        const prev = tasks[incoming.task_id];
+        if (!prev) {
+          tasks[incoming.task_id] = incoming;
+          continue;
+        }
+        const prevTerminal = TERMINAL_STATUSES.has(prev.status);
+        const nextTerminal = TERMINAL_STATUSES.has(incoming.status);
+        // 本地已终态、列表还不是 → 保留本地（列表滞后）
+        if (prevTerminal && !nextTerminal) continue;
+        tasks[incoming.task_id] = { ...prev, ...incoming };
+      }
+      return { ...state, tasks };
+    }
+
+    case "SET_TASK_STATUS": {
+      const prev = state.tasks[action.taskId];
+      if (!prev) return state;
+
+      // ★ 终态保护：增量事件不得把已终态改回运行态；
+      //   但 authoritative（getTask）允许纠正 —— 例如本地误判成 done，
+      //   而服务端说是 failed，应该听服务端的。
+      if (!action.authoritative) {
+        if (TERMINAL_STATUSES.has(prev.status) && !TERMINAL_STATUSES.has(action.status)) {
+          return state;
+        }
+      }
+      if (prev.status === action.status) return state;
+      return {
+        ...state,
+        tasks: { ...state.tasks, [action.taskId]: { ...prev, status: action.status } },
+      };
+    }
+
+    case "HYDRATE_SESSIONS": {
+      /**
+       * 后端是 Session 的权威来源。这里**覆盖**本地会话表，
+       * 但保留本地选中的 activeSessionId（如果它还在）。
+       */
+      const sessions: Record<string, Session> = {};
+      const messages = { ...state.messages };
+      for (const s of action.sessions) {
+        sessions[s.session_id] = s;
+        if (!messages[s.session_id]) messages[s.session_id] = [];
+      }
+      const stillThere =
+        state.activeSessionId !== null && sessions[state.activeSessionId] !== undefined;
+      return {
+        ...state,
+        sessions,
+        messages,
+        activeSessionId: stillThere ? state.activeSessionId : null,
+        activeTaskId: stillThere ? state.activeTaskId : null,
+      };
+    }
+
     case "APPEND_MESSAGES": {
       const prev = state.messages[action.sessionId] ?? [];
       const seen = new Set(prev.map((m) => m.message_id));
@@ -383,9 +540,6 @@ function reducer(state: LoomStore, action: LoomAction): LoomStore {
       };
     }
 
-    case "RESET_TO_DEMO":
-      return makeInitialState();
-
     default:
       return state;
   }
@@ -423,11 +577,12 @@ export function useActiveSession(): Session | null {
 export function useActiveMessages(): Message[] {
   const { state } = useLoom();
   const id = state.activeSessionId;
-  if (!id) return [];
-  return useMemo(
-    () => [...(state.messages[id] ?? [])].sort((a, b) => a.created_at - b.created_at),
-    [state.messages, id],
-  );
+  // ★ 必须无条件调用 useMemo：早退 `if (!id) return []` 会让 Hook 数量随状态变化，
+  //   React 会报 "change in the order of Hooks"。空值判断放在回调内部。
+  return useMemo(() => {
+    if (!id) return [];
+    return [...(state.messages[id] ?? [])].sort((a, b) => a.created_at - b.created_at);
+  }, [state.messages, id]);
 }
 
 /** 当前执行流聚焦的任务 */
@@ -440,10 +595,10 @@ export function useActiveTask(): Task | null {
 export function useActiveEvents(): EventEnvelope[] {
   const { state } = useLoom();
   const id = state.activeTaskId;
-  return useMemo(
-    () => (id ? [...(state.events[id] ?? [])].sort((a, b) => a.seq - b.seq) : []),
-    [state.events, id],
-  );
+  return useMemo(() => {
+    if (!id) return [];
+    return [...(state.events[id] ?? [])].sort((a, b) => a.seq - b.seq);
+  }, [state.events, id]);
 }
 
 /** 当前会话的任务列表（正序） */

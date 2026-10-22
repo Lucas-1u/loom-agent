@@ -5,7 +5,7 @@
  * 方便后续切换开发环境和桌面环境。」
  *
  * 所以：**任何组件都不许直接写 URL**，全部从这里取。
- * Phase 3 的 `services/api.ts` / `eventStream.ts` 也只从这里读 `API_BASE`。
+ * `services/api.ts` / `services/eventStream.ts` 也只从这里读 `API_BASE`。
  *
  * 三种运行环境的差异：
  *   · 浏览器开发（vite dev）      → http://127.0.0.1:8765
@@ -28,20 +28,29 @@ export const API_BASE: string = (
 ).replace(/\/+$/, "");
 
 /**
- * 端点路径集中定义。
+ * 端点路径集中定义 —— **与 `backend/server/app.py` 的实际路由一一对应**。
  *
- * 与任务书 §9 的参考接口一一对应，但要等 Phase 3 真正实现后
- * 才把这里的"预期路径"变成"真实路径"（见 README 的 Phase 3 说明）。
+ * ★ 曾经有个 `workspace: "/api/workspace"` 是 Phase 1 的规划遗留，
+ *   后端从来没实现过。已删除。改这个文件前请先 grep 后端 @app 路由。
  */
 export const ENDPOINTS = {
   health: "/api/health",
-  workspace: "/api/workspace",
+
+  // ---- Session ----
+  sessions: "/api/sessions",
+  sessionMessages: (id: string) => `/api/sessions/${id}/messages`,
+
+  // ---- Task ----
   tasks: "/api/tasks",
   task: (id: string) => `/api/tasks/${id}`,
   taskEvents: (id: string) => `/api/tasks/${id}/events`,
-  stream: "/api/stream",
-  approvalDecision: (id: string) => `/api/approvals/${id}/decision`,
   cancel: (id: string) => `/api/tasks/${id}/cancel`,
+
+  // ---- 审批 ----
+  approvalDecision: (id: string) => `/api/approvals/${id}/decision`,
+
+  // ---- SSE ----
+  stream: "/api/stream",
 } as const;
 
 /** 拼成完整 URL 的小工具（避免各处手写字符串拼接） */
@@ -50,10 +59,13 @@ export function url(path: string): string {
 }
 
 /**
- * 当前是否处于**演示模式**。
+ * 是否允许**手动**进入演示模式。
  *
- * Phase 2 没有后端，UI 用 mock 数据渲染。
- * Phase 3 接上后端后，把这里改成 `false`（或由 env 控制），
- * 界面上的 DEMO 徽章会自动消失。
+ * ★ 真实后端优先：应用启动先打 `/api/health`，
+ *   连不上才显示「后端未启动」+ 重试 + 「查看演示数据」按钮。
+ *   **绝不自动 fallback 到 mock** —— 那会让界面看起来能用，
+ *   实际上什么都没跑，是最容易误导人的一种"友好"。
+ *
+ * 需要彻底禁用演示入口时设 `VITE_DEMO_DISABLED=true`。
  */
-export const DEMO_MODE: boolean = import.meta.env.VITE_DEMO_MODE !== "false";
+export const DEMO_ALLOWED: boolean = import.meta.env.VITE_DEMO_DISABLED !== "true";
