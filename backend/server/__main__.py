@@ -149,6 +149,8 @@ async def amain(args: argparse.Namespace) -> int:
         # 退出前尽力收尾：取消在跑的任务并落盘
         print("\n正在关闭…")
         await scheduler.shutdown(timeout=5.0)
+        # 显式关库：连接是长生命周期的，不关会留着 -wal / -shm
+        await store.close()
 
     return 0
 

@@ -10,14 +10,27 @@ SQLite 持久化层
 ★ 并发与线程安全（这是选 SQLite 而不是 JSON 的核心原因）
 ────────────────────────────────────────────────────────────────
   多个 Task（默认上限 2）可能**同时结束**。JSON 方案里「读-改-写」会丢更新，
-  必须自己加全局锁 + 原子写。SQLite 的事务直接解决，代价是每次操作一个短连接。
+  必须自己加全局锁 + 原子写。SQLite 的事务直接解决。
 
   具体做法：
-    · 每次操作**新建一个连接**（`sqlite3.connect` 对同一文件很快），用完关掉
-      —— 绝不在多个协程间共享同一个连接对象（sqlite3 连接不是线程安全的）
+    · **进程内复用同一个连接**（懒创建，`check_same_thread=False`），
+      所有访问经 `_DB_LOCK` 串行化 —— 同一时刻只有一个线程在用它
     · 同步 API 用 `asyncio.to_thread()` 包一层，不阻塞事件循环
     · 一次操作 = 一个事务（`with conn:` 自动 commit / rollback），**绝不跨操作**
     · WAL 模式：读写不互斥；`synchronous=NORMAL` 在 WAL 下足够安全且更快
+
+★ 为什么不再"每次操作新建连接"（2026-10-25 修复）
+────────────────────────────────────────────────────────────────
+  WAL 的 `-wal` / `-shm` 由**最后一个关闭的连接**负责 checkpoint 并删除。
+  「每次操作一个短连接」意味着每次写都在做「创建 → 拆除」这套动作；
+  多线程并发下，A 正在拆 `-shm`、B 同时打开同一文件，B 会拿不到 wal-index
+  而被 SQLite 降级为只读，抛 `SQLITE_READONLY: attempt to write a readonly
+  database`。实测（8 线程并发写）：短连接 5/100 失败，单线程 0/100；
+  改成复用连接后 1200 次并发写 0 失败，且单次写从 54ms 降到 0.6ms
+  （短连接每次关闭都要 checkpoint，这才是那 54ms 的来源）。
+
+  ⚠️ 注意：WAL 本身没问题，**问题在连接生命周期**。所以这里保留 WAL，
+     改的是「不再反复开关连接」。
 
 ★ created_at 与 started_at 分开
 ────────────────────────────────────────────────────────────────
@@ -31,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -41,6 +55,20 @@ IDEM_TTL_S = 24 * 3600
 IDEM_MAX_ROWS = 1000
 
 SCHEMA_VERSION = 1
+
+# --------------------------------------------------------------------------- #
+# 进程级数据库锁
+# --------------------------------------------------------------------------- #
+# 为什么是模块级而不是每个 TaskStore 一把？
+#   测试 / 自检里会同时存在多个指向同一个文件的 TaskStore 实例
+#   （比如 `restart = db.store()`）。锁必须覆盖**文件**，不是实例。
+#
+# 为什么用 RLock？
+#   同步方法之间理论上可能嵌套调用（当前没有），RLock 让「重入」不会自锁死。
+#
+# 代价：所有读写被串行化。本应用的写频率是「每任务 3~5 次」，
+#       单次 0.6ms，串行化完全不是瓶颈；换来的是不再有连接生命周期竞争。
+_DB_LOCK = threading.RLock()
 
 
 class StoreError(RuntimeError):
@@ -59,32 +87,65 @@ class TaskStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        # 懒创建：第一次真正用到时才 connect（init 里会用到）
+        self._conn: sqlite3.Connection | None = None
 
     # ===================================================================== #
     # 连接与事务
     # ===================================================================== #
+    def _connect_locked(self) -> sqlite3.Connection:
+        """
+        取（必要时创建）本实例的连接。**调用方必须已持有 `_DB_LOCK`**。
+
+        `check_same_thread=False` 是必需的：`asyncio.to_thread` 会把同步实现
+        派到线程池里，不同操作可能落在不同线程上。
+        这么做的安全性来自两处：
+          ① 每次使用都被 `_DB_LOCK` 串行化，不存在并发访问同一个连接；
+          ② CPython 自带的 SQLite 是 serialized 模式（threadsafety=3），
+             即使真并发也只是串行执行，不会破坏内存。
+        """
+        if self._conn is None:
+            conn = sqlite3.connect(
+                self.db_path, timeout=5.0, check_same_thread=False
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn = conn
+        return self._conn
+
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
         """
-        一个短事务。成功 commit，异常 rollback，无论怎样都关连接。
+        一个短事务。成功 commit，异常 rollback。
 
         ★ `with conn:` 在 sqlite3 里是**事务上下文**（不是普通上下文管理器），
           进入时隐式 BEGIN，正常退出 commit，抛异常 rollback。
+          连接本身**不关闭** —— 复用连接，避免 WAL 反复拆除（见模块头说明）。
 
         ★ 为什么这里不设 `PRAGMA journal_mode=WAL`？
-          WAL 是**数据库级持久设置**，写一次就存在文件头里。每次连接都设一遍
-          会在并发连接时争抢 WAL 头（实测偶发 `attempt to write a readonly
-          database`）。只在 `init_sync()` 里设一次即可。
+          WAL 是**数据库级持久设置**，写一次就存在文件头里。只在 `init_sync()`
+          里设一次即可；每次连接都设一遍会在并发连接时争抢 WAL 头。
         """
-        conn = sqlite3.connect(self.db_path, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA synchronous=NORMAL")
+        with _DB_LOCK:
+            conn = self._connect_locked()
             with conn:
                 yield conn
-        finally:
-            conn.close()
+
+    def close_sync(self) -> None:
+        """
+        关闭连接（进程退出 / 测试清理时调用）。
+
+        ★ 必须显式关：Windows 上文件被打开的连接占着时目录删不掉，
+          WAL 的 `-wal` / `-shm` 也会留着。
+        """
+        with _DB_LOCK:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self.close_sync)
 
     # ===================================================================== #
     # 初始化 / 升级

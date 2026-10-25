@@ -81,6 +81,17 @@ class TaskRuntime:
         self.end_reason: str = ""
         self.result: str = ""
 
+        # ---- 落盘故障（可诊断性）----
+        # 落盘失败时不能只留一行日志：把故障记在这里，`/api/tasks/{id}` 能查到
+        self.persist_failures: int = 0
+        self.persist_error: dict[str, Any] | None = None
+
+        # ---- 落盘顺序 ----
+        # 广播前置之后，两次落盘是并发的：审批请求那次如果很慢（DB 抖动），
+        # 可能晚于审批决策那次才写完，把库里的状态**写回退**。
+        # 这把锁保证同一任务的状态转换按发生顺序落盘。
+        self._persist_lock = asyncio.Lock()
+
         # 完成信号（app.py 用它判断能不能回收），也用于测试等待
         self.finished = asyncio.Event()
 
@@ -142,8 +153,16 @@ class TaskRuntime:
         finally:
             try:
                 await self._persist_final()
-            except Exception:  # noqa: BLE001
-                log.exception("任务 %s 落盘失败", self.task_id)
+            except Exception as exc:  # noqa: BLE001
+                self._record_persist_failure(
+                    "final",
+                    exc,
+                    context=(
+                        f"status={self.status}, "
+                        f"turn={self.core.state.turn if self.core.state else None}；"
+                        f"结论只在内存里，进程重启后不可恢复"
+                    ),
+                )
             self.finished.set()
 
     # ===================================================================== #
@@ -153,9 +172,18 @@ class TaskRuntime:
         """
         EventBus 的每条事件都经过这里，转给 hub 广播。
 
-        ★ 这个函数里**没有任何真正的 await 让出点**（hub.publish 内部只有
-          deque.append 和 queue.put_nowait），所以多个投递协程不会交错，
-          事件的先后顺序与 emit 顺序一致。
+        ★ 顺序：先改内存状态 → **立刻广播** → 最后落盘。
+          之前是「先落盘再广播」，有两个后果：
+            ① 落盘是个真正的 await，会把广播推到后面，SSE 的到达顺序
+               被数据库耗时打乱（seq 是对的，但到达乱序）；
+            ② 落盘一旦抛异常，广播根本不会执行 —— 事件直接消失，
+               任务内 seq 会留下一个永远补不回来的空洞。
+          广播放在落盘之前，落盘失败就只影响"重启后能不能恢复"，
+          不影响实时事件。
+
+        ★ 广播本身没有 await 让出点（hub.publish 内部只有 deque.append 和
+          queue.put_nowait），所以多个投递协程不会交错，
+          事件顺序 == emit 顺序。
 
         ★ 为什么要把 `ev.task_id` 改掉？
           `AgentCore.run()` 内部会创建自己的 `TaskState`（自带一个新 task_id），
@@ -169,22 +197,69 @@ class TaskRuntime:
         if ev.task_id != self.task_id:
             ev.task_id = self.task_id
 
-        # ---- 顺带维护服务层状态 ----
+        # ---- ① 服务层状态（同步，先改好，快照立刻看得到）----
+        persist_status = ""
         if ev.type == "approval.request":
             self.status = "awaiting_approval"
-            # 审批等待时立刻落盘：这是"任务停在哪儿"的关键信息
-            await self._persist_state("awaiting_approval")
-
+            persist_status = "awaiting_approval"
         elif ev.type == "approval.decision":
             self.status = "running"
-            await self._persist_state("running")
-
+            persist_status = "running"
         elif ev.type == "final_answer":
             text = (ev.data or {}).get("text", "")
             if text:
                 self.result = str(text)
 
+        # ---- ② 广播：不能被落盘失败拖累 ----
         await self._hub.publish(self.task_id, self.session_id, ev)
+
+        # ---- ③ 落盘：审批等待/恢复是"任务停在哪儿"的关键信息 ----
+        if persist_status:
+            try:
+                await self._persist_state(persist_status)
+            except Exception as exc:  # noqa: BLE001
+                self._record_persist_failure(
+                    f"state:{persist_status}", exc, event_type=ev.type
+                )
+
+    def _record_persist_failure(
+        self,
+        stage: str,
+        exc: BaseException,
+        *,
+        event_type: str = "",
+        context: str = "",
+    ) -> None:
+        """
+        记一次落盘失败：计数 + 结构化字段 + 带堆栈的 ERROR 日志。
+
+        ★ 不吞异常的正确姿势：
+          调用方**已经**把该做的事（广播）做完了，这里的失败不影响实时事件，
+          只影响"重启后能不能恢复"。但必须留下足以定位的信息：
+          哪个任务、哪一步、哪类事件、什么错 —— 而不是一行 `xxx 落盘失败`。
+
+          同时写进 `persist_error`，`GET /api/tasks/{id}` 能直接查到；
+          进程还在时这是最方便的排查入口。
+        """
+        self.persist_failures += 1
+        self.persist_error = {
+            "stage": stage,
+            "event_type": event_type,
+            "error": f"{type(exc).__name__}: {exc}",
+            "at": time.time(),
+            "count": self.persist_failures,
+        }
+        log.error(
+            "任务 %s 落盘失败（stage=%s, event=%s, 第 %d 次%s）：%s: %s",
+            self.task_id,
+            stage,
+            event_type or "-",
+            self.persist_failures,
+            f", {context}" if context else "",
+            type(exc).__name__,
+            exc,
+            exc_info=exc,
+        )
 
     # ===================================================================== #
     # 控制
@@ -254,28 +329,61 @@ class TaskRuntime:
             # available=false 时前端要明确提示"事件历史不可用"，不能假装完整
             "events_available": bool(buffered),
             "events_buffered": len(buffered),
+            # ---- 落盘故障（正常情况是 0 / None）----
+            # 有值时说明「库里的快照可能是旧的」，排查入口就在这里
+            "persist_failures": self.persist_failures,
+            "persist_error": self.persist_error,
         }
 
     # ===================================================================== #
     # 落盘
     # ===================================================================== #
+    def _state_for_persist(self) -> dict[str, Any]:
+        """
+        落库用的快照。
+
+        ★ 去掉 `persist_*` 两个字段：它们是**本次进程内的诊断信息**，
+          不属于 Agent 状态。留在 state_json 里会出现
+          「这次成功了，但库里永远带着上次的报错」，反而误导。
+          诊断信息只走 `snapshot()`（HTTP 快照）和日志。
+        """
+        snap = self.snapshot()
+        snap.pop("persist_failures", None)
+        snap.pop("persist_error", None)
+        return snap
+
     async def _persist_state(self, status: str) -> None:
-        """中间状态（审批等待/恢复）落盘。"""
-        await self._store.save_task(
-            self.task_id,
-            status=status,
-            state=self.snapshot(),
-            turn=self.core.state.turn if self.core.state else None,
-        )
+        """
+        中间状态（审批等待/恢复）落盘。
+
+        ★ 两层保护，防止"慢的旧写入"覆盖"快的新写入"：
+          ① `_persist_lock`：同一任务的落盘串行执行，先发生的先写；
+          ② 状态校验：真正写之前再看一眼 `self.status` —— 如果已经被更晚的
+             事件推进了（比如 approval.request 的落盘还在排队，approval.decision
+             已经把它推到 running），就**跳过**这次旧写入。
+
+        只加锁不校验是不够的：`_persist_final` 写完之后，队列里可能还压着
+        一条 `awaiting_approval`，它会把终态盖回去。
+        """
+        async with self._persist_lock:
+            if self.status != status:
+                return
+            await self._store.save_task(
+                self.task_id,
+                status=status,
+                state=self._state_for_persist(),
+                turn=self.core.state.turn if self.core.state else None,
+            )
 
     async def _persist_final(self) -> None:
         """终态落盘：摘要字段 + 完整快照，同一个 UPDATE。"""
-        await self._store.save_task(
-            self.task_id,
-            status=self.status,
-            state=self.snapshot(),
-            end_reason=self.end_reason,
-            result=self.result,
-            ended_at=self.ended_at or time.time(),
-            turn=self.core.state.turn if self.core.state else None,
-        )
+        async with self._persist_lock:
+            await self._store.save_task(
+                self.task_id,
+                status=self.status,
+                state=self._state_for_persist(),
+                end_reason=self.end_reason,
+                result=self.result,
+                ended_at=self.ended_at or time.time(),
+                turn=self.core.state.turn if self.core.state else None,
+            )

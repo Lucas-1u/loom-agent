@@ -61,14 +61,38 @@ VERBOSE = False
 results: list[tuple[bool, str]] = []
 SCENARIO_TIMEOUT = 90.0
 
+# 每个场景的断言条数必须稳定。
+# ★ 为什么：之前 s3 里有两处 `if dec:` / `if result:` 的嵌套 check，
+#   事件一缺就少记一条，总项数在 50 / 49 / 16 之间跳 ——
+#   同一套代码，"通过率"却能变，等于没法横向比较。
+# 现在每个场景跑完都核对条数，少一条就补一条失败并写明原因。
+EXPECTED_COUNTS = {"s1": 12, "s2": 12, "s3": 18, "s4": 9}
 
-def check(cond: bool, label: str) -> None:
-    results.append((bool(cond), label))
+_UNSET = object()
+
+
+def check(cond: bool, label: str, actual: object = _UNSET) -> None:
+    """
+    记一条断言。
+
+    `actual` 显式给出时追加到标签后面 —— 失败报告里能直接看到实际值，
+    不用再回头翻日志猜。
+    """
+    text = label if actual is _UNSET else f"{label}｜实际：{actual!r}"
+    results.append((bool(cond), text))
     if cond:
         if VERBOSE:
-            print(f"  [ok] {label}")
+            print(f"  [ok] {text}")
     else:
-        print(f"  [X]  {label}")
+        print(f"  [X]  {text}")
+
+
+def ev_field(ev: dict | None, key: str, default: object = None) -> object:
+    """从 SSE 记录里安全取 `event.data[key]`（ev 为 None 时返回 default）。"""
+    if not ev:
+        return default
+    data = (ev.get("event") or {}).get("data") or {}
+    return data.get(key, default)
 
 
 # --------------------------------------------------------------------------- #
@@ -181,6 +205,9 @@ class LiveServer:
                 await asyncio.wait_for(self._task, timeout=10)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
+        # ★ 显式关库：TaskStore 复用长连接，不关的话 Windows 上
+        #   shutil.rmtree 会静默失败（文件被占用），临时目录越攒越多。
+        await self.store.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -398,16 +425,16 @@ async def scenario_sse_realtime(srv: LiveServer) -> None:
             got_call = await sse.wait_event(
                 lambda e: e["task_id"] == tid and e["event"]["type"] == "tool.call")
             check(got_call is not None, "★ 流上收到 tool.call")
-            if got_call:
-                check(got_call["event"]["data"]["tool"] == "list_files",
-                      f"工具名正确（{got_call['event']['data'].get('tool')}）")
+            # ★ 不再写成 `if got_call:` 的嵌套 —— 那样事件一缺就少记一条断言，
+            #   总项数会变。这里一律记，并把实际值带上。
+            check(ev_field(got_call, "tool") == "list_files",
+                  "工具名正确", actual=ev_field(got_call, "tool"))
 
             got_end = await sse.wait_event(
                 lambda e: e["task_id"] == tid and e["event"]["type"] == "task.end")
             check(got_end is not None, "★ 流上收到 task.end")
-            if got_end:
-                check(got_end["event"]["data"]["status"] == "done",
-                      f"终态 done（{got_end['event']['data'].get('status')}）")
+            check(ev_field(got_end, "status") == "done",
+                  "终态 done", actual=ev_field(got_end, "status"))
 
             # 全局 id 单调 + 任务内 seq 递增
             ids = [e["id"] for e in sse.events]
@@ -434,14 +461,25 @@ async def scenario_concurrent_isolation(srv: LiveServer) -> None:
             s2 = await post(client, "/api/sessions", {"title": "S2-b", "workspace": srv.workspace})
 
             # 同时提交（并发上限 4，两个都会立刻跑）
-            t1, t2 = await asyncio.gather(
-                post(client, "/api/tasks", {"goal": "GO-READ-ALPHA 任务一",
-                                            "session_id": s1["session_id"], "workspace": srv.workspace}),
-                post(client, "/api/tasks", {"goal": "GO-READ-BETA 任务二",
-                                            "session_id": s2["session_id"], "workspace": srv.workspace}),
-            )
+            try:
+                t1, t2 = await asyncio.gather(
+                    post(client, "/api/tasks", {"goal": "GO-READ-ALPHA 任务一",
+                                                "session_id": s1["session_id"], "workspace": srv.workspace}),
+                    post(client, "/api/tasks", {"goal": "GO-READ-BETA 任务二",
+                                                "session_id": s2["session_id"], "workspace": srv.workspace}),
+                )
+            except Exception as exc:  # noqa: BLE001
+                # ★ 这里以前直接抛出 httpx.HTTPStatusError，整轮测试当场退出，
+                #   后面的场景一个都不跑、也没有汇总。现在记成一条明确的失败，
+                #   剩下的断言由 runner 补齐（总项数仍然稳定）。
+                detail = ""
+                if isinstance(exc, httpx.HTTPStatusError):
+                    detail = f"｜HTTP {exc.response.status_code}：{exc.response.text[:200]}"
+                check(False, f"两个任务都创建成功｜实际：{type(exc).__name__}: {exc}{detail}")
+                return
+
             id1, id2 = t1["task_id"], t2["task_id"]
-            check(id1 != id2, "两个任务 id 不同")
+            check(id1 != id2, "两个任务 id 不同", actual=(id1, id2))
 
             ok1 = await sse.wait_event(lambda e: e["task_id"] == id1 and e["event"]["type"] == "task.end")
             ok2 = await sse.wait_event(lambda e: e["task_id"] == id2 and e["event"]["type"] == "task.end")
@@ -495,52 +533,57 @@ async def scenario_write_approval(srv: LiveServer) -> None:
             req = await sse.wait_event(
                 lambda e: e["task_id"] == tid and e["event"]["type"] == "approval.request")
             check(req is not None, "★★ 流上收到 approval.request")
-            if req is None:
-                return
 
-            data = req["event"]["data"]
-            approval_id = data["approval_id"]
-            check(data["tool"] == "write_file", f"审批的工具是 write_file（{data.get('tool')}）")
-            check(data["risk"] == "write", f"风险等级 write（{data.get('risk')}）")
-            check("e2e_out.txt" in str(data.get("target", "")), f"目标含文件名（{data.get('target')}）")
+            # ★ 即使没收到 request 也继续走完 —— 用空 data 兜底。
+            #   以前这里是 `if req is None: 补 16 条 + return`，靠人工数条数；
+            #   现在每条断言都无条件执行，条数由 EXPECTED_COUNTS 兜底。
+            data: dict = (req["event"]["data"] if req else {}) or {}
+            approval_id = str(data.get("approval_id") or "")
+
+            check(data.get("tool") == "write_file", "审批的工具是 write_file", actual=data.get("tool"))
+            check(data.get("risk") == "write", "风险等级 write", actual=data.get("risk"))
+            check("e2e_out.txt" in str(data.get("target", "")), "目标含文件名", actual=data.get("target"))
             check(bool(data.get("impact")), "带影响说明")
 
             # 审批期间：任务状态是 awaiting_approval
             mid = await get(client, f"/api/tasks/{tid}")
             check(mid["status"] in ("awaiting_approval", "running"),
-                  f"审批期间状态合理（{mid['status']}）")
+                  "审批期间状态合理", actual=mid["status"])
 
             # ---- 批准 ----
-            r = await client.post(f"/api/approvals/{approval_id}/decision",
-                                  json={"task_id": tid, "decision": "approved", "reason": ""},
-                                  timeout=20)
-            check(r.status_code == 200, f"批准返回 200（{r.status_code}）")
+            r = None
+            if approval_id:
+                r = await client.post(f"/api/approvals/{approval_id}/decision",
+                                      json={"task_id": tid, "decision": "approved", "reason": ""},
+                                      timeout=20)
+            check(r is not None and r.status_code == 200,
+                  "批准返回 200",
+                  actual=(r.status_code if r is not None else "未提交（没拿到 approval_id）"))
 
             # ---- 断言审批决策事件 + 工具执行 + 终态 ----
             dec = await sse.wait_event(
                 lambda e: e["task_id"] == tid and e["event"]["type"] == "approval.decision")
             check(dec is not None, "★★ 流上收到 approval.decision")
-            if dec:
-                check(dec["event"]["data"]["approved"] is True, "决策是 approved")
+            check(ev_field(dec, "approved") is True, "决策是 approved",
+                  actual=ev_field(dec, "approved"))
 
             result = await sse.wait_event(
                 lambda e: e["task_id"] == tid and e["event"]["type"] == "tool.result")
             check(result is not None, "★★ 流上收到 tool.result")
-            if result:
-                check(result["event"]["data"]["ok"] is True,
-                      f"工具执行成功（ok={result['event']['data'].get('ok')}）")
+            check(ev_field(result, "ok") is True, "工具执行成功", actual=ev_field(result, "ok"))
 
             end = await sse.wait_event(
                 lambda e: e["task_id"] == tid and e["event"]["type"] == "task.end")
-            check(end is not None, "任务结束")
+            check(end is not None, "任务结束", actual=ev_field(end, "status"))
 
             # ---- 磁盘上真的生成了文件 ----
             exists = await asyncio.get_event_loop().run_in_executor(None, target.exists)
             check(exists, f"★★★ 磁盘上真的生成了 {target.name}")
+            content = ""
             if exists:
                 content = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: target.read_text(encoding="utf-8"))
-                check(content == "hello-from-e2e", f"内容正确（{content[:40]!r}）")
+            check(content == "hello-from-e2e", "内容正确", actual=content[:40])
 
             # ---- 事件顺序 ----
             # ---- 逻辑顺序：按 seq 排（这是 core 的权威顺序）----
@@ -563,18 +606,23 @@ async def scenario_write_approval(srv: LiveServer) -> None:
             check(seq_nums == list(range(1, len(seq_nums) + 1)),
                   f"★★ seq 连续无缺口（{len(seq_nums)} 条：{[s for s in seq_nums]}）")
 
-            # 记录投递顺序与 seq 顺序是否一致（诊断用，不作为断言：
-            # SSE 的到达顺序不属于契约，前端按 seq 排序）
+            # ★ 到达顺序 = seq 顺序。
+            #   以前 `_on_event` 先 await 落盘再 broadcast，落盘耗时会把到达顺序
+            #   打乱（实测 [1..5,7,8,9,10,6]）。现在广播在前、落盘在后，
+            #   这条从"诊断打印"升级成硬断言。
             deliver_order = [e["event"]["seq"] for e in sse.of_task(tid)]
-            if deliver_order != sorted(deliver_order):
-                print(f"    [注意] 投递顺序与 seq 不一致：{deliver_order}")
-                print(f"           （已知问题 #8：_on_event 落盘 await 打乱了 publish 顺序）")
+            check(deliver_order == sorted(deliver_order),
+                  "★★ 投递顺序与 seq 一致（没有被落盘 await 打乱）",
+                  actual=deliver_order)
 
             # ---- 二次决策必须失败（一次性消费）----
-            r2 = await client.post(f"/api/approvals/{approval_id}/decision",
-                                   json={"task_id": tid, "decision": "approved", "reason": ""},
-                                   timeout=20)
-            check(r2.status_code == 409, f"★★ 重复决策被拒（{r2.status_code}）")
+            code: object = "未提交（没拿到 approval_id）"
+            if approval_id:
+                r2 = await client.post(f"/api/approvals/{approval_id}/decision",
+                                       json={"task_id": tid, "decision": "approved", "reason": ""},
+                                       timeout=20)
+                code = r2.status_code
+            check(code == 409, "★★ 重复决策被拒", actual=code)
 
 
 # --------------------------------------------------------------------------- #
@@ -654,15 +702,31 @@ async def amain(argv: list[str]) -> int:
         print(f"数据库  ：{srv.db_path}")
 
         for key in picked:
+            before = len(results)
             try:
                 await asyncio.wait_for(SCENARIOS[key](srv), timeout=SCENARIO_TIMEOUT * 2)
             except asyncio.TimeoutError:
                 check(False, f"[{key}] 场景超时（{SCENARIO_TIMEOUT * 2}s）")
+            except Exception as exc:  # noqa: BLE001
+                # ★ 单个场景炸了不能拖垮整轮：记一条失败，继续跑下一个场景。
+                check(False, f"[{key}] 场景异常中止：{type(exc).__name__}: {exc}")
+
+            # ★ 把条数补齐到预期值。
+            #   任何一个断言被跳过（事件缺失 / 场景提前 return），总项数都会变，
+            #   "通过率"就没法横向比较。这里用显式的失败项补位，并写明原因。
+            expected = EXPECTED_COUNTS[key]
+            got = len(results) - before
+            for n in range(got, expected):
+                check(False, f"[{key}] 第 {n + 1}/{expected} 项断言未执行（场景提前中止）")
+            if got > expected:
+                check(False, f"[{key}] 断言条数 {got} 超过预期 {expected}（加了断言但没更新 EXPECTED_COUNTS）")
 
         ok = sum(1 for c, _ in results if c)
         total = len(results)
         print("\n" + "=" * 78)
         print(f"结果：{ok}/{total} 通过")
+        print("按场景：" + "  ".join(f"{k}={EXPECTED_COUNTS[k]}" for k in picked)
+              + f"（合计预期 {sum(EXPECTED_COUNTS[k] for k in picked)} 项）")
         if ok != total:
             print(f"\n失败项（{total - ok} 条）：")
             for c, label in results:

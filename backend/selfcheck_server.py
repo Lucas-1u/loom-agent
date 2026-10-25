@@ -32,13 +32,18 @@ VERBOSE = False
 results: list[tuple[bool, str]] = []
 
 
-def check(cond: bool, label: str) -> None:
-    results.append((bool(cond), label))
+_UNSET = object()
+
+
+def check(cond: bool, label: str, actual: object = _UNSET) -> None:
+    """`actual` 给出时追加到标签后面 —— 失败报告里直接能看到实际值。"""
+    text = label if actual is _UNSET else f"{label}｜实际：{actual!r}"
+    results.append((bool(cond), text))
     if cond:
         if VERBOSE:
-            print(f"  [ok] {label}")
+            print(f"  [ok] {text}")
     else:
-        print(f"  [X]  {label}")
+        print(f"  [X]  {text}")
 
 
 # --------------------------------------------------------------------------- #
@@ -48,11 +53,19 @@ class TmpDB:
     def __init__(self) -> None:
         self.dir = tempfile.mkdtemp(prefix="loom_srv_")
         self.path = str(Path(self.dir) / "state.db")
+        # TaskStore 现在复用长连接（见 store.py 顶部说明）——
+        # Windows 上文件被打开时目录删不掉，所以清理前必须显式关。
+        self._stores: list[TaskStore] = []
 
     def store(self) -> TaskStore:
-        return TaskStore(self.path)
+        s = TaskStore(self.path)
+        self._stores.append(s)
+        return s
 
     def cleanup(self) -> None:
+        for s in self._stores:
+            s.close_sync()
+        self._stores.clear()
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -226,6 +239,67 @@ async def test_store(db: TmpDB) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [A2] TaskStore 并发写 —— SQLITE_READONLY 回归
+# --------------------------------------------------------------------------- #
+async def test_store_concurrent_sqlite(db: TmpDB) -> None:
+    """
+    ★ 回归用例：WAL + 并发短连接曾偶发
+        sqlite3.OperationalError: attempt to write a readonly database
+
+    根因是「每次操作新建连接」：WAL 的 -wal/-shm 由最后一个关闭的连接
+    checkpoint 并删除，并发下另一个线程正好在这个窗口打开文件，就会被降级成只读。
+    修法是连接复用 + 全局串行化（见 store.py 顶部）。
+
+    这里直接用**真实 TaskStore**（不另写一套 sqlite 逻辑），
+    断言三件事：
+      ① 一次都不能抛异常
+      ② 每一次写都真的落库（turn 等于最后一次写的序号，不能有丢失）
+      ③ 仍然是 WAL —— 修复不能靠偷偷降级 journal_mode 绕过问题
+    """
+    print("\n[A2] TaskStore 并发写（SQLITE_READONLY 回归）")
+
+    store = db.store()
+    await store.init()
+    await store.upsert_session(mk_session("sc", title="并发"))
+
+    n_tasks, n_writes = 12, 40          # 480 次写：足以把 1% 量级的偶发错误逼出来
+    for i in range(n_tasks):
+        await store.create_task(mk_task(f"c{i}", "sc"))
+
+    errors: list[str] = []
+
+    def hammer(tid: str) -> None:
+        for n in range(n_writes):
+            try:
+                store.save_task_sync(tid, status="running", turn=n + 1)
+            except Exception as exc:  # noqa: BLE001 —— 这里就是要抓到它
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+    await asyncio.gather(*(asyncio.to_thread(hammer, f"c{i}") for i in range(n_tasks)))
+
+    check(not errors, f"★★ 并发写 {n_tasks * n_writes} 次零异常",
+          actual=(errors[:3] if errors else "无"))
+    check(len(errors) == 0 or all("readonly" not in e.lower() for e in errors),
+          "★★ 没有出现 SQLITE_READONLY")
+
+    rows = await store.list_tasks("sc")
+    turns = {r["task_id"]: r["turn"] for r in rows}
+    missing = [f"c{i}" for i in range(n_tasks) if turns.get(f"c{i}") != n_writes]
+    check(not missing,
+          f"★★ 每次写都落库（每个任务 turn 应为 {n_writes}）",
+          actual=(missing if missing else sorted(set(turns.values()))))
+
+    # 用独立连接读 journal_mode：确认还是 WAL
+    c = sqlite3.connect(db.path)
+    try:
+        mode = c.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        c.close()
+    check(str(mode).lower() == "wal", "★ 仍然是 WAL（没有靠降级 journal 模式绕过）",
+          actual=mode)
+
+
+# --------------------------------------------------------------------------- #
 # [B] EventHub
 # --------------------------------------------------------------------------- #
 async def test_hub() -> None:
@@ -392,13 +466,175 @@ async def test_runtime(db: TmpDB) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [C2] 落盘失败时的投递可靠性
+# --------------------------------------------------------------------------- #
+async def test_runtime_persist_failure(db: TmpDB) -> None:
+    """
+    ★ 回归用例：落盘失败曾经会**吞掉事件**。
+
+    旧实现 `_on_event` 是「先 await 落盘，再 hub.publish」：
+    落盘一抛异常，publish 根本不会执行，`EventBus._deliver` 又把异常吞掉，
+    结果是任务内 seq 出现空洞（实测 approval.decision 直接消失），
+    前端永远等不到，且日志里只有一行看不懂的 `subscriber <bound method ...>`。
+
+    现在要求：
+      ① 落盘失败时事件照样广播
+      ② 故障要能在 `snapshot()` 里查到（stage / 错误原文 / 次数）
+      ③ 终态落盘失败时任务仍要正常结束，不能挂住
+    """
+    print("\n[C2] 落盘失败不能吞事件（投递可靠性回归）")
+
+    ws = tempfile.mkdtemp(prefix="loom_pf_")
+    store = db.store()
+    await store.init()
+    await store.upsert_session(mk_session("sp", ws=ws))
+
+    hub = EventHub()
+    q = hub.subscribe()
+
+    rt = TaskRuntime(
+        task_id="task_pf",
+        session_id="sp",
+        goal="看看目录",
+        workspace=ws,
+        model="fake",
+        adapter=FakeAdapter(make_script()),
+        registry=build_default_registry(),
+        config=AgentConfig(max_turns=4, max_seconds=20, approval_timeout_s=3, min_evidence=0),
+        hub=hub,
+        store=store,
+    )
+    await store.create_task(mk_task("task_pf", "sp", workspace=ws))
+
+    # ---- ① 直接驱动 _on_event：落盘必失败，事件仍必须到 hub ----
+    real_save_task = store.save_task
+
+    async def boom(*_a, **_kw):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    store.save_task = boom  # type: ignore[method-assign]
+    try:
+        ev = Event.make("approval.decision", {"approved": True, "approval_id": "apr_x"},
+                        task_id="task_pf")
+        ev.seq = 7
+        await rt._on_event(ev)
+    finally:
+        store.save_task = real_save_task  # type: ignore[method-assign]
+
+    got = []
+    while not q.queue.empty():
+        got.append(q.queue.get_nowait())
+    check([g["event"]["type"] for g in got] == ["approval.decision"],
+          "★★ 落盘失败时事件仍然广播（不再丢失）",
+          actual=[g["event"]["type"] for g in got])
+    check(rt.status == "running", "★ 内存状态照常推进（approval.decision → running）",
+          actual=rt.status)
+    check(rt.persist_failures == 1, "★ 故障被计数", actual=rt.persist_failures)
+    check(rt.persist_error is not None
+          and rt.persist_error["stage"] == "state:running"
+          and "readonly" in rt.persist_error["error"].lower(),
+          "★★ 故障带 stage + 错误原文（可诊断）", actual=rt.persist_error)
+    check(rt.snapshot().get("persist_error") == rt.persist_error,
+          "★ 快照能查到落盘故障（/api/tasks/{id} 的排查入口）")
+    check(rt.bus.delivery_errors == 0,
+          "★★ 事件不是靠「吞异常」送到的（订阅者零异常）",
+          actual=rt.bus.delivery_errors)
+
+    # ---- ② 终态落盘失败：任务仍要结束，且不能假装成功 ----
+    # ★ 必须换一个新的 runtime：上面 phase ① 已经把 rt.status 推到 running，
+    #   而 start() 在 status != created 时是直接 return 的。
+    rt2 = TaskRuntime(
+        task_id="task_pf2",
+        session_id="sp",
+        goal="看看目录",
+        workspace=ws,
+        model="fake",
+        adapter=FakeAdapter(make_script()),
+        registry=build_default_registry(),
+        config=AgentConfig(max_turns=4, max_seconds=20, approval_timeout_s=3, min_evidence=0),
+        hub=hub,
+        store=store,
+    )
+    await store.create_task(mk_task("task_pf2", "sp", workspace=ws))
+
+    store.save_task = boom  # type: ignore[method-assign]
+    try:
+        await rt2.start()
+        try:
+            await asyncio.wait_for(rt2.finished.wait(), timeout=10)
+            finished = True
+        except asyncio.TimeoutError:
+            finished = False
+    finally:
+        store.save_task = real_save_task  # type: ignore[method-assign]
+
+    check(finished, "★★ 终态落盘失败也不能把任务挂住")
+    check(rt2.status == "done", "★ Agent 本身仍然跑完了", actual=rt2.status)
+    check(rt2.persist_error is not None and rt2.persist_error["stage"] == "final",
+          "★★ 终态故障单独记录 stage=final", actual=rt2.persist_error)
+
+    row = await store.get_task("task_pf2")
+    # mark_started 是先写成功的，所以库里停在 running；
+    # 关键是**没有**假的 done —— 落盘失败就是失败，不静默改成成功。
+    check(row["status"] == "running",
+          "★★ 库里没有留下假的 done（终态没写进去就是没写进去）",
+          actual=row["status"])
+
+    # ---- ③ 落盘顺序：慢的旧写入不能把新状态盖回去 ----
+    # ★ 广播前置之后，两次落盘是并发的。审批请求那次如果慢（DB 抖动），
+    #   可能晚于审批决策那次才写完 —— 库里的状态就回退了。
+    rt3 = TaskRuntime(
+        task_id="task_pf3",
+        session_id="sp",
+        goal="看看目录",
+        workspace=ws,
+        model="fake",
+        adapter=FakeAdapter(make_script()),
+        registry=build_default_registry(),
+        config=AgentConfig(max_turns=4, max_seconds=20, approval_timeout_s=3, min_evidence=0),
+        hub=hub,
+        store=store,
+    )
+    await store.create_task(mk_task("task_pf3", "sp", workspace=ws))
+
+    real_save_task2 = store.save_task
+
+    async def slow_awaiting(*_a, **_kw):
+        # 只有 awaiting_approval 这次写"很慢" —— 模拟一次磁盘/系统调用抖动
+        if _kw.get("status") == "awaiting_approval":
+            await asyncio.sleep(0.3)
+        return await real_save_task2(*_a, **_kw)
+
+    store.save_task = slow_awaiting  # type: ignore[method-assign]
+    try:
+        req_ev = Event.make("approval.request", {"approval_id": "a2"}, task_id="task_pf3")
+        req_ev.seq = 1
+        dec_ev = Event.make("approval.decision", {"approved": True}, task_id="task_pf3")
+        dec_ev.seq = 2
+        await asyncio.gather(rt3._on_event(req_ev), rt3._on_event(dec_ev))
+    finally:
+        store.save_task = real_save_task2  # type: ignore[method-assign]
+
+    row3 = await store.get_task("task_pf3")
+    check(row3["status"] == rt3.status,
+          "★★ 慢的旧写入不会把库里的状态写回退（awaiting_approval 不能盖掉 running）",
+          actual=row3["status"])
+    check((row3["state"] or {}).get("status") == rt3.status,
+          "★★ state_json 与内存状态一致", actual=(row3["state"] or {}).get("status"))
+
+    shutil.rmtree(ws, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 async def run_async_suites(db: TmpDB) -> None:
     """这几节都是纯 async，跑在同一个 loop 里。"""
     await test_store(db)
+    await test_store_concurrent_sqlite(db)
     await test_hub()
     await test_runtime(db)
+    await test_runtime_persist_failure(db)
     await test_scheduler(db)
 
 

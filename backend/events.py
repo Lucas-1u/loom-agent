@@ -36,6 +36,17 @@ from enum import Enum
 from typing import Any, AsyncIterator, Callable, Awaitable
 
 
+def _subscriber_name(sub: Any) -> str:
+    """
+    给日志用的订阅者名字。
+
+    订阅者通常是 `self._on_event` 这类 bound method，直接 `%r` 只会打出
+    `<bound method TaskRuntime._on_event of <...object at 0x...>>` ——
+    既看不出是哪个类，也看不出是哪个实例。这里取 `__qualname__`。
+    """
+    return getattr(sub, "__qualname__", None) or getattr(sub, "__name__", None) or repr(sub)
+
+
 # --------------------------------------------------------------------------- #
 # 事件类型（16 种）
 # --------------------------------------------------------------------------- #
@@ -171,6 +182,9 @@ class EventBus:
         self._seq: int = 0
         self._subs: list[Subscriber] = []
         self._tasks: set[asyncio.Task[None]] = set()
+        # 订阅者抛异常的累计次数。正常应恒为 0；
+        # 非 0 说明"有事件没被某个消费者看到"，属于必须排查的状态。
+        self.delivery_errors: int = 0
 
     # ---- 订阅管理 ----------------------------------------------------------
     def subscribe(self, sub: Subscriber) -> None:
@@ -228,15 +242,27 @@ class EventBus:
         投递给单个订阅者。
 
         单个订阅者抛异常绝不能影响其他订阅者，也不能影响 Agent 循环 ——
-        所以这里吞掉异常。调试时想看错误可看本模块 logger。
+        所以这里隔离异常。但**隔离 ≠ 静默**：
+          · 计数到 self.delivery_errors（正常恒为 0）
+          · 日志带 type / task_id / seq / 订阅者名字 / 完整堆栈
+            （之前只有 `subscriber <bound method ...>` 和一个事件名，
+             既不知道是哪个任务，也不知道是第几条事件）
         """
         try:
             await sub(ev)
-        except Exception:  # noqa: BLE001 —— 刻意宽泛：订阅者故障必须隔离
+        except Exception as exc:  # noqa: BLE001 —— 刻意宽泛：订阅者故障必须隔离
             import logging
 
-            logging.getLogger("loom.events").exception(
-                "subscriber %r failed on event %s", sub, ev.type
+            self.delivery_errors += 1
+            logging.getLogger("loom.events").error(
+                "订阅者处理事件失败：type=%s task_id=%s seq=%s subscriber=%s → %s: %s",
+                ev.type,
+                ev.task_id or "-",
+                ev.seq,
+                _subscriber_name(sub),
+                type(exc).__name__,
+                exc,
+                exc_info=exc,
             )
 
     # ---- 任务 id -----------------------------------------------------------

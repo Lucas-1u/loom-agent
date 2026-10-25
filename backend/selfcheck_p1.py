@@ -77,6 +77,8 @@ async def main() -> int:
     await bus2.drain()
     check(len(good) == 1, "坏订阅者抛错，好订阅者仍收到事件")
     check(bus2.subscribers is not None, "总线未因异常崩坏")
+    check(bus2.delivery_errors == 1,
+          f"★ 订阅者异常被准确计数（实际 {bus2.delivery_errors}，应为 1）")
 
     # ------------------------------------------------------------------ #
     print("\n[3] Event.to_sse 帧格式")
