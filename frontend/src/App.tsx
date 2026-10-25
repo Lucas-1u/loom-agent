@@ -72,6 +72,8 @@ export default function App() {
   }, [state.tasks]);
 
   const busy = task?.status === "running" || task?.status === "awaiting_approval";
+  /** 该会话已经有任务 → 工作目录锁定（历史归属不可改） */
+  const workspaceLocked = state.mode === "real" && tasks.length > 0;
 
   // ------------------------------------------------------------------ //
   // ① 启动：健康检查 + 加载会话
@@ -263,19 +265,46 @@ export default function App() {
     [dispatch],
   );
 
-  /** 改工作区：后端没有 update 接口 → 只改本地，且明确告诉用户不会持久化 */
+  /**
+   * 改工作区。
+   *
+   * ★ 会话的工作目录是**历史事实**：一旦这个会话跑过任务，就不允许再改。
+   *   旧实现只改本地字段（后端不知道），于是同一个会话里混进了两个目录的任务 ——
+   *   用户看到的就是"LLMstudy 的会话里是 Try_agent 的内容"。
+   *   现在：空会话可以改（写回后端）；已有任务就拦下，提示新建会话。
+   */
   const handleWorkspaceChange = useCallback(
     (path: string) => {
       if (!session || busy) return;
-      dispatch({ type: "SET_SESSION_WORKSPACE", sessionId: session.session_id, path });
-      if (state.mode === "real") {
-        setBanner(
-          "工作区已在本地切换。后端暂无「更新会话」接口，所以刷新后会回到原值；" +
-            "新建的任务会用这个目录。",
-        );
+
+      if (state.mode !== "real") {
+        dispatch({ type: "SET_SESSION_WORKSPACE", sessionId: session.session_id, path });
+        return;
       }
+
+      if (tasks.length > 0) {
+        setBanner(
+          `该会话已绑定工作目录 ${session.workspace_path || "（未设置）"}，不能再改。` +
+            "要换目录请点侧栏「新建会话」。",
+        );
+        return;
+      }
+
+      void (async () => {
+        try {
+          const s = await api.updateSession(session.session_id, { workspace: path });
+          dispatch({
+            type: "SET_SESSION_WORKSPACE",
+            sessionId: s.session_id,
+            path: s.workspace_path,
+          });
+          setBanner("");
+        } catch (exc) {
+          setBanner(exc instanceof api.ApiError ? exc.note : String(exc));
+        }
+      })();
     },
-    [dispatch, session, busy, state.mode],
+    [dispatch, session, busy, state.mode, tasks.length],
   );
 
   const handleSubmit = useCallback(
@@ -455,6 +484,7 @@ export default function App() {
               events={events}
               tasks={tasks}
               activeTaskId={state.activeTaskId}
+              sessionWorkspace={session?.workspace_path ?? ""}
               onSelectTask={(id) => dispatch({ type: "SET_ACTIVE_TASK", taskId: id })}
               onApprovalResolve={(id, ok) => void handleApprovalResolve(id, ok)}
             />
@@ -467,9 +497,13 @@ export default function App() {
           <WorkspaceSelector
             workspace={session?.workspace_path ?? ""}
             onChange={handleWorkspaceChange}
-            disabled={busy || !session}
+            disabled={busy || !session || workspaceLocked}
             disabledReason={
-              !session ? "先选择一个会话" : "任务运行中不能改工作区，否则 Agent 的目录会中途变化"
+              !session
+                ? "先选择一个会话"
+                : busy
+                  ? "任务运行中不能改工作区，否则 Agent 的目录会中途变化"
+                  : "该会话已有任务，工作目录已固定；换目录请新建会话"
             }
           />
         </div>

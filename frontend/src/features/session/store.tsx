@@ -129,7 +129,7 @@ export type LoomAction =
 // --------------------------------------------------------------------------- //
 // 初始状态
 // --------------------------------------------------------------------------- //
-function emptyStore(): LoomStore {
+export function emptyStore(): LoomStore {
   return {
     viewMode: "chat",
     mode: "checking",
@@ -228,7 +228,12 @@ function touchSession(sessions: Record<string, Session>, sessionId: string, ts: 
 // --------------------------------------------------------------------------- //
 // Reducer
 // --------------------------------------------------------------------------- //
-function reducer(state: LoomStore, action: LoomAction): LoomStore {
+/**
+ * ★ 导出给单元测试用（scripts/test-session-isolation.mjs）。
+ *   它是纯函数：给定 state + action 返回新 state，不碰 DOM / 网络，
+ *   所以可以脱离 React 直接验证"切会话不会串线"。
+ */
+export function reducer(state: LoomStore, action: LoomAction): LoomStore {
   switch (action.type) {
     case "SET_VIEW":
       // ★ 只改渲染模式。不碰 sessions / tasks / messages / events。

@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -49,6 +50,13 @@ class CreateSessionBody(BaseModel):
     workspace: str = ""
 
 
+class UpdateSessionBody(BaseModel):
+    """PATCH /api/sessions/{id}：只允许改标题，以及**还没有任务时**改工作目录。"""
+
+    title: str | None = None
+    workspace: str | None = None
+
+
 class CreateTaskBody(BaseModel):
     goal: str = Field(min_length=1)
     session_id: str
@@ -64,6 +72,20 @@ class ApprovalBody(BaseModel):
 # --------------------------------------------------------------------------- #
 # SSE 帧
 # --------------------------------------------------------------------------- #
+def _norm_ws(raw: str | None) -> str:
+    """
+    比较"两个工作目录是不是同一个"用的规范化键。
+
+    ★ 只处理分隔符 / 尾部分隔符 / 大小写 —— **不解析符号链接、不要求目录存在**。
+      这里判的是"两次请求指的是不是同一个目录"，不是安全边界；
+      真正的路径安全在 `tools/path_safety.resolve_in_workspace`。
+    """
+    s = (raw or "").strip().replace("/", "\\")
+    if len(s) > 3:          # 保留 `C:\` 这种盘符根
+        s = s.rstrip("\\")
+    return s.lower()
+
+
 def sse_frame(event_type: str, data: dict[str, Any], *, eid: int | None = None) -> str:
     """
     拼一个 SSE 帧。
@@ -152,13 +174,58 @@ def create_app(
     @app.post("/api/sessions")
     async def create_session(body: CreateSessionBody) -> dict[str, Any]:
         now = time.time()
-        sid = f"s_{int(now * 1000)}_{len(await store.list_sessions())}"
+        # ★ 会话身份必须独立生成。
+        #   旧实现是 `s_{毫秒}_{会话数}`：两个请求落在同一毫秒、且都读到同样的
+        #   会话数时，会算出**同一个 id**；upsert 的 ON CONFLICT 会把先建的那个
+        #   会话的标题/工作目录覆盖掉 —— 这就是"会话串线"的一个入口。
+        sid = f"s_{uuid.uuid4().hex[:12]}"
         row = {
             "session_id": sid,
             "title": body.title or "新建会话",
             "workspace": body.workspace,
             "created_at": now,
             "updated_at": now,
+        }
+        await store.upsert_session(row)
+        return row
+
+    @app.patch("/api/sessions/{session_id}")
+    async def update_session(session_id: str, body: UpdateSessionBody) -> dict[str, Any]:
+        """
+        改会话的标题 / 工作目录。
+
+        ★ 工作目录只有在**该会话还没有任何任务**时才允许改。
+          理由：会话归属是历史事实。允许事后改挂目录，就会让同一个会话里
+          混着两个项目的内容（真实踩过的坑），而历史任务无法判断该信哪个目录。
+          要换目录 → 新建会话。
+        """
+        sess = await store.get_session(session_id)
+        if sess is None:
+            raise HTTPException(404, f"会话不存在：{session_id}")
+
+        new_ws = sess["workspace"]
+        if body.workspace is not None and _norm_ws(body.workspace) != _norm_ws(sess["workspace"]):
+            n = await store.count_tasks(session_id)
+            if n > 0:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "accepted": False,
+                        "reason": "session_has_tasks",
+                        "note": (
+                            f"该会话已有 {n} 个任务，工作目录固定为 {sess['workspace'] or '（未设置）'}，"
+                            "不能再改。要换目录请新建会话。"
+                        ),
+                        "session_workspace": sess["workspace"],
+                    },
+                )
+            new_ws = body.workspace
+
+        row = {
+            **sess,
+            "title": sess["title"] if body.title is None else body.title,
+            "workspace": new_ws,
+            "updated_at": time.time(),
         }
         await store.upsert_session(row)
         return row
@@ -216,16 +283,40 @@ def create_app(
         ★ 幂等键：优先 `Idempotency-Key`，其次 `X-Request-Id`，
           再其次 body 里没有就没法幂等（老客户端）。
           命中 → 返回原任务，`idempotent_replay=true`。
+
+        ★ 工作目录**以会话为准**：任务不允许跑到会话之外的目录去。
+          旧前端把"切换工作目录"实现成只改本地字段，于是同一个会话里
+          混进了两个项目的任务 —— 用户在界面上看到的就是"串线"。
         """
-        sessions = {s["session_id"] for s in await store.list_sessions()}
-        if body.session_id not in sessions:
+        sess = await store.get_session(body.session_id)
+        if sess is None:
             raise HTTPException(404, f"会话不存在：{body.session_id}")
+
+        session_ws = sess["workspace"] or ""
+        if session_ws and body.workspace and _norm_ws(session_ws) != _norm_ws(body.workspace):
+            raise HTTPException(
+                409,
+                detail={
+                    "accepted": False,
+                    "reason": "workspace_mismatch",
+                    "note": (
+                        f"会话已绑定工作目录 {session_ws}，不能在这里用 {body.workspace} 建任务。"
+                        "要换目录请新建会话。"
+                    ),
+                    "session_workspace": session_ws,
+                },
+            )
+        workspace = session_ws or body.workspace
+        if not session_ws and body.workspace:
+            # 老数据兼容：会话还没绑目录（历史上允许空），首次建任务时补绑，
+            # 之后它就固定下来了 —— 不静默改写已有归属。
+            await store.upsert_session({**sess, "workspace": body.workspace, "updated_at": time.time()})
 
         key = idempotency_key or x_request_id or ""
         snap = await scheduler.submit(
             session_id=body.session_id,
             goal=body.goal,
-            workspace=body.workspace,
+            workspace=workspace,
             idem_key=key,
         )
         return snap

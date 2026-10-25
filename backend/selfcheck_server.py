@@ -653,6 +653,7 @@ def main() -> int:
         # ★ 同步跑 [F]：TestClient 会开自己的 loop，
         #   如果此时已经在 asyncio.run 里，会报 "another loop is running"
         test_http_and_sse(db)
+        test_session_isolation(db)
     finally:
         db.cleanup()
 
@@ -1018,6 +1019,134 @@ def test_http_and_sse(db: TmpDB) -> None:
 
     finally:
         shutil.rmtree(ws, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# [G] 会话隔离：工作目录归属 / 内容不串线 / 重启恢复
+# --------------------------------------------------------------------------- #
+def test_session_isolation(db: TmpDB) -> None:
+    """
+    复现并守住「会话串线」：
+
+    真实踩过的坑：同一个 session 里先后在 D:\\LLMstudy 和 D:\\Try_agent 跑任务
+    （前端切换工作目录时只改了本地字段，后端会话归属没变），
+    于是「属于 LLMstudy 的会话」里出现了 Try_agent 的内容。
+
+    这里把规则钉死：
+      ① 会话 id 唯一，创建时保存工作目录
+      ② 任务必须落在所属会话的目录里，否则拒绝
+      ③ 消息按 session_id 查，绝不互相可见
+      ④ 有任务的会话不能改挂目录
+      ⑤ 重启后归属与内容都不变
+    """
+    print("\n[G] 会话隔离（工作目录归属 + 重启恢复）")
+
+    import asyncio as _aio
+
+    from fastapi.testclient import TestClient
+
+    ws_a = tempfile.mkdtemp(prefix="loom_LLMstudy_")
+    ws_b = tempfile.mkdtemp(prefix="loom_Try_agent_")
+    try:
+        store = db.store()
+        store.init_sync()
+        hub = EventHub()
+        cfg = AgentConfig(max_turns=2, max_seconds=20, approval_timeout_s=2, min_evidence=0)
+
+        def make_scheduler(st) -> TaskScheduler:
+            return TaskScheduler(
+                store=st, hub=EventHub(), adapter=SlowAdapter(delay=0.05),
+                registry=build_default_registry(), config=cfg, max_global=4,
+            )
+
+        sch = make_scheduler(store)
+        client = TestClient(create_app(store=store, hub=hub, scheduler=sch))
+
+        # ---- ① 两个目录各建一个会话 ----
+        a = client.post("/api/sessions", json={"title": "LLMstudy", "workspace": ws_a}).json()
+        b = client.post("/api/sessions", json={"title": "Try_agent", "workspace": ws_b}).json()
+        check(a["session_id"] != b["session_id"], "★★ 两个会话 id 不同")
+        check(a["workspace"] == ws_a and b["workspace"] == ws_b, "创建时各自保存了工作目录")
+
+        # 连建多个会话，id 不能重复（旧实现是 s_{毫秒}_{会话数}，并发下会撞）
+        ids = {client.post("/api/sessions", json={"title": "批量", "workspace": ws_a}).json()["session_id"]
+               for _ in range(6)}
+        check(len(ids) == 6, f"★★ 连续建 6 个会话 id 全不重复（实际 {len(ids)} 个）")
+
+        # ---- ② 各自建任务 ----
+        ta = client.post("/api/tasks", json={"goal": "ALPHA-LLMSTUDY", "session_id": a["session_id"], "workspace": ws_a})
+        tb = client.post("/api/tasks", json={"goal": "BETA-TRYAGENT", "session_id": b["session_id"], "workspace": ws_b})
+        check(ta.status_code == 200 and tb.status_code == 200, "两个任务分别创建成功")
+
+        # ---- ③ 消息不串线 ----
+        ma = client.get(f"/api/sessions/{a['session_id']}/messages").json()["messages"]
+        mb = client.get(f"/api/sessions/{b['session_id']}/messages").json()["messages"]
+        check(any("ALPHA-LLMSTUDY" in m["content"] for m in ma), "A 能看到自己的消息")
+        check(any("BETA-TRYAGENT" in m["content"] for m in mb), "B 能看到自己的消息")
+        check(all("BETA-TRYAGENT" not in m["content"] for m in ma), "★★ A 看不到 B 的消息")
+        check(all("ALPHA-LLMSTUDY" not in m["content"] for m in mb), "★★ B 看不到 A 的消息")
+        check(all(m["session_id"] == a["session_id"] for m in ma), "★ A 的消息 session_id 都是 A")
+
+        # ---- ④ 任务列表按会话过滤 ----
+        la = client.get(f"/api/tasks?session_id={a['session_id']}").json()["tasks"]
+        check(all(t["session_id"] == a["session_id"] for t in la), "★ 任务列表只含该会话的任务")
+
+        # ---- ⑤ ★ 核心：任务必须落在所属会话的目录里 ----
+        r = client.post("/api/tasks", json={"goal": "CROSS-DIR", "session_id": a["session_id"], "workspace": ws_b})
+        check(r.status_code == 409, "★★ 用别的工作目录往 A 里建任务 → 拒绝", r.status_code)
+        ma2 = client.get(f"/api/sessions/{a['session_id']}/messages").json()["messages"]
+        check(all("CROSS-DIR" not in m["content"] for m in ma2), "★★ 被拒的任务没有混进 A 的消息")
+
+        # ---- ⑥ 有任务的会话不能改挂目录 ----
+        r = client.patch(f"/api/sessions/{a['session_id']}", json={"workspace": ws_b})
+        check(r.status_code == 409, "★★ 有任务的会话不能改工作目录", r.status_code)
+        row = [s for s in client.get("/api/sessions").json()["sessions"] if s["session_id"] == a["session_id"]][0]
+        check(row["workspace"] == ws_a, "★★ 拒绝后归属没有变")
+
+        # ---- ⑦ 空会话可以设置目录（会持久化）----
+        c = client.post("/api/sessions", json={"title": "空会话", "workspace": ""}).json()
+        r = client.patch(f"/api/sessions/{c['session_id']}", json={"workspace": ws_b})
+        body = r.json() if r.status_code == 200 else {}
+        check(r.status_code == 200 and body.get("workspace") == ws_b,
+              "空会话可以设置工作目录", r.status_code)
+        check(body.get("session_id") == c["session_id"], "设置目录不改变会话身份")
+
+        # ---- ⑧ 重启后：归属与内容都还在，且不串 ----
+        client.close()
+        loop_sd = _aio.new_event_loop()
+        try:
+            loop_sd.run_until_complete(sch.shutdown(timeout=3))
+        finally:
+            loop_sd.close()
+
+        store2 = db.store()
+        store2.init_sync()
+        sch2 = make_scheduler(store2)
+        client2 = TestClient(create_app(store=store2, hub=EventHub(), scheduler=sch2))
+
+        rows2 = {s["session_id"]: s for s in client2.get("/api/sessions").json()["sessions"]}
+        check(rows2.get(a["session_id"], {}).get("workspace") == ws_a,
+              "★★ 重启后 A 仍归属 LLMstudy")
+        ma3 = client2.get(f"/api/sessions/{a['session_id']}/messages").json()["messages"]
+        check(any("ALPHA-LLMSTUDY" in m["content"] for m in ma3), "重启后 A 的历史消息还在")
+        check(all("BETA-TRYAGENT" not in m["content"] for m in ma3), "★★ 重启后 A 仍看不到 B 的内容")
+
+        # ---- ⑨ 事件历史：重启后确实不保留，接口要如实说不可用 ----
+        tid_a = ta.json()["task_id"]
+        ev = client2.get(f"/api/tasks/{tid_a}/events").json()
+        check(ev.get("available") is False,
+              "★★ 重启后事件历史不可用（available=false，不伪造）", ev.get("reason"))
+
+        client2.close()
+        loop_sd2 = _aio.new_event_loop()
+        try:
+            loop_sd2.run_until_complete(sch2.shutdown(timeout=3))
+        finally:
+            loop_sd2.close()
+
+    finally:
+        shutil.rmtree(ws_a, ignore_errors=True)
+        shutil.rmtree(ws_b, ignore_errors=True)
 
 
 if __name__ == "__main__":

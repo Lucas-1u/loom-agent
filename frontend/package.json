@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test:workspace": "npx esbuild src/features/session/workspace.ts --bundle --format=esm --outfile=.tmp/workspace.mjs && npx esbuild src/features/session/selectors.ts --bundle --format=esm --outfile=.tmp/selectors.mjs && node scripts/test-workspace.mjs"
+    "test:workspace": "npx esbuild src/features/session/workspace.ts --bundle --format=esm --outfile=.tmp/workspace.mjs && npx esbuild src/features/session/selectors.ts --bundle --format=esm --outfile=.tmp/selectors.mjs && node scripts/test-workspace.mjs",
+    "test:session": "npx esbuild src/features/session/store.tsx --bundle --format=esm --define:import.meta.env={} --outfile=.tmp/store.mjs && node scripts/test-session-isolation.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

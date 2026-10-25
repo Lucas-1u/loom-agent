@@ -243,6 +243,26 @@ class TaskStore:
     async def list_sessions(self) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.list_sessions_sync)
 
+    def get_session_sync(self, session_id: str) -> dict[str, Any] | None:
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    async def get_session(self, session_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self.get_session_sync, session_id)
+
+    def count_tasks_sync(self, session_id: str) -> int:
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    async def count_tasks(self, session_id: str) -> int:
+        return await asyncio.to_thread(self.count_tasks_sync, session_id)
+
     # ===================================================================== #
     # Task
     # ===================================================================== #

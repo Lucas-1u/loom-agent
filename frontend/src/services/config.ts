@@ -38,6 +38,7 @@ export const ENDPOINTS = {
 
   // ---- Session ----
   sessions: "/api/sessions",
+  session: (id: string) => `/api/sessions/${id}`,
   sessionMessages: (id: string) => `/api/sessions/${id}/messages`,
 
   // ---- Task ----

@@ -62,7 +62,7 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 const CREATE_TASK_TIMEOUT_MS = 60_000;
 
 interface RequestOpts {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PATCH";
   body?: unknown;
   headers?: Record<string, string>;
   timeoutMs?: number;
@@ -211,6 +211,23 @@ export async function createSession(b: {
   return toSession(r);
 }
 
+/**
+ * 改会话（标题 / 工作目录）。
+ *
+ * ★ 后端只在「该会话还没有任务」时允许改工作目录，否则 409。
+ *   这不是前端能绕过的限制 —— 会话归属是历史事实，改了就串线。
+ */
+export async function updateSession(
+  sessionId: string,
+  b: { title?: string; workspace?: string },
+): Promise<Session> {
+  const r = await request<RawSession>(ENDPOINTS.session(sessionId), {
+    method: "PATCH",
+    body: b,
+  });
+  return toSession(r);
+}
+
 export async function sessionMessages(sessionId: string): Promise<Message[]> {
   const r = await request<{ session_id: string; messages: Message[] }>(
     ENDPOINTS.sessionMessages(sessionId),
@@ -251,6 +268,7 @@ function toTask(r: RawTask): Task {
     end_reason: r.end_reason || undefined,
     result: r.result || undefined,
     turn: r.turn,
+    workspace: r.workspace,
   };
 }
 

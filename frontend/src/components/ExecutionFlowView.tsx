@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EventEnvelope } from "../types/events";
 import type { Task } from "../features/session/types";
 import { relativeTime } from "../features/session/selectors";
+import { sameWorkspace } from "../features/session/workspace";
 import { EventTimeline } from "./EventTimeline";
 
 /**
@@ -23,12 +24,15 @@ export function ExecutionFlowView({
   activeTaskId,
   onSelectTask,
   onApprovalResolve,
+  sessionWorkspace,
 }: {
   events: EventEnvelope[];
   tasks: Task[];
   activeTaskId: string | null;
   onSelectTask: (taskId: string) => void;
   onApprovalResolve?: (id: string, approved: boolean) => void;
+  /** 当前会话的工作目录，用来标出「历史任务跑在别的目录」 */
+  sessionWorkspace?: string;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -39,6 +43,18 @@ export function ExecutionFlowView({
   const activeTask = useMemo(
     () => tasks.find((t) => t.task_id === activeTaskId) ?? null,
     [tasks, activeTaskId],
+  );
+
+  /**
+   * 历史任务是否跑在别的目录。
+   *
+   * ★ 旧版本允许在会话里切换工作目录（只改本地），于是同一个会话里
+   *   可能混着两个项目的任务。数据不能悄悄改写，但要**明确标出来**，
+   *   否则用户看到的就是"LLMstudy 的会话里是 Try_agent 的内容"。
+   */
+  const mismatch = useCallback(
+    (t: Task) => Boolean(t.workspace && sessionWorkspace && !sameWorkspace(t.workspace, sessionWorkspace)),
+    [sessionWorkspace],
   );
 
   const initialScroll = useRef(
@@ -106,6 +122,11 @@ export function ExecutionFlowView({
             </span>
             <span className="min-w-0 flex-1 truncate text-[12px] text-slate-300">
               {activeTask?.goal ?? "（未选择任务）"}
+              {activeTask && mismatch(activeTask) && (
+                <span className="ml-2 text-[10px] font-normal text-tone-amber">
+                  ⚠ 该任务实际在 {activeTask.workspace} 执行，与会话目录不同
+                </span>
+              )}
             </span>
             <span className="shrink-0 text-[10px] text-slate-600">
               {expandedPicker ? "收起" : "切换"}
@@ -150,6 +171,11 @@ export function ExecutionFlowView({
                       <span className="block text-[10px] text-slate-600">
                         <StatusDot status={t.status} /> {t.status} · {relativeTime(t.started_at)}
                       </span>
+                      {mismatch(t) && (
+                        <span className="mt-0.5 block truncate text-[10px] text-tone-amber">
+                          ⚠ 实际在 {t.workspace} 执行（与会话目录不同）
+                        </span>
+                      )}
                     </span>
                   </button>
                 );
