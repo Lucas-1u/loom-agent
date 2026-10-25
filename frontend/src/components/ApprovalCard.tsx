@@ -35,7 +35,8 @@ export function ApprovalCard({
   const tool = String(data.tool ?? "");
 
   const riskStyle =
-    risk === "delete"
+    // exec（执行任意命令）按最高风险显示：它的影响面比改一个文件大
+    risk === "delete" || risk === "exec"
       ? "border-tone-red/40 bg-tone-red/10 text-tone-red"
       : risk === "write"
         ? "border-tone-amber/40 bg-tone-amber/10 text-tone-amber"

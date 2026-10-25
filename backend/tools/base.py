@@ -78,6 +78,10 @@ class ErrorKind(str, Enum):
     #   混在 invalid_arguments 里，模型只会看到笼统的"参数不对"。
     PATCH_CONFLICT = "patch_conflict"     # old_string 未找到，或匹配到多处
     STALE_CONTENT = "stale_content"       # 文件在读取之后被改过
+    # ---- 命令执行：沙箱不可用 -------------------------------------------
+    # ★ 单独一类，是为了让「Docker 没装」和「命令跑失败了」在日志/UI 上
+    #   一眼能分清。它**不是**可重试错误：环境没修好之前重试只会再撞一次。
+    SANDBOX_UNAVAILABLE = "sandbox_unavailable"
 
 
 # 哪些错误值得让模型换个姿势再试一次
@@ -192,6 +196,18 @@ class ToolResult:
             if self.error.get("hint"):
                 parts.append(f"建议：{self.error['hint']}")
             parts.append(f"错误类型：{self.error.get('kind')}")
+            # ★ 失败也可能带数据（典型：run_command 非零退出，stdout/stderr
+            #   必须喂给模型它才能修）。以前这里直接 return，模型看不到报错。
+            if self.data is not None:
+                body = (
+                    self.data
+                    if isinstance(self.data, str)
+                    else json.dumps(self.data, ensure_ascii=False, indent=2, default=str)
+                )
+                text = "\n".join(parts) + "\n\n" + body
+                if len(text) > max_chars:
+                    text = text[:max_chars] + f"\n\n…（内容被截断，原长 {len(text)} 字符）"
+                return text
             return "\n".join(parts)[:max_chars]
 
         # 成功：优先喂 data（内容），没有 data 就喂 summary
@@ -230,6 +246,9 @@ class ToolContext:
     approval_id: str = ""
     # 是否已获授权（Policy 判定后置 True；写工具检查它）
     authorized: bool = False
+    # ★ 任务取消信号（AgentCore 的 cancel_event）。长耗时工具（run_command）
+    #   必须在它被 set 时立刻收手，否则"用户点了停止"要等命令自己超时。
+    cancel_event: Any = None
 
     # 可注入的配置（避免工具直接 import config，保证可测试）
     max_read_chars: int = 40_000

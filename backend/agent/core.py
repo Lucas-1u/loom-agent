@@ -577,7 +577,13 @@ class AgentCore:
             if granted is None:
                 # 被拒绝 / 超时 → 构造失败结果回灌
                 return None
-            ctx = make_context(state, approval_id=granted, authorized=True)
+            ctx = make_context(
+                state,
+                approval_id=granted,
+                authorized=True,
+                # ★ 长耗时工具（run_command）要能感知"用户点了停止"
+                cancel_event=self._cancel_event,
+            )
 
         # ---- 执行 -------------------------------------------------------
         t0 = time.time()

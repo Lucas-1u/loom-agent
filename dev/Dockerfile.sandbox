@@ -1,0 +1,37 @@
+# Loom 沙箱镜像
+#
+# 构建（只需一次，之后 run_command 都用本地镜像，不会联网拉取）：
+#     docker build -f dev/Dockerfile.sandbox -t loom-sandbox:py312 .
+#
+# ★ 为什么要有这个文件
+#   沙箱默认禁网（--network none），运行期 pip install 一定失败。
+#   所以依赖必须**打进镜像**，而不是让 Agent 在容器里现装。
+#   需要更多依赖时：改下面的 pip install 行，重新 build。
+#
+# ★ 镜像固定策略
+#   基础镜像锁到具体小版本（3.12.7）。要更严格就锁 digest：
+#     docker image inspect --format '{{index .RepoDigests 0}}' python:3.12.7-slim
+#   然后把 FROM 换成 python@sha256:...
+#   运行时还会加 `--pull never`：本地没有就报错，绝不隐式联网。
+#
+# ★ 用户
+#   镜像内 uid 1000 = loom；运行时再用 --user 1000:1000 显式指定（双保险）。
+#   root 只出现在 build 阶段。
+
+FROM python:3.12.7-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# 只装"跑测试"需要的最小集合，不装编译工具链（镜像越小，攻击面越小）
+RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin loom \
+    && python -m pip install "pytest==8.3.3"
+
+USER loom
+WORKDIR /workspace
+
+# 默认命令只是给 `docker run -it loom-sandbox:py312` 手动排查用；
+# Loom 实际执行时会在镜像名后覆盖 argv。
+CMD ["python", "--version"]

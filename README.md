@@ -45,8 +45,58 @@ Loom：[PLAN   ] 计划 3 步
 | 结构化事件流（16 种事件类型） | ✅ |
 | Windows 一键启动器 | ✅ |
 | `delete_file` | ⬜ 下一步 |
-| `run_command`（allowlist + 审批） | ⬜ 待定 |
+| `run_command`（**Docker 沙箱** + 审批） | ✅ |
 | 桌面 GUI（Tauri + React） | ⬜ 规划中 |
+
+---
+
+## 命令执行（`run_command` + Docker 沙箱）
+
+Agent 可以跑 Python 脚本、pytest、构建命令，但**只能在容器里跑**。
+审批与隔离是两层：批准只代表"这条命令可以执行"，**不会**放宽任何一条隔离限制。
+
+### 一次性准备镜像
+
+沙箱默认断网，所以依赖必须打进镜像（运行期 `pip install` 一定失败）：
+
+```bash
+docker build -f dev/Dockerfile.sandbox -t loom-sandbox:py312 .
+```
+
+需要更多依赖就改 `dev/Dockerfile.sandbox` 里的 `pip install` 再 build。
+镜像默认锁到 `python:3.12.7-slim`；要更严格可锁 digest（见该文件注释）。
+运行时带 `--pull never`，本地没有镜像时直接报错，**不会偷偷联网拉取**。
+
+### 每次执行的固定限制（写死在代码里，模型改不了）
+
+| 限制 | 值 |
+|---|---|
+| 网络 | `--network none`（要联网必须改代码） |
+| 用户 | `--user 1000:1000`（非 root） |
+| 根文件系统 | `--read-only`，只有 `/tmp` 是 tmpfs |
+| capabilities | `--cap-drop ALL` + `no-new-privileges` |
+| 资源 | 1 CPU / 512MB 内存（含 swap）/ 128 进程 / 默认 60s、上限 300s |
+| 挂载 | 只挂工作区到 `/workspace`（读写），不挂 docker.sock / 家目录 / 系统目录 |
+| 环境变量 | 只注入 `HOME` / `TMPDIR` / 三个 Python 变量，不透传宿主机 env |
+| 输出 | stdout / stderr 各 16KB，超出截断（不静默） |
+
+### Docker 不可用时
+
+`run_command` 返回 `sandbox_unavailable` 并说明原因，**不会退回到宿主机执行**。
+服务启动时会在横幅和 `/api/health` 的 `sandbox` 字段里显示状态。
+
+### 测试
+
+```bash
+python -m backend.selfcheck_sandbox        # 88 项，离线（不需要 Docker）
+python -m backend.test_sandbox_docker      # 真实容器；没有 Docker 会 [SKIP]
+```
+
+离线用例验证的是**参数与控制流**，不能替代真实隔离验证。
+
+> ⚠️ 这不是"绝对安全"的沙箱：它与 Docker 守护进程同权限级别，
+> 容器逃逸/内核漏洞仍可能影响宿主机。它降低的是"Agent 跑错命令把系统搞坏"的风险，
+> 不是对抗恶意代码的强隔离。
 
 ---
 

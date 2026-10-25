@@ -1,0 +1,12 @@
+# Docker 构建上下文排除项
+# 沙箱镜像不需要项目源码（只挂载工作区），所以把大目录全排除，
+# 避免 build 时把几百 MB 的 .venv / node_modules 传给 Docker。
+.venv/
+node_modules/
+frontend/
+sandbox/
+.git/
+__pycache__/
+*.pyc
+*.log
+.env

@@ -28,6 +28,7 @@ import uvicorn
 from ..agent.core import AgentConfig
 from ..config import PROJECT_ROOT, Config, load_dotenv_if_present
 from ..models.openai_compat import OpenAICompatAdapter
+from ..sandbox import SandboxManager
 from ..tools.registry import build_default_registry
 from .app import create_app
 from .hub import EventHub
@@ -106,11 +107,32 @@ async def amain(args: argparse.Namespace) -> int:
 
     # ---- ④ 装配 ----
     hub = EventHub()
+
+    # ★ 命令沙箱：先探测，把结果作为**明确的环境状态**告诉用户。
+    #   Docker 不可用不影响启动（只读/写文件仍可用），但 run_command 会明确失败，
+    #   绝不降级到宿主机执行。
+    sandbox = SandboxManager(cfg.sandbox)
+    # disabled 时 probe 会立刻返回 unavailable（不碰 docker），
+    # 这样 /api/health 里也能看到"已禁用"而不是 null。
+    sb = await sandbox.probe()
+    if not cfg.sandbox.enabled:
+        sb_line = "已禁用（LOOM_SANDBOX_ENABLED=0）"
+        sb_warn = "run_command 会被直接拒绝"
+    elif sb.ready:
+        sb_line = f"docker {sb.version} / {sb.image}"
+        sb_warn = ""
+    else:
+        sb_line = "不可用"
+        sb_warn = (
+            f"{sb.detail.splitlines()[0] if sb.detail else 'Docker 未就绪'}\n"
+            "      run_command 会被拒绝（不会改在宿主机执行）"
+        )
+
     scheduler = TaskScheduler(
         store=store,
         hub=hub,
         adapter=OpenAICompatAdapter.from_config(cfg.model),
-        registry=build_default_registry(),
+        registry=build_default_registry(sandbox=sandbox),
         config=AgentConfig.from_budget_config(cfg.budgets),
         max_global=args.max_tasks,
     )
@@ -121,6 +143,7 @@ async def amain(args: argparse.Namespace) -> int:
         scheduler=scheduler,
         provider=cfg.model.provider,
         model=cfg.model.model,
+        sandbox=sandbox,
     )
 
     print("=" * 62)
@@ -130,8 +153,12 @@ async def amain(args: argparse.Namespace) -> int:
     print(f"  模型      {cfg.model.provider} / {cfg.model.model}")
     print(f"  数据库    {db_path}")
     print(f"  并发上限  {args.max_tasks}")
+    print(f"  命令沙箱  {sb_line}")
     print(f"  健康检查  http://{host}:{port}/api/health")
     print("=" * 62)
+    if sb_warn:
+        print(f"[!] {sb_warn}")
+        print()
 
     config = uvicorn.Config(
         app,
@@ -149,6 +176,13 @@ async def amain(args: argparse.Namespace) -> int:
         # 退出前尽力收尾：取消在跑的任务并落盘
         print("\n正在关闭…")
         await scheduler.shutdown(timeout=5.0)
+        # 杀掉可能还活着的沙箱容器（--rm 只管正常退出）
+        try:
+            killed = await sandbox.close()
+            if killed:
+                print(f"  已清理 {killed} 个沙箱容器")
+        except Exception:  # noqa: BLE001
+            log.exception("清理沙箱容器失败")
         # 显式关库：连接是长生命周期的，不关会留着 -wal / -shm
         await store.close()
 

@@ -79,6 +79,19 @@ def sse_frame(event_type: str, data: dict[str, Any], *, eid: int | None = None) 
 # --------------------------------------------------------------------------- #
 # 应用工厂
 # --------------------------------------------------------------------------- #
+def _sandbox_info(sandbox: Any) -> dict[str, Any] | None:
+    """
+    沙箱状态（给 /api/health 用）。
+
+    用鸭子类型而不是 import SandboxManager：这一层只做协议转换，
+    不该依赖具体实现。没装配沙箱时返回 None。
+    """
+    if sandbox is None:
+        return None
+    status = sandbox.cached_status() if hasattr(sandbox, "cached_status") else None
+    return status.to_dict() if status is not None else None
+
+
 def create_app(
     *,
     store: TaskStore,
@@ -86,6 +99,7 @@ def create_app(
     scheduler: TaskScheduler,
     provider: str = "",
     model: str = "",
+    sandbox: Any = None,
 ) -> FastAPI:
     app = FastAPI(title="Loom Agent Server", version="0.1.0")
 
@@ -122,6 +136,9 @@ def create_app(
             "time": time.time(),
             "scheduler": scheduler.stats(),
             "hub": hub.stats(),
+            # 命令沙箱状态：available=false 时 run_command 会被明确拒绝
+            # （不会降级到宿主机执行）。null 表示当前进程没有装配沙箱。
+            "sandbox": _sandbox_info(sandbox),
         }
 
     # ===================================================================== #

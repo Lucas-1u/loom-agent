@@ -237,6 +237,52 @@ BACKUP_DIR_NAME: str = ".loom_backup"
 
 
 # --------------------------------------------------------------------------- #
+# 命令执行沙箱（Docker）
+# --------------------------------------------------------------------------- #
+@dataclass
+class SandboxConfig:
+    """
+    沙箱容器的限制条件。
+
+    ★ 这些值决定「Agent 的任意命令最多能伤到哪儿」。
+      模型无权修改其中任何一项 —— 它只能给 command / args / cwd / timeout。
+    ★ network 刻意**不开放环境变量**：想联网必须改代码，
+      这样"某次调试临时开个网"不会悄悄变成默认行为。
+    """
+
+    image: str = "loom-sandbox:py312"     # 由 dev/Dockerfile.sandbox 构建；也可填 python@sha256:...
+    docker_bin: str = "docker"
+    enabled: bool = True                  # False = 直接拒绝执行（不是改在宿主机跑）
+
+    network: str = "none"
+    user: str = "1000:1000"               # 非 root
+    memory: str = "512m"
+    cpus: str = "1.0"
+    pids_limit: int = 128
+    tmpfs_size: str = "64m"
+    workspace_mount: str = "/workspace"   # 工作区在容器内的固定挂载点
+
+    default_timeout_s: int = 60
+    max_timeout_s: int = 300
+    max_output_bytes: int = 16_384        # 单条流（stdout / stderr 各自）上限
+
+    @classmethod
+    def from_env(cls) -> "SandboxConfig":
+        return cls(
+            image=_env("LOOM_SANDBOX_IMAGE", "loom-sandbox:py312"),
+            docker_bin=_env("LOOM_DOCKER_BIN", "docker") or "docker",
+            enabled=_env("LOOM_SANDBOX_ENABLED", "1").lower() not in ("0", "false", "off", "no"),
+            memory=_env("LOOM_SANDBOX_MEMORY", "512m"),
+            cpus=_env("LOOM_SANDBOX_CPUS", "1.0"),
+            pids_limit=_env_int("LOOM_SANDBOX_PIDS", 128),
+            tmpfs_size=_env("LOOM_SANDBOX_TMPFS", "64m"),
+            default_timeout_s=_env_int("LOOM_SANDBOX_TIMEOUT", 60),
+            max_timeout_s=_env_int("LOOM_SANDBOX_MAX_TIMEOUT", 300),
+            max_output_bytes=_env_int("LOOM_SANDBOX_MAX_OUTPUT", 16_384),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # 总配置
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -244,6 +290,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig.from_env)
     model: ModelConfig = field(default_factory=ModelConfig.from_env)
     budgets: BudgetConfig = field(default_factory=BudgetConfig.from_env)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig.from_env)
     log_level: str = "INFO"
 
     @classmethod
@@ -253,6 +300,7 @@ class Config:
             server=ServerConfig.from_env(),
             model=ModelConfig.from_env(provider),
             budgets=BudgetConfig.from_env(),
+            sandbox=SandboxConfig.from_env(),
             log_level=_env("LOOM_LOG_LEVEL", "INFO"),
         )
 

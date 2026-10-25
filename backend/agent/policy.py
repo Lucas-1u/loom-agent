@@ -303,8 +303,11 @@ class Policy:
             )
 
         # ---- 路径重新校验（TOCTOU）-------------------------------------
-        if tool.risk in (RiskLevel.WRITE, RiskLevel.DELETE):
-            candidate = args.get("path") or args.get("target")
+        # ★ EXEC 也要查：run_command 的 cwd 决定命令落在哪个目录。
+        #   虽然 cwd 已经在 args_hash 里（改了会被上面拦住），
+        #   这里再解析一次，防的是"审批期间工作区里那个目录被换成符号链接"。
+        if tool.risk in (RiskLevel.WRITE, RiskLevel.DELETE, RiskLevel.EXEC):
+            candidate = args.get("path") or args.get("target") or args.get("cwd")
             if candidate:
                 try:
                     resolve_in_workspace(state.workspace, candidate, must_exist=False)
@@ -344,6 +347,7 @@ def make_context(
     *,
     approval_id: str = "",
     authorized: bool = False,
+    cancel_event: Any = None,
 ) -> ToolContext:
     """
     从 TaskState 造一个 ToolContext。
@@ -366,6 +370,7 @@ def make_context(
         turn=state.turn,
         approval_id=approval_id,
         authorized=authorized,
+        cancel_event=cancel_event,
         max_read_chars=MAX_READ_CHARS,
         ignored_dir_names=frozenset(IGNORED_DIR_NAMES),
         sensitive_names=frozenset(SENSITIVE_NAMES),

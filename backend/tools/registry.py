@@ -152,15 +152,21 @@ class ToolRegistry:
 # --------------------------------------------------------------------------- #
 # 默认注册表（v0.1a 工具集）
 # --------------------------------------------------------------------------- #
-def build_default_registry(*, include_mutating: bool = True) -> ToolRegistry:
+def build_default_registry(
+    *,
+    include_mutating: bool = True,
+    sandbox: "SandboxManager | None" = None,
+) -> ToolRegistry:
     """
     构建默认工具集。
 
         readonly : list_files, read_file       （自动执行）
         mutating : write_file, edit_file       （需审批）
-        —— 后续会补 delete_file / run_command
+        exec     : run_command                 （需审批 + Docker 沙箱）
 
-    参数 include_mutating 允许「只读模式」：实验时可一键关掉所有写能力。
+    参数 include_mutating 允许「只读模式」：实验时可一键关掉所有写/执行能力。
+    sandbox 允许外部注入 SandboxManager（服务端统一管理容器生命周期；
+    不传则工具自己建一个）。
     """
     from .readonly.list_files import make as make_list
     from .readonly.read_file import make as make_read
@@ -170,6 +176,7 @@ def build_default_registry(*, include_mutating: bool = True) -> ToolRegistry:
     reg.register(make_read(), group="readonly")
 
     if include_mutating:
+        from .exec.run_command import make as make_run
         from .mutating.edit_file import make as make_edit
         from .mutating.write_file import make as make_write
 
@@ -177,6 +184,9 @@ def build_default_registry(*, include_mutating: bool = True) -> ToolRegistry:
         #   这里 write 在前只是因为它是先写的。
         reg.register(make_write(), group="mutating")
         reg.register(make_edit(), group="mutating")
+        # ★ run_command 单独分组：它的风险不在"改文件"，而在"能执行任意程序"，
+        #   安全边界是 Docker 容器（见 backend/sandbox/manager.py）。
+        reg.register(make_run(sandbox), group="exec")
 
     return reg
 
