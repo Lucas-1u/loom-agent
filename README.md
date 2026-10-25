@@ -88,8 +88,8 @@ docker build -f dev/Dockerfile.sandbox -t loom-sandbox:py312 .
 ### 测试
 
 ```bash
-python -m backend.selfcheck_sandbox        # 88 项，离线（不需要 Docker）
-python -m backend.test_sandbox_docker      # 真实容器；没有 Docker 会 [SKIP]
+python -m backend.selfcheck_sandbox        # 96 项，离线（不需要 Docker）
+python -m backend.test_sandbox_docker      # 25 项真实容器；没有 Docker 会 [SKIP]
 ```
 
 离线用例验证的是**参数与控制流**，不能替代真实隔离验证。

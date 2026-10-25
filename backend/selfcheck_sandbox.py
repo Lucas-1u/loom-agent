@@ -369,6 +369,23 @@ async def test_run_flow(ws: str) -> None:
     check(r.data["truncated"] is True, "★ 标记 truncated")
     check("截断" in r.summary, f"摘要里提示截断（{r.summary}）")
 
+    # ---- 带 cancel_event 但命令正常结束：不能被误判成取消 ----
+    # ★ 回归：`finally` 里 `cancel_task.cancel()` 后 `await` 它，抛的是
+    #   CancelledError（BaseException），`suppress(Exception)` 抓不住 →
+    #   命令明明成功了，整个任务却被判成 "cancelled"。
+    #   只有「带了 cancel_event 且命令正常结束」才会走到，离线用例之前漏了。
+    docker_idle = FakeDocker(FakeProc(stdout=b"ok\n", code=0))
+    tool_idle, _ = build_tool(docker_idle)
+    idle = asyncio.Event()          # 永不 set
+    ctx_idle = make_context(
+        TaskState(goal="g", workspace=ws, task_id="task_ok01"),
+        authorized=True, cancel_event=idle,
+    )
+    r = await tool_idle.run({"command": "python", "args": ["-c", "print(1)"]}, ctx_idle)
+    check(r.ok and r.data["exit_code"] == 0 and r.data["cancelled"] is False,
+          "★★ 带 cancel_event 的正常执行不会被误判为取消",
+          {"ok": r.ok, "cancelled": r.data.get("cancelled")})
+
     # ---- spawn 失败 ----
     docker = FakeDocker(proc=None)
     tool, _ = build_tool(docker)

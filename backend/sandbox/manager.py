@@ -372,8 +372,13 @@ class SandboxManager:
                     )
                 if cancel_task is not None:
                     cancel_task.cancel()
-                    with contextlib.suppress(Exception):
-                        await cancel_task
+                    # ★ 不能用 `suppress(Exception)` 包 `await cancel_task`：
+                    #   await 一个被取消的 Task 抛的是 CancelledError，
+                    #   而它继承自 BaseException —— suppress(Exception) 抓不住。
+                    #   这条路径在「命令**正常**结束、但带了 cancel_event」时必定走到，
+                    #   漏掉会把整个任务误判成"用户取消"（真实 E2E 才暴露的 bug）。
+                    #   gather(return_exceptions=True) 会把 CancelledError 当结果收下。
+                    await asyncio.gather(cancel_task, return_exceptions=True)
         except asyncio.CancelledError:
             # 外层任务被硬取消：也要把容器带走
             await self._kill_container(name, task_id=task_id)
@@ -389,6 +394,10 @@ class SandboxManager:
             if not self._active.get(task_id):
                 self._active.pop(task_id, None)
 
+        log.info(
+            "沙箱执行结束 container=%s exit=%s timed_out=%s cancelled=%s 用时=%.1fs",
+            name, exit_code, timed_out, cancelled, time.time() - t0,
+        )
         return RunOutcome(
             exit_code=exit_code,
             stdout=out_buf.decode("utf-8", "replace"),

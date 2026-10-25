@@ -79,6 +79,19 @@ async def amain() -> int:
         r = await tool.run({"command": "python", "args": ["hello.py"]}, ctx)
         check(r.ok and "from-file" in r.data["stdout"], "运行工作区里的脚本")
 
+        # ★ 带 cancel_event 但命令正常结束 —— 真实 E2E 里踩过的坑：
+        #   finally 里 await 被 cancel 的辅助任务会抛 CancelledError
+        #   （BaseException，suppress(Exception) 抓不住），把成功误判成取消。
+        idle = asyncio.Event()      # 永不 set
+        ctx_idle = make_context(
+            TaskState(goal="正常结束", workspace=ws, task_id="task_docker_ok"),
+            authorized=True, cancel_event=idle,
+        )
+        r = await tool.run({"command": "python", "args": ["-c", "print('ok')"]}, ctx_idle)
+        check(r.ok and r.data.get("exit_code") == 0,
+              "★★ 带 cancel_event 的正常执行不被误判为取消",
+              {"cancelled": r.data.get("cancelled"), "exit": r.data.get("exit_code")})
+
         # ---- 2. 非零退出 + stderr ----
         print("\n[2] 非零退出")
         r = await tool.run(
@@ -136,6 +149,59 @@ async def amain() -> int:
         )
         leftovers = [n for n in out.splitlines() if n.strip()]
         check(code == 0 and not leftovers, "★★ 没有残留的沙箱容器", leftovers)
+
+        # ---- 10. 资源限制是否真的落到了 cgroup ----
+        print("\n[10] 资源限制（读容器内 cgroup，证明参数生效）")
+        r = await tool.run({"command": "sh", "args": ["-c",
+            "cat /sys/fs/cgroup/pids.max; "
+            "cat /sys/fs/cgroup/memory.max; "
+            "cat /sys/fs/cgroup/cpu.max"]}, ctx)
+        lines = [x.strip() for x in (r.data.get("stdout") or "").splitlines() if x.strip()]
+        check(lines[0:1] == ["128"], "★★ pids 上限 128 生效", lines[0:1])
+        check(lines[1:2] == ["536870912"], "★★ 内存上限 512MB 生效", lines[1:2])
+        check(lines[2:3] == ["100000 100000"], "★★ CPU 上限 1 核生效", lines[2:3])
+
+        # ---- 11. 凭据 / socket / 挂载面 ----
+        print("\n[11] 凭据与挂载面")
+        r = await tool.run({"command": "sh", "args": ["-c",
+            "env; echo '---SOCK---'; ls /var/run/docker.sock 2>&1; "
+            "echo '---ROOT---'; ls /workspace/.."]}, ctx)
+        out = r.data.get("stdout") or ""
+        env_part, _, rest = out.partition("---SOCK---")
+        sock_part, _, root_part = rest.partition("---ROOT---")
+        check("BAILIAN_API_KEY" not in out and "DEEPSEEK_API_KEY" not in out,
+              "★★ 没有注入宿主 API Key")
+        env_lines = [x for x in env_part.splitlines() if "=" in x]
+        check(len(env_lines) < 20, f"★ 环境变量很少（{len(env_lines)} 个，无宿主 env 透传）")
+        check("No such file" in sock_part or "cannot access" in sock_part,
+              "★★ 容器内没有 docker.sock", sock_part.strip()[:60])
+        check("bin" in root_part and "etc" in root_part and "Loom_agent" not in root_part,
+              "★★ /workspace/.. 是容器根（看不到宿主目录）", root_part.strip().replace("\n", " ")[:80])
+
+        # ---- 12. 任务取消 → 容器被清理 ----
+        print("\n[12] 取消清理")
+        cancel = asyncio.Event()
+        ctx2 = make_context(
+            TaskState(goal="取消测试", workspace=ws, task_id="task_docker_cancel"),
+            authorized=True, cancel_event=cancel,
+        )
+
+        async def _fire() -> None:
+            await asyncio.sleep(2.0)
+            cancel.set()
+
+        task = asyncio.create_task(_fire())
+        r = await tool.run(
+            {"command": "python", "args": ["-c", "import time; time.sleep(60)"], "timeout_s": 60},
+            ctx2,
+        )
+        task.cancel()
+        check(r.data.get("cancelled") is True, "★★ 取消后标记 cancelled", r.data.get("cancelled"))
+        check(not mgr.active_containers(), "取消后登记表清空", mgr.active_containers())
+        code, out3, _ = await mgr._docker_quick(
+            ["ps", "-a", "--filter", "name=loom-sbx-", "--format", "{{.Names}}"], 10
+        )
+        check(not out3.strip(), "★★ 取消后没有残留容器", out3.strip())
 
     finally:
         await mgr.close()
