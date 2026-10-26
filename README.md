@@ -5,7 +5,7 @@
 目标形态是 Codex / Cursor 式的个人 Coding Agent。但现阶段的目标不是"功能做得多"，
 而是 **"每一步都能讲清楚为什么"** —— 这是一个用来**理解现代 AI Agent 内部架构**的实验平台。
 
-**纯 Python · 不用编排框架 · 自检 397/397 · 真实模型 7/7 场景通过**
+**纯 Python · 手写 Agent Loop · 自检 1022 项（离线，全部通过）· 真实模型 7/7 场景通过**
 
 ---
 
@@ -33,20 +33,23 @@ Loom：[PLAN   ] 计划 3 步
 跟"调一个 API 让模型聊天"的区别在于：**Agent Loop、状态机、权限判定、事件流全部是手写的显式代码**，
 不藏在任何编排框架里。
 
-### 它现在能做什么（v0.1a）
+### 它现在能做什么（截至 M2.2）
 
 | 能力 | 状态 |
 |---|---|
 | 五阶段 Agent Loop（PLAN / ACT / OBSERVE / REFLECT / FINAL） | ✅ |
-| 工具调用（列目录 / 读文件 / 写文件） | ✅ |
+| 工具调用（列目录 / 读文件 / 写文件 / 局部修改 / 沙箱执行命令） | ✅ 共 5 个 |
 | **局部修改** `edit_file`（唯一匹配 / 冲突检测 / stale 检测 / diff 预览） | ✅ |
 | 写操作**人工审批**（真挂起-恢复，不是轮询） | ✅ |
-| 工作区越界防护 | ✅ |
-| 结构化事件流（16 种事件类型） | ✅ |
+| 工作区越界防护 / 允许-禁止范围 / 改动审计 | ✅ |
+| 结构化事件流（**17** 种事件类型） | ✅ |
+| 上下文压缩 / 文件读取复用 / 预算续期 | ✅ |
+| 消息历史持久化（`task_history`，append-only） | ✅ |
+| 编排引擎（`LOOM_ORCHESTRATOR=legacy\|graph`，默认 legacy） | ✅ 双引擎 |
 | Windows 一键启动器 | ✅ |
-| `delete_file` | ⬜ 下一步 |
-| `run_command`（**Docker 沙箱** + 审批） | ✅ |
-| 桌面 GUI（Tauri + React） | ⬜ 规划中 |
+| `delete_file` | ⬜ **未实现**（从未写过，不在当前 M1–M6 计划内） |
+| 浏览器 GUI（React + Vite） | ✅ 已接真实后端 |
+| 桌面外壳（Tauri） | ⬜ 未实现（`frontend/src-tauri` 不存在） |
 
 ---
 
@@ -201,17 +204,25 @@ python dev/install_desktop.py --remove   # 卸载
 > 安装时会把 `__LOOM_HOME__` 占位符替换成当前项目路径 —— 不用手改。
 > 项目挪了位置，重跑一次安装脚本即可。
 
-### GUI 界面（Phase 2 · 演示数据）
+### GUI 界面（Phase 3c 起已接真实后端）
 
-前端已可用，但**还没接后端** —— 界面里的事件是手写的演示数据，不是真实执行记录。
-右上角常驻一个 `DEMO` 徽章，就是提醒这件事。
+前端是**真的在跟后端说话**：会话/任务来自 `GET /api/sessions`、`POST /api/tasks`，
+执行过程走 `GET /api/stream`（SSE，断线用 `?since=<lastId>` 补拉），审批走
+`POST /api/approvals/{id}/decision`。演示数据只在后端不可达时兜底（右上角会显示 `DEMO` /
+`OFFLINE` 徽章，不会假装连上了）。
 
 ```bash
-cd frontend
-npm install
-npm run dev              # http://localhost:5173
-npm run test:workspace   # 路径规范化 / 分组逻辑的单元测试（26 项）
+# 先起后端（默认 127.0.0.1:8765），再起前端
+python -m backend.server
+cd frontend && npm install && npm run dev      # http://localhost:5173
+
+npm run test:workspace   # 路径规范化 / 分组（26 项）
+npm run test:session     # 会话隔离（16 项）
+npm run test:events      # 事件契约：后端 EventType ↔ 前端清单 ↔ 样式（31 项）
 ```
+
+> `test:events` 不是可选的：`eventStream.ts` 是**按 `EVENT_TYPES` 逐个 addEventListener**
+> 的，清单少一种，那种事件的 SSE 帧就会被浏览器静默丢弃（`context.compacted` 就这么丢过一次）。
 
 **三栏布局：左侧按工作目录分组的会话列表 + 中央双视图 + 底部工作区与输入框。**
 
@@ -244,8 +255,10 @@ Session（有自己的工作目录）
 | `?view=execution` | 直接打开执行流视图 |
 | `?view=execution&scroll=top` | 从时间线开头看，而不是贴底 |
 
-**当前进度**：布局 / 会话分组 / 双视图 / 事件配色 / 折叠 / 自动滚动 / 响应式都已就绪。
-**下一步**（Phase 3）：FastAPI + SSE 桥，把演示数据换成真实事件；随后接审批交互。
+**当前进度**：布局 / 会话分组 / 双视图 / 事件配色 / 折叠 / 自动滚动 / 响应式都已就绪，
+并且 Phase 3c 已把演示数据换成真实事件（含审批卡、取消、断线补拉）。
+**下一步**：M3（RAG 检索）‖ M4（MCP 接入），之后 M5 → M6；M6 才做四项技术的展示增强
+（子任务树 / mcp / rag 标记），本轮不涉及。
 
 ---
 
@@ -295,7 +308,12 @@ User Task → PLAN → ACT(Tool Calling) → OBSERVE(Tool Result) → REFLECT �
 ### 终止条件都有明确的原因
 
 `agent_done` / `no_more_actions` / `empty_reply` / `budget_turns` / `budget_seconds` /
-`budget_tool_calls` / `too_many_errors` / `model_error` / `cancelled` / `internal_error`
+`budget_tool_calls` / `too_many_errors` / `model_error` / `cancelled` / `internal_error` /
+`verification_failed` / **`no_progress`**
+
+`no_progress` 是 M2.2 新增的：模型反复把 REFLECT 格式的进展汇报当答复提交、而期间
+**没有任何工具执行 / 新证据 / 计划推进**时，先给一次受控恢复提示，仍无进展就以这个原因终止
+（判据是"零进展"，不是"反思了几次"，见 `_handle_reflect_answer`）。
 
 中断时兜底答复会**诚实声明**"以上为中断时的实际进展，不是完整结论" ——
 只在真正中断时才说，正常完成时不出现。
@@ -315,9 +333,9 @@ Agent 做任何事都产生**结构化事件**，而不是 `print` 日志：
           "args": {"path": "main.py"}, "risk": "read"}}
 ```
 
-16 种类型：`task.start` / `task.end` / `plan` / `thinking` / `act` / `observe` /
+17 种类型：`task.start` / `task.end` / `plan` / `thinking` / `act` / `observe` /
 `tool.call` / `tool.result` / `approval.request` / `approval.decision` / `approval.expired` /
-`reflect` / `final_answer` / `error` / `budget.exceeded` / `state.snapshot`
+`reflect` / `final_answer` / `error` / `budget.exceeded` / `context.compacted` / `state.snapshot`
 
 两个关键设计：
 
@@ -416,36 +434,43 @@ loom/
 ├── loom.bat                     一键启动器（Windows）
 │
 ├── backend/                     Python Agent Runtime
-│   ├── events.py          ★★★  事件契约的唯一来源（16 种事件）
+│   ├── events.py          ★★★  事件契约的唯一来源（17 种事件）
 │   ├── state.py           ★★★  TaskState：结构化程序状态（≠ 聊天记录）
 │   ├── config.py                路径 / 模型 / 预算 / 安全常量
 │   ├── demo.py                  离线演示（不需要 API Key）
 │   │
 │   ├── agent/                   ── Agent Core ──
-│   │   ├── core.py        ★★★  五阶段循环主控
+│   │   ├── core.py        ★★★  五阶段循环主控（legacy 引擎）
+│   │   ├── graph_engine.py ★★  LangGraph 引擎（复用 core 的同一组检查点）
 │   │   ├── policy.py      ★★   执行前校验链 + 软/硬双层熔断
 │   │   ├── approval.py    ★★   审批管理器（asyncio.Future 真挂起）
-│   │   └── context.py     ★★   State → messages 单向派生
+│   │   ├── context.py     ★★   State → messages 单向派生
+│   │   ├── compaction.py       上下文压缩（状态块 + 摘要，可降级）
+│   │   ├── intent.py           意图分类 / 约束抽取 / 证据分级
+│   │   ├── scope.py            改动范围审计（基线 diff + 归因）
+│   │   ├── history_log.py      消息历史持久化（append-only + 缺口检测）
+│   │   └── state.py            （见上，契约层）
 │   │
 │   ├── tools/                   ── 工具层 ──
-│   │   ├── base.py        ★★   统一工具契约（11 种错误类型）
+│   │   ├── base.py        ★★   统一工具契约（15 种错误类型）
 │   │   ├── path_safety.py ★★★  路径越界防护
 │   │   ├── registry.py    ★★   注册表 + 统一执行入口
 │   │   ├── readonly/           list_files / read_file（自动执行）
-│   │   └── mutating/           write_file / edit_file（需审批）
-│   │       └── _shared.py      备份 / 哈希 / 文本读取（两个写工具共用）
+│   │   ├── mutating/           write_file / edit_file（需审批）
+│   │   │   └── _shared.py      备份 / 哈希 / 文本读取（两个写工具共用）
+│   │   └── exec/               run_command（需审批 + Docker 沙箱）
 │   │
 │   ├── models/                  ── 模型层 ──
 │   │   ├── adapter.py           ModelAdapter 抽象 + FakeAdapter
-│   │   └── openai_compat.py     一套实现同时服务百炼 / DeepSeek
+│   │   └── openai_compat.py     一套实现服务百炼 / DeepSeek / 讯飞（含候选轮换）
 │   │
 │   ├── cli/                     CLI 交互层
-│   │   ├── render.py            Agent 运行日志区（16 种标签）
+│   │   ├── render.py            Agent 运行日志区（按事件类型渲染）
 │   │   ├── console.py           终端输入解码（UTF-8 / GBK 宽容处理）
 │   │   ├── approve.py           审批交互
 │   │   └── main.py              入口 + 参数 + 交互 REPL
 │   │
-│   └── selfcheck_*.py           自检套件（397 项，全离线）
+│   └── selfcheck_*.py           自检套件（1022 项，全离线）
 │
 ├── dev/                         开发辅助
 │   ├── loom.bat.src             启动器源文件（UTF-8）
@@ -474,11 +499,11 @@ server/  →  agent/  →  tools/
 | 工具 | 风险 | 需审批 | 说明 |
 |---|---|---|---|
 | `list_files` | read | ❌ 自动 | 只列一层，跳过噪音目录，上限 300 条 |
-| `read_file` | read | ❌ 自动 | 40k 字符上限，多编码探测，带行号 |
+| `read_file` | read | ❌ 自动 | 40k 字符上限，多编码探测，带行号，返回内容哈希 |
 | `write_file` | write | ✅ **需确认** | 写前自动备份，`overwrite=false` 保护 |
 | `edit_file` | write | ✅ **需确认** | 只改一小段。**唯一匹配**；匹配到多处时拒绝而不是猜 |
-| `delete_file` | delete | ✅ | 下一步 |
-| `run_command` | exec | ✅ | 待定 |
+| `run_command` | exec | ✅ **需确认** | **只能在 Docker 沙箱里跑**（断网 / 只读根 / 非 root / 限额） |
+| `delete_file` | — | — | ⬜ **未实现**（`tools/mutating/` 里只有 write/edit） |
 
 判据是 **"有没有副作用"**，不是工具名。
 
@@ -490,9 +515,11 @@ server/  →  agent/  →  tools/
  "side_effects": [...], "retryable": bool, "security": bool}
 ```
 
-11 种错误类型：`not_found` / `not_a_file` / `not_a_dir` / `permission_denied` /
-`invalid_arguments` / `path_outside_workspace` / `sensitive_file` / `too_large` /
-`timeout` / `execution_error` / `not_implemented` / `internal_error`
+15 种错误类型（`tools/base.py` 的 `ErrorKind`，本次实测 `len(ErrorKind)==15`）：
+`not_found` / `not_a_file` / `not_a_dir` / `permission_denied` / `invalid_arguments` /
+`path_outside_workspace` / `sensitive_file` / `too_large` / `timeout` / `execution_error` /
+`not_implemented` / `internal_error` / `patch_conflict` / `stale_content` / `sandbox_unavailable`
+（审批被拒 / 超时不单列错误类型，走 `ToolResult` 的失败摘要回灌）
 
 `summary` 进 Evidence（给模型看结论），`data` 进消息体（给模型看细节）—— 分两个粒度是有意的。
 
@@ -501,17 +528,29 @@ server/  →  agent/  →  tools/
 ## 测试
 
 ```bash
-# 离线自检（不需要 API Key）
-python -m backend.selfcheck_p1      # 46  —— 契约层
-python -m backend.selfcheck_p2      # 32  —— 模型层
-python -m backend.selfcheck_agent   # 208 —— Agent 全链路（重点）
-python -m backend.selfcheck_cli     # 67  —— CLI 渲染 + 审批 + 终端输入解码
-python dev/test_workspace_reuse.py  # 17  —— 启动器的工作目录选择器
+# 离线自检（不需要 API Key）—— 本次全部实跑，合计 1022 项
+python -m backend.selfcheck_p1      #  54 —— 契约层（含事件类型 17 的断言）
+python -m backend.selfcheck_p2      #  45 —— 模型层（含候选轮换）
+python -m backend.selfcheck_agent   # 575 —— Agent 全链路（重点）
+python -m backend.selfcheck_cli     #  67 —— CLI 渲染 + 审批 + 终端输入解码
+python -m backend.selfcheck_server  # 185 —— 存储 / 事件广播 / 运行时 / 调度
+python -m backend.selfcheck_sandbox #  96 —— 沙箱参数与控制流（假进程）
+python dev/test_workspace_reuse.py  #  17 —— 启动器的工作目录选择器
 
-# 联网（需要 .env 里的 Key）
-python -m backend.test_live_model          # 5 个真实模型场景
+# 集成 / 真实环境
+python -m backend.server.test_live_e2e     # 51 —— 真 HTTP/SSE/调度/审批（模型用替身）
+python -m backend.test_sandbox_docker      # 25 —— 真实容器（无 Docker 会 SKIP）
+python -m backend.test_live_model          #  7 个真实模型场景（联网、烧 token）
 python -m backend.test_approval_live       # 真实交互式审批（管道喂 stdin）
+
+# 前端（cd frontend）
+npm run test:workspace   # 26 —— 路径规范化 / 分组
+npm run test:session     # 16 —— 会话隔离
+npm run test:events      # 31 —— 事件契约：后端 EventType ↔ 前端清单 ↔ 样式
 ```
+
+> 数字口径：以上是**代码里实际注册的断言数**（本次运行核对）。`selfcheck_*` 与前端
+> 三个脚本本次都实跑并通过；E2E / 真实容器 / 真实模型本次**未运行**。
 
 **为什么自检写这么多？** 因为 Agent 的行为有太多"看起来对但实际不对"的地方：
 
@@ -520,18 +559,32 @@ python -m backend.test_approval_live       # 真实交互式审批（管道喂 s
 - 审批批了 A → 实际执行的是 B
 - `/proj_evil` 被当成 `/proj` 的子目录
 
-这些都不会崩，只会静默地做错事。**397 项自检就是用来钉死这些的。**
+这些都不会崩，只会静默地做错事。**1022 项自检就是用来钉死这些的。**
 
 ---
 
 ## 路线图
 
-- ~~**v0.1b**~~ — ✅ `edit_file`（唯一匹配 / `patch_conflict` / `stale_content` /
-  CRLF 与 BOM 保真 / diff 审批预览）
-- **下一步** — `delete_file`（复用同一套备份与 stale 检测）
-- **v0.1c** — `run_command`（allowlist + 审批）
-- **v0.2** — 本地 HTTP + SSE 服务层（`POST /api/task` + `GET /api/stream`）
-- **v0.3** — Tauri + React 桌面端（Agent Core 零改动，只消费事件流）
+已完成的阶段：
+
+- ✅ **v0.1a** — 五阶段 Loop + 4 工具 + Policy + 审批（CLI）
+- ✅ **v0.1b** — `edit_file`（唯一匹配 / `patch_conflict` / `stale_content` / CRLF+BOM 保真）
+- ✅ **v0.1c** — `run_command` + Docker 沙箱（唯一执行出口，无宿主机分支）
+- ✅ **Phase 3a–3d** — SQLite 持久化 / 调度 / FastAPI+SSE / 前端接真后端 / E2E 51 项
+- ✅ **第三阶段 1–6 批** — 验证闸门 / 计划状态 / 范围审计 / 意图与证据分级 / 风险收尾确认 /
+  约束一致性 / 读取复用 / 上下文压缩 / 预算续期
+- ✅ **M1** — 编排器开关 + 消息历史持久化（`task_history`）
+- ✅ **M2** — LangGraph 引擎（`LOOM_ORCHESTRATOR=graph`，与 legacy 共用同一组检查点）
+- ✅ **M2.1** — 工具链修复（`command` 含空格一律拒 / exit 127 专属提示 / task_id 孤儿）
+- ✅ **M2.2** — 前端事件契约（`context.compacted`）+ 反思答复的无进展终止（`no_progress`）
+
+未实现 / 后续（原始计划的 M1–M6）：
+
+- ⬜ **M3** — RAG 检索（`search_docs` + FTS5，只索引文档不索引源码）
+- ⬜ **M4** — MCP 接入（`MCPToolAdapter` → 现有 Registry，默认需审批）
+- ⬜ **M5** — Multi-Agent（`spawn_subtask` + 父子任务 + 证据分级验收）
+- ⬜ **M6** — 前端展示与前后对比
+- ⬜ `delete_file`（不在 M1–M6 计划内）、Tauri 桌面外壳、跨进程续跑
 
 ---
 

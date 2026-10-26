@@ -1974,6 +1974,7 @@ async def main() -> int:
         await test_evidence_grading(sb)
         await test_risk_closure(sb)
         await test_final_answer_hygiene(sb)
+        await test_reflect_no_progress(sb)
         await test_scope_consistency(sb)
         await test_read_cache(sb)
         await test_compaction(sb)
@@ -2552,6 +2553,126 @@ async def test_final_answer_hygiene(sb: Sandbox) -> None:
     st2 = await core2.run("列一下目录", workspace=sb.dir)
     check("最终答复：目录里有 3 个条目。" in st2.final_answer,
           f"★ done=true 的进展汇报会要一份真正的答复（{st2.final_answer[:40]!r}）")
+
+
+# --------------------------------------------------------------------------- #
+# [F2] 反思答复：正常回灌 / 零进展恢复 / 无进展终止（M2.2）
+# --------------------------------------------------------------------------- #
+REFLECT_ANSWER = '{"progress":"已看过目录","next_action":"读取 main.py","done":false}'
+
+
+async def test_reflect_no_progress(sb: Sandbox) -> None:
+    """
+    [F2] 模型把 REFLECT 的 JSON 当答复交上来时的完整行为。
+
+    覆盖六种情形：
+      1. 正常 REFLECT 阶段 → 下一步工具调用（阶段机制没被破坏）
+      2. 模型把 REFLECT 当普通答复 → 不收尾
+      3. 连续多轮重复同样的反思内容 → 有界处理
+      4. 期间没有工具/证据/状态变化 → 判据是"零进展"，不是"文本重复"
+      5. 一次恢复提示后能正常执行工具 → 继续跑完
+      6. 恢复无效 → 以 no_progress 终止并清楚报告原因
+    """
+    print("\n[F2] 反思答复与无进展循环")
+
+    (Path(sb.dir) / "main.py").write_text("print('hi')\n", encoding="utf-8")
+
+    def reg():
+        r = ToolRegistry()
+        r.register(build_default_registry().get("list_files"), group="readonly")
+        r.register(build_default_registry().get("read_file"), group="readonly")
+        return r
+
+    # ---- 1. 正常 REFLECT 阶段 → 转入下一步工具调用 ------------------------
+    ad1 = FakeAdapter([
+        ModelReply(tool_calls=[tc("r1", "list_files", {"path": "."})]),
+        ModelReply(content='{"progress":"看到 main.py","next_action":"读它","done":false}'),
+        ModelReply(tool_calls=[tc("r2", "read_file", {"path": "main.py"})]),
+        ModelReply(content='{"progress":"读完了","next_action":"收尾","done":true}'),
+        ModelReply(content="main.py 里只有一行 print。"),
+    ])
+    bus1 = EventBus()
+    ev1 = collect(bus1)          # ★ 必须在 run 之前订阅，否则收不到事件
+    st1 = await AgentCore(ad1, reg(), config=AgentConfig(
+        max_turns=8, min_evidence=0, use_plan_phase=False), bus=bus1).run(
+        "看看 main.py", workspace=sb.dir)
+    await bus1.drain()
+    check(st1.status is TaskStatus.DONE, f"正常 REFLECT 流程完成（{st1.status.value}）")
+    check([e.tool for e in st1.tool_events] == ["list_files", "read_file"],
+          f"★ REFLECT 之后确实继续调用了工具（{[e.tool for e in st1.tool_events]}）")
+    check(sum(1 for e in ev1 if e.type == EventType.REFLECT) == 2, "两次 REFLECT 自评")
+    check(st1.reflect_streak == 0, "没有触发零进展计数（这类反思不走答复分支）")
+
+    # ---- 2/5. 首次把 REFLECT 当答复 → 恢复提示后正常干活 -----------------
+    ad2 = FakeAdapter([
+        ModelReply(content=REFLECT_ANSWER),
+        ModelReply(tool_calls=[tc("s1", "read_file", {"path": "main.py"})]),
+        ModelReply(content="main.py 是一行 print。"),
+    ])
+    bus2 = EventBus()
+    ev2 = collect(bus2)
+    st2 = await AgentCore(ad2, reg(), config=AgentConfig(
+        max_turns=8, min_evidence=0, use_plan_phase=False, use_reflect_phase=False),
+        bus=bus2).run("读 main.py 并说明", workspace=sb.dir)
+    await bus2.drain()
+    check(st2.status is TaskStatus.DONE, f"★ 一次回灌后任务正常完成（{st2.status.value}）")
+    check(st2.reflect_streak == 1, f"只记 1 次零进展（{st2.reflect_streak}）")
+    check(st2.reflect_recoveries == 0, "首次不触发受控恢复")
+    check(len(st2.tool_events) == 1, "★ 回灌提示后模型确实执行了工具")
+    kinds2 = [e.data.get("kind") for e in ev2 if e.type == EventType.ERROR]
+    check(kinds2.count("reflect_as_answer") == 1, "有 reflect_as_answer 提示")
+    check("no_progress" not in kinds2, "没有误判成无进展终止")
+
+    # ---- 3/4/6. 连续相同的零进展反思 → 恢复一次 → 仍不改进则终止 ---------
+    ad3 = FakeAdapter([ModelReply(content=REFLECT_ANSWER) for _ in range(5)])
+    bus3 = EventBus()
+    ev3 = collect(bus3)
+    st3 = await AgentCore(ad3, reg(), config=AgentConfig(
+        max_turns=6, min_evidence=0, use_plan_phase=False, use_reflect_phase=False),
+        bus=bus3).run("读 main.py 并说明", workspace=sb.dir)
+    await bus3.drain()
+    kinds3 = [e.data.get("kind") for e in ev3 if e.type == EventType.ERROR]
+    check(st3.status is TaskStatus.ABORTED, f"★ 零进展循环被终止（{st3.status.value}）")
+    check(st3.end_reason == "no_progress", f"★ 终止原因明确（{st3.end_reason}）")
+    check(st3.reflect_streak == 3, f"第 3 次零进展才终止（streak={st3.reflect_streak}）")
+    check(st3.reflect_recoveries == 1, f"只发一次受控恢复（{st3.reflect_recoveries}）")
+    check(len(st3.tool_events) == 0, "★ 期间确实没有任何工具执行")
+    check(kinds3.count("reflect_as_answer") == 3, f"每轮都留痕（{kinds3.count('reflect_as_answer')}）")
+    check(kinds3.count("no_progress_recovered") == 1, "恢复提示有独立事件")
+    check(kinds3.count("no_progress") == 1, "终止有独立事件")
+    check(st3.budgets.max_turns == 6, "★ 没有偷偷加大轮次预算")
+    check(st3.turn < st3.budgets.max_turns,
+          f"★ 在预算耗尽前就终止（{st3.turn}/{st3.budgets.max_turns}）")
+    check("无进展循环" in st3.final_answer, "答复说明了无进展判据")
+    check("内容完全相同" in st3.final_answer, "如实报告内容是重复的")
+    check("读取 main.py" in st3.final_answer, "点出它声称却没做的下一步")
+    check("不是完整结论" in st3.final_answer, "不把中断包装成完成")
+
+    # ---- 4b. 内容不同但同样零进展 → 仍按无进展处理（判据不是文本去重）----
+    ad4 = FakeAdapter([
+        ModelReply(content='{"progress":"看了看目录","next_action":"读 main.py","done":false}'),
+        ModelReply(content='{"progress":"又看了一遍目录","next_action":"读一下 main.py","done":false}'),
+        ModelReply(content='{"progress":"确认目录没变","next_action":"确实要读 main.py","done":false}'),
+    ])
+    bus4 = EventBus()
+    st4 = await AgentCore(ad4, reg(), config=AgentConfig(
+        max_turns=6, min_evidence=0, use_plan_phase=False, use_reflect_phase=False),
+        bus=bus4).run("读 main.py 并说明", workspace=sb.dir)
+    await bus4.drain()
+    check(st4.end_reason == "no_progress",
+          f"★ 文本不同但零进展 → 同样终止（{st4.end_reason}）")
+    check("内容有变化" in st4.final_answer, "报告里区分了'内容有变化'")
+
+    # ---- 5b. Graph 引擎同源行为（共用 _finalize_text_reply）--------------
+    ad5 = FakeAdapter([ModelReply(content=REFLECT_ANSWER) for _ in range(4)])
+    st5 = await AgentCore(ad5, reg(), config=AgentConfig(
+        max_turns=6, min_evidence=0, use_plan_phase=False, use_reflect_phase=False,
+        orchestrator="graph"), bus=EventBus()).run("读 main.py 并说明", workspace=sb.dir)
+    check(st5.engine == "graph", f"引擎标注（{st5.engine}）")
+    check(st5.end_reason == "no_progress", f"★ graph 下同样以 no_progress 终止（{st5.end_reason}）")
+    check(st5.reflect_streak == 3, f"graph 下判据一致（streak={st5.reflect_streak}）")
+    check("finalize" in st5.graph_trace, "图确实经过 finalize 节点")
+
 
 
 # --------------------------------------------------------------------------- #

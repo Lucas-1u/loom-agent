@@ -12,7 +12,13 @@
  *   · `seq` 单调递增 → 用它排序、去重、断线补发（Last-Event-ID）
  */
 
-/** 16 种事件类型（顺序与后端 EventType 一致） */
+/** 17 种事件类型（顺序与后端 EventType 一致）
+ *
+ * ★ 这份清单不只是类型：`services/eventStream.ts` 会**按它逐个 addEventListener**。
+ *   少列一种 → 该事件的 SSE 帧在浏览器里没有监听器 → **静默丢失**（不会报错）。
+ *   所以 frontend/scripts/test-events-contract.mjs 会拿它和 backend/events.py 逐项比对，
+ *   两边不一致时测试直接失败 —— 这是防止再次漂移的唯一机制。
+ */
 export const EVENT_TYPES = [
   "task.start",
   "task.end",
@@ -29,6 +35,7 @@ export const EVENT_TYPES = [
   "final_answer",
   "error",
   "budget.exceeded",
+  "context.compacted",
   "state.snapshot",
 ] as const;
 

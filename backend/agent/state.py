@@ -493,6 +493,16 @@ class TaskState:
     # 读取复用命中次数（同文件同 hash，折叠成标记而不是再贴一遍全文）
     read_reuse_hits: int = 0
 
+    # ---- M2.2：反思答复的无进展检测 ----------------------------------------
+    # 背景：模型可能把 REFLECT 的 JSON 当答复反复提交；若系统只是不断回灌
+    # "继续执行"，就会安静地烧掉全部轮次（真实运行见过连续 11 次）。
+    # 判据不是"反思了几次"，而是**两次之间有没有真实的进展增量**
+    # （工具调用 / 证据 / 命令 / 计划步进任一变化即算有进展）。
+    reflect_progress_key: str = ""     # 上一次反思答复时的进展指纹（变化即视为有进展）
+    reflect_streak: int = 0            # 进展指纹未变的连续反思答复次数
+    reflect_last_fingerprint: str = "" # 上一次反思答复的内容指纹（用于如实报告"内容相同"）
+    reflect_recoveries: int = 0        # 已发出的受控恢复提示次数（有上限，不无限重试）
+
     # ---- 审批 --------------------------------------------------------------
     pending_approval: PendingApproval | None = None   # 非空 = 正在挂起
     approval_history: list[ApprovalRecord] = field(default_factory=list)
@@ -869,6 +879,11 @@ class TaskState:
             "context_last": self.context_last,
             "context_peak_chars": self.context_peak_chars,
             "read_reuse_hits": self.read_reuse_hits,
+            "reflect_reloop": {
+                "streak": self.reflect_streak,
+                "recoveries": self.reflect_recoveries,
+                "last_fingerprint": self.reflect_last_fingerprint,
+            },
             "reflections": self.reflections,
             "pending_approval": self.pending_approval.to_dict() if self.pending_approval else None,
             "approval_history": [a.to_dict() for a in self.approval_history],

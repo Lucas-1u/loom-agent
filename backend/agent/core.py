@@ -64,6 +64,7 @@ Loom 的版本把这些补上，并且把「一切过程都变成事件」作为
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -103,6 +104,28 @@ log = logging.getLogger("loom.core")
 # ★ 收敛成三种，是刻意的：模型很容易发明一堆花哨的 check 类型，
 #   而程序只可能可靠判定这三种。不认识的类型回落到 observation。
 _STEP_CHECKS = ("observation", "change", "command_ok")
+
+# --------------------------------------------------------------------------- #
+# M2.2：反思答复的「零进展」处理档位
+# --------------------------------------------------------------------------- #
+# ★ 这两个常数**不是"反思次数上限"**。判据是「两次反思答复之间有没有真实进展增量」
+#   （工具调用 / 证据 / 命令 / 计划步进任一变化 → 有进展，计数归 1）。
+#   只有在**连续零进展**时才会升级：
+#     第 2 次零进展 → 发一次受控恢复提示（明确要求下一条是工具调用或答复）
+#     第 3 次零进展 → 按 no_progress 终止，并在答复里说明判据
+#   恢复只做一次：既然"零进展"这个事实没变，第二次恢复提示不会有新信息。
+_REFLECT_STREAK_RECOVER = 2
+_REFLECT_MAX_RECOVERIES = 1
+
+_REFLECT_RECOVERY_PROMPT = (
+    "[系统] 你刚刚又提交了一份进展汇报，而且自上一份以来**没有任何工具执行、"
+    "没有新证据、计划也没有推进** —— 这不构成进展。\n"
+    "下一条消息只能是以下两种之一：\n"
+    "1) 一次真实的工具调用（list_files / read_file / edit_file / run_command 等），去真正推进下一步；\n"
+    "2) 面向用户的最终答复正文（做了什么、结果如何、还有什么没做完）。\n"
+    "不要再输出 progress/next_action/done 这类 JSON。"
+    "如果确实无法继续，请在答复里直接说明卡在哪里，而不是重复汇报。"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -256,6 +279,41 @@ def _as_reflect_payload(text: str) -> dict[str, Any] | None:
     if "progress" in obj and "next_action" in obj:
         return obj
     return None
+
+
+def _flat_text(value: Any) -> str:
+    """把任意值压成单行小写文本（用于比对"是不是同一段话"）。"""
+    return " ".join(str(value or "").split()).lower()
+
+
+def reflect_answer_fingerprint(obj: dict[str, Any]) -> str:
+    """
+    反思答复的内容指纹：progress + next_action + done。
+
+    ★ 只用来回答"这次是不是又把同一段话交上来了"，
+      不参与"要不要终止"的判断（终止看的是进展增量，见下）。
+    """
+    raw = "|".join(
+        (_flat_text(obj.get("progress")), _flat_text(obj.get("next_action")),
+         "1" if obj.get("done") else "0")
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def progress_key(state: TaskState) -> str:
+    """
+    任务"真实进展"的指纹：工具调用 / 证据 / 命令 / 计划步进。
+
+    ★ 为什么用这四个而不是 state.turn：
+      轮次每轮必然 +1，用它做判据等于"永远有进展"，检测不到空转。
+      这四个量只在**真的做了事**时才变（读文件、跑命令、计划推进）。
+    """
+    return ":".join((
+        str(len(state.tool_events)),
+        str(len(state.evidence_summary)),
+        str(len(state.command_history)),
+        str(state.current_step_index),
+    ))
 
 
 # --------------------------------------------------------------------------- #
@@ -675,10 +733,17 @@ class AgentCore:
     # ===================================================================== #
     async def _act_phase(self, state: TaskState) -> Any:
         """ACT 阶段：问模型要下一步动作。返回 ModelReply，失败返回 None。"""
+        # ★ M2.2：ACT 的阶段提示改为**每轮都给**。
+        #   旧写法是 `if not state.tool_events` —— 第一次工具调用之后就再也不提示
+        #   "现在处于 ACT 阶段"，而 PLAN/REFLECT/FINAL 三种提示是无条件给的。
+        #   于是模型在 ACT 轮里既没有"该调工具"的信号，又刚看过自己上一轮的
+        #   REFLECT JSON，容易顺着那个形状继续输出 → 真实运行里连续 11 次
+        #   reflect_as_answer，把轮次烧在空转上。
+        #   提示词原文没改，只是不再"只在第一轮出现"。
         msgs = await self._prepare_messages(
             state,
             history=self._history,
-            phase_hint=phase_hint("act") if not state.tool_events else "",
+            phase_hint=phase_hint("act"),
         )
         try:
             return await self._call_model(msgs, turn=state.turn, allow_tools=True)
@@ -1568,25 +1633,7 @@ class AgentCore:
         #   是的话它不是答复，不能收尾 —— done:false 记成 done 是虚假完成。
         reflect_obj = _as_reflect_payload(reply.content)
         if reflect_obj is not None:
-            self._history.append(Message.assistant(reply.content, reasoning=reply.reasoning))
-            if reflect_obj.get("done"):
-                self._history.append(Message.user(
-                    "[系统] 你给的是进展汇报，不是给用户的最终答复。"
-                    "请直接输出最终答复正文（说明做了什么、结果如何、还有什么没做完）。"
-                ))
-            else:
-                nxt = str(reflect_obj.get("next_action") or reflect_obj.get("progress") or "").strip()
-                self._history.append(Message.user(
-                    f"[系统] 继续执行：{nxt}" if nxt else
-                    "[系统] 你还没有完成本次任务，请继续调用工具推进。"
-                ))
-            self.bus.error(
-                "reflect_as_answer",
-                "模型交上来的是进展汇报（REFLECT 格式），已按'继续执行'处理",
-                fatal=False,
-                turn=turn,
-            )
-            return "continue"
+            return self._handle_reflect_answer(state, reply, reflect_obj)
 
         answer = extract_text_answer(reply.content)
 
@@ -1653,6 +1700,112 @@ class AgentCore:
         self.bus.final_answer(answer, turn=turn)
         self.bus.task_end("done", answer, "agent_done")
         return "stop"
+
+    # ===================================================================== #
+    # 反思答复（M2.2）：识别 + 零进展处理
+    # ===================================================================== #
+    def _handle_reflect_answer(
+        self, state: TaskState, reply: Any, obj: dict[str, Any]
+    ) -> str:
+        """
+        模型把 REFLECT 的 JSON 当答复交上来时的处理。
+
+        返回路由："continue"（继续跑）| "stop"（已按 no_progress 终止）。
+
+        ★ 为什么需要这段（真实运行证据）
+        --------------------------------
+        旧实现只做一件事：把模型自己的 next_action 复读回去（"继续执行：…"）。
+        模型若反复用同一种形状说同一句话，系统就会一直"继续执行"——20 轮预算里
+        11 轮烧在这里，而**没有任何一层会判断"它其实没进展"**。
+
+        ★ 判据是"有没有进展"，不是"反思了几次"
+        --------------------------------
+        每次进来先算 progress_key（工具数 / 证据数 / 命令数 / 计划步进）：
+          · 与上次不同 → 中间真的做了事 → streak 归 1，正常回灌；
+          · 与上次相同 → 这段反思没伴随任何真实动作 → streak+1。
+        只有"零进展"连续出现才升级：第 2 次发一次受控恢复，第 3 次按 no_progress 终止。
+        """
+        turn = state.turn
+        fp = reflect_answer_fingerprint(obj)
+        key = progress_key(state)
+        same_content = bool(state.reflect_last_fingerprint) and fp == state.reflect_last_fingerprint
+        if key == state.reflect_progress_key:
+            state.reflect_streak += 1
+        else:
+            state.reflect_streak = 1
+        state.reflect_progress_key = key
+        state.reflect_last_fingerprint = fp
+
+        nxt = str(obj.get("next_action") or obj.get("progress") or "").strip()
+        self._history.append(Message.assistant(reply.content, reasoning=reply.reasoning))
+        self.bus.error(
+            "reflect_as_answer",
+            "模型交上来的是进展汇报（REFLECT 格式），不是最终答复",
+            fatal=False,
+            turn=turn,
+        )
+
+        # ---- ① 零进展重复：先给一次受控恢复 --------------------------------
+        if (state.reflect_streak >= _REFLECT_STREAK_RECOVER
+                and state.reflect_recoveries < _REFLECT_MAX_RECOVERIES):
+            state.reflect_recoveries += 1
+            self.bus.error(
+                "no_progress_recovered",
+                f"连续 {state.reflect_streak} 次进展汇报没有任何工具/证据/计划变化，"
+                "已发出一次受控恢复提示",
+                fatal=False,
+                turn=turn,
+            )
+            self._history.append(Message.user(_REFLECT_RECOVERY_PROMPT))
+            return "continue"
+
+        # ---- ② 恢复无效：按无进展终止（如实说明，不伪装成完成）-----------
+        if state.reflect_streak > _REFLECT_STREAK_RECOVER:
+            answer = self._no_progress_answer(state, same_content=same_content, next_action=nxt)
+            self.bus.error(
+                "no_progress",
+                f"连续 {state.reflect_streak} 次零进展的进展汇报，任务按 no_progress 终止",
+                fatal=True,
+                turn=turn,
+            )
+            state.finish(TaskStatus.ABORTED, answer, "no_progress")
+            self.bus.final_answer(answer, turn=turn)
+            self.bus.task_end("aborted", answer, "no_progress")
+            return "stop"
+
+        # ---- ③ 首次出现：正常回灌，但提示"下一步要动手，不是再汇报" --------
+        if obj.get("done"):
+            self._history.append(Message.user(
+                "[系统] 你给的是进展汇报，不是给用户的最终答复。"
+                "请直接输出最终答复正文（说明做了什么、结果如何、还有什么没做完）。"
+                "不要再用 progress/next_action/done 这类 JSON。"
+            ))
+        else:
+            self._history.append(Message.user(
+                f"[系统] 继续执行：{nxt}。请**直接调用工具**执行这一步，"
+                "不要再用 progress/next_action 这类 JSON 汇报进展。"
+                if nxt else
+                "[系统] 你还没有完成本次任务，请调用工具推进"
+                "（不要再输出进展汇报 JSON）。"
+            ))
+        return "continue"
+
+    def _no_progress_answer(
+        self, state: TaskState, *, same_content: bool, next_action: str
+    ) -> str:
+        """无进展终止时的答复：先说清判据，再附上中断时的实际进展。"""
+        head = [
+            f"任务因「无进展循环」终止（第 {state.turn} 轮）。",
+            f"模型连续 {state.reflect_streak} 次把进展汇报（REFLECT 格式）当答复提交，"
+            f"{'内容完全相同' if same_content else '内容有变化'}；"
+            "但期间没有任何工具执行、没有新证据、计划也没有推进。",
+            f"已发出 {state.reflect_recoveries} 次受控恢复提示，模型仍未改变行为。",
+        ]
+        if next_action:
+            head.append(
+                f"它最后一次声称的下一步是：「{next_action[:200]}」—— 该动作从未被执行。"
+            )
+        return "\n".join(head) + "\n\n" + self._fallback_answer(state, "no_progress")
 
     async def _call_model(self, msgs: list[Message], *, turn: int, allow_tools: bool):
         """

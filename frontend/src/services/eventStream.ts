@@ -116,7 +116,11 @@ export function openEventStream(opts: OpenOptions): () => void {
       handlers.onState("open");
     };
 
-    // ---- 16 种业务事件 + 1 种控制事件，逐个注册 ----
+    // ---- 17 种业务事件 + 1 种控制事件，逐个注册 ----
+    // ★ EventSource 只把帧派发给**同名监听器**：EVENT_TYPES 少列一种，
+    //   该事件的帧就永远不会进 onEvent（浏览器不报错、也不触发 onmessage）。
+    //   所以 EVENT_TYPES 必须与 backend/events.py 一一对应，
+    //   由 scripts/test-events-contract.mjs 兜底（跑 npm run test:events）。
     for (const type of EVENT_TYPES) {
       source.addEventListener(type, (raw) => {
         const msg = raw as MessageEvent<string>;
