@@ -57,12 +57,16 @@ class TaskRuntime:
         config: AgentConfig,
         hub: EventHub,
         store: TaskStore,
+        allowed_paths: list[str] | None = None,
+        forbidden_paths: list[str] | None = None,
     ) -> None:
         self.task_id = task_id
         self.session_id = session_id
         self.goal = goal
         self.workspace = workspace
         self.model = model
+        self.allowed_paths = list(allowed_paths) if allowed_paths else None
+        self.forbidden_paths = list(forbidden_paths) if forbidden_paths else None
 
         self._hub = hub
         self._store = store
@@ -121,7 +125,13 @@ class TaskRuntime:
 
     async def _run(self) -> None:
         try:
-            state = await self.core.run(self.goal, workspace=self.workspace, model_label=self.model)
+            state = await self.core.run(
+                self.goal,
+                workspace=self.workspace,
+                model_label=self.model,
+                allowed_paths=self.allowed_paths,
+                forbidden_paths=self.forbidden_paths,
+            )
 
             self.status = state.status.value
             self.end_reason = state.end_reason
@@ -319,7 +329,10 @@ class TaskRuntime:
             "session_id": self.session_id,
             "goal": self.goal,
             "workspace": self.workspace,
-            "model": self.model,
+            # ★ 行里的 model 可能为空（API 不指定模型），而 state.model 记的是
+            #   **实际服务本次调用的模型**（模型轮换后两者会不同）。
+            #   这里必须让 state 的值兜底，否则快照里的模型名永远是空/配置值。
+            "model": self.model or base.get("model", "") or "",
             "status": self.status,
             "started_at": self.started_at,
             "ended_at": self.ended_at,

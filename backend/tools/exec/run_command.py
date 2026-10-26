@@ -96,6 +96,18 @@ class RunCommandTool(Tool):
         if "\x00" in cmd or len(cmd) > MAX_COMMAND_CHARS:
             return f"command 非法（含 NUL 或超过 {MAX_COMMAND_CHARS} 字符）"
 
+        # ---- 第六批：检测"整条命令塞进 command"--------------------------
+        # 真实 E2E：模型三次把 "python -m pytest -q" 整条塞进 command，
+        # 容器 exec 报 127（No such file or directory），白白烧掉 3 轮。
+        # 在这里提前失败并给出**可直接照抄**的纠正写法，
+        # 不自动拆分执行 —— 引号/管道拆错比多一轮更危险。
+        if args.get("args") in (None, []) and " " in cmd.strip():
+            parts = cmd.strip().split()
+            return (
+                f"command 应该只是可执行文件名，不要把整条命令塞进来（检测到 {cmd.strip()[:60]!r}）。"
+                f"正确写法：command={parts[0]!r}, args={parts[1:]!r}"
+            )
+
         raw_args = args.get("args")
         if raw_args is not None:
             if not isinstance(raw_args, list):

@@ -207,3 +207,29 @@ def tool_line(tool: Any) -> str:
 
     tail = f"（参数：{', '.join(params)}）" if params else "（无参数）"
     return f"`{getattr(tool, 'name', '?')}`：{first}{tail}"
+
+
+RISK_REVIEW_PROMPT = """收尾前，系统在文件改动审计里发现了**可能影响验证可信度**的修改：
+
+{risks}
+
+请逐条给出结构化解释（只输出 JSON，不要输出别的文字）：
+
+{{
+  "explanations": [
+    {{
+      "path": "触发风险的文件路径",
+      "why": "为什么需要这项修改，它与用户原始任务的关系",
+      "changed_verification": true 或 false,
+      "still_proves": "若 changed_verification=false：测试通过仍然能证明什么",
+      "independent_verification": "还需要什么独立验证来确认结果；没有就写\"无\""
+    }}
+  ]
+}}
+
+要求：
+- changed_verification=true 表示这项修改改变了原本需要验证的条件
+  （例如让原本失败的用例被跳过、被 mock、或不再执行）。
+- 每一条风险都要解释，漏掉的会被系统标记为「未解释」。
+- 解释是给系统和用户判断用的证据，不是免检凭证；与审计记录矛盾会被以审计为准。
+"""

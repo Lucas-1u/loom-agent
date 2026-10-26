@@ -160,6 +160,120 @@ async def offline() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 模型轮换（第四批后：按顺序用，某个没额度就换下一个）
+# --------------------------------------------------------------------------- #
+class _FakeMsg:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.reasoning = None
+        self.tool_calls = None
+
+
+class _FakeChoice:
+    def __init__(self, content: str) -> None:
+        self.message = _FakeMsg(content)
+        self.finish_reason = "stop"
+
+
+class _FakeResp:
+    def __init__(self, model: str, content: str = "好") -> None:
+        self.model = model
+        self.choices = [_FakeChoice(content)]
+
+
+class _FakeCompletions:
+    """按模型名决定成功还是抛错。"""
+
+    def __init__(self, fail: dict[str, str]) -> None:
+        self.fail = fail
+        self.calls: list[str] = []
+
+    async def create(self, **payload):
+        model = payload.get("model", "")
+        self.calls.append(model)
+        if model in self.fail:
+            raise RuntimeError(self.fail[model])
+        return _FakeResp(model)
+
+
+class _FakeClient:
+    def __init__(self, fail: dict[str, str]) -> None:
+        self.chat = type("C", (), {})()
+        self.chat.completions = _FakeCompletions(fail)
+
+
+def _adapter_with(fail: dict[str, str], models: list[str]) -> OpenAICompatAdapter:
+    ad = OpenAICompatAdapter(
+        provider="bailian", model=models[0], models=models,
+        base_url="https://example.invalid/v1", api_key="sk-test",
+    )
+    ad._client = _FakeClient(fail)
+    return ad
+
+
+async def model_rotation() -> None:
+    print("\n[M] 模型轮换（额度不足就换下一个）")
+    models = ["m-a", "m-b", "m-c"]
+
+    # M1 第一个模型额度不足 → 自动换到第二个并成功
+    ad = _adapter_with({"m-a": "Error code: 400 - insufficient balance (quota exhausted)"}, models)
+    reply = await ad.chat([Message.user("hi")])
+    check(reply.content == "好", "★ 额度不足后换模型仍然拿到回复")
+    # ★ 第六批：400 会先同载荷重试一次（讯飞间歇性 400），所以是 3 次
+    check(ad._client.chat.completions.calls == ["m-a", "m-a", "m-b"],
+          f"★ 调用顺序：400 重试一次再换模型（{ad._client.chat.completions.calls}）")
+    check(ad.model == "m-b", f"★ 活动模型切到 m-b（{ad.model}）")
+    check("m-a" in ad._dead_models, "★ 不可用的模型被记下来")
+
+    # M2 后续请求直接跳过已判死的模型
+    ad._client.chat.completions.calls.clear()
+    await ad.chat([Message.user("hi again")])
+    check(ad._client.chat.completions.calls == ["m-b"], "★ 后续请求跳过已判死的模型")
+
+    # M3 全部候选都失败 → 抛出最后一个错误（不吞）
+    ad2 = _adapter_with({m: "insufficient balance" for m in models}, models)
+    try:
+        await ad2.chat([Message.user("hi")])
+        check(False, "★ 全部失败时应该抛错")
+    except ModelError as exc:
+        check(exc.kind == "quota_error", f"★ 全部失败时抛出 quota_error（{exc.kind}）")
+    check(len(ad2._dead_models) == 3, "★ 三个模型都被标记不可用")
+
+    # M4 非额度错误不换模型（换也解决不了，只会掩盖真因）
+    ad3 = _adapter_with({"m-a": "Error code: 400 - invalid temperature value"}, models)
+    try:
+        await ad3.chat([Message.user("hi")])
+        check(False, "★ 参数错误应该直接抛")
+    except ModelError as exc:
+        check(exc.kind == "bad_request", f"★ 参数错误不换模型（{exc.kind}）")
+    check(ad3._client.chat.completions.calls == ["m-a", "m-a"],
+          f"★ 400 不换模型但会重试一次（{ad3._client.chat.completions.calls}）")
+
+    # M5 模型下线（model not found）也要换
+    ad4 = _adapter_with({"m-a": "Error code: 400 - model not found: m-a"}, models)
+    await ad4.chat([Message.user("hi")])
+    check(ad4._client.chat.completions.calls == ["m-a", "m-a", "m-b"],
+          "★ 模型下线也会换下一个")
+
+    # M6 全部判死后重置（额度会恢复，不能永久拉黑）
+    ad5 = _adapter_with({"m-a": "insufficient balance"}, ["m-a", "m-b"])
+    await ad5.chat([Message.user("hi")])
+    ad5._dead_models.add("m-b")     # 模拟两个都被判死
+    ad5._client.chat.completions.calls.clear()
+    await ad5.chat([Message.user("hi again")])
+    check("m-a" in ad5._client.chat.completions.calls,
+          "★ 全部判死后会重置并从头再试（额度可能已恢复）")
+
+    # M7 配置层：LOOM_MODELS 的顺序被保留
+    from backend.config import ModelConfig
+    cfg = ModelConfig(provider="bailian", model="m-a", models=["m-a", "m-b", "m-c"],
+                      api_key="sk-test", base_url="https://example.invalid/v1")
+    ad6 = OpenAICompatAdapter.from_config(cfg)
+    check(ad6.models == ["m-a", "m-b", "m-c"], f"★ 配置里的候选顺序被保留（{ad6.models}）")
+    check(ad6.model == "m-a", "★ 第一个候选是主模型")
+
+
+# --------------------------------------------------------------------------- #
 # 在线测试
 # --------------------------------------------------------------------------- #
 async def online(provider: str) -> None:
@@ -257,6 +371,7 @@ async def main() -> int:
     print("=" * 72)
 
     await offline()
+    await model_rotation()
     if args.online:
         await online(args.provider)
 

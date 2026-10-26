@@ -23,12 +23,14 @@ from backend.agent.approval import ApprovalManager, args_fingerprint, build_pend
 from backend.agent.context import ContextBuilder, TurnBuilder
 from backend.agent.core import AgentConfig, AgentCore, extract_json, extract_text_answer
 from backend.agent.policy import Policy, make_context
-from backend.agent.state import RiskLevel, TaskStatus
+from backend.agent.scope import scan_tree
+from backend.agent.state import (ChangeRecord, PlanStep, RiskLevel, StepStatus, TaskState,
+                                 TaskStatus, ToolEvent)
 from backend.config import setup_logging
 from backend.events import Event, EventBus, EventType, collect
 from backend.models.adapter import FakeAdapter, Message, ModelError, ModelReply, ToolCall
-from backend.tools.base import ErrorKind, ToolContext, ToolResult
-from backend.tools.registry import build_default_registry
+from backend.tools.base import ErrorKind, Tool, ToolContext, ToolResult
+from backend.tools.registry import ToolRegistry, build_default_registry
 
 results: list[tuple[bool, str]] = []
 VERBOSE = False
@@ -1397,6 +1399,545 @@ async def test_robustness(sb: Sandbox) -> None:
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# [V] 完成验证闸门：命令失败时，不许把任务判成功
+# --------------------------------------------------------------------------- #
+class StubRunTool(Tool):  # type: ignore[name-defined]
+    """假的 run_command：只返回带 exit_code 的结果，不启动任何进程。
+
+    ★ 为什么不用真工具：这里要测的是「Core 怎么读执行结果」，
+      不是沙箱。用假工具才能精确控制"失败/成功"，也不依赖 Docker。
+    """
+
+    name = "run_command"
+    description = "测试用假命令执行（不会真的运行任何东西）"
+    parameters = {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    }
+    risk = RiskLevel.READ          # 不触发审批 —— 审批不是本节要测的东西
+
+    def __init__(self, exit_codes: list[int]) -> None:
+        self.exit_codes = list(exit_codes)
+        self.calls = 0
+
+    async def run(self, args, ctx):  # type: ignore[override]
+        self.calls += 1
+        code = self.exit_codes[min(self.calls - 1, len(self.exit_codes) - 1)]
+        data = {"exit_code": code, "stdout": "", "stderr": "E   assert 1 == 2"}
+        if code == 0:
+            return ToolResult.success(self.name, "命令执行成功（退出码 0）", data=data)
+        return ToolResult.failure(
+            self.name, ErrorKind.EXECUTION_ERROR, f"命令退出码 {code}", data=data
+        )
+
+
+def _gate_registry(stub_run: "StubRunTool"):
+    from backend.tools.readonly.list_files import make as mk_list
+    from backend.tools.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    reg.register(mk_list(), group="readonly")
+    reg.register(stub_run, group="exec")
+    reg.register(StubEditTool(), group="mutating")
+    return reg
+
+
+class StubEditTool(Tool):
+    """假的 edit_file：只制造一条 change 记录，不碰磁盘。
+
+    ★ 闸门用「有没有改过文件」区分"修复型"和"观测型"任务，
+      所以测试里需要能可控地制造这个信号。
+    """
+
+    name = "edit_file"
+    description = "测试用假编辑（不真的写文件）"
+    parameters = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+    risk = RiskLevel.READ          # 不触发审批，专注测闸门
+
+    async def run(self, args, ctx):  # type: ignore[override]
+        return ToolResult.success(
+            self.name, "修改文件 a.py", data={"change": {"path": "a.py", "action": "edit"}}
+        )
+
+
+async def test_verification_gate(sb: Sandbox) -> None:
+    """[V] 「模型说完成」不等于「任务真的完成」。"""
+    print("\n[V] 完成验证闸门（失败不能被判成功）")
+
+    # ---- V1 复现：最后一次命令失败 + 模型声称"测试全过" ----
+    stub = StubRunTool([1])
+    adapter = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("c1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("c2", "edit_file", {"path": "a.py"})]),
+            ModelReply(tool_calls=[tc("c3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="所有测试已通过，修复完成。"),
+            ModelReply(content="确认修复完成，测试全部通过。"),
+            ModelReply(content="（不该走到这里）"),
+        ]
+    )
+    bus = EventBus()
+    events = collect(bus)
+    core = AgentCore(
+        adapter,
+        _gate_registry(stub),
+        config=AgentConfig(
+            max_turns=8, min_evidence=1, use_plan_phase=False, use_reflect_phase=False,
+            max_verification_retries=1,
+        ),
+        bus=bus,
+    )
+    state = await core.run("修好它并跑测试", workspace=sb.dir)
+    await bus.drain()
+
+    check(stub.calls == 1, f"假命令只执行了 1 次（{stub.calls}）")
+    check(state.status is TaskStatus.ABORTED, f"★ 命令失败 → 任务是 aborted 而不是 done（{state.status.value}）")
+    check(state.end_reason == "verification_failed", f"★ 结束原因是 verification_failed（{state.end_reason}）")
+    check(
+        any(e.type == EventType.ERROR and e.data.get("kind") == "unverified_completion" for e in events),
+        "★ 发出了 unverified_completion 错误事件",
+    )
+    check("未通过验证" in state.final_answer, "最终答复被机器标注「未通过验证」")
+    check("所有测试已通过" in state.final_answer or "确认修复完成" in state.final_answer,
+          "模型自己的说法仍被保留（不篡改，只加标注）")
+    check(state.verification_retries == 1, f"记录了一次驳回（{state.verification_retries}）")
+    check(bool(state.command_history) and state.command_history[-1].exit_code == 1,
+          "命令结果被记进 state.command_history")
+
+    # ---- V2 驳回之后重新验证成功 → 正常完成（证明不是一棒子打死）----
+    stub2 = StubRunTool([1, 0])
+    adapter2 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("d1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("d2", "edit_file", {"path": "a.py"})]),
+            ModelReply(tool_calls=[tc("d3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="完成了。"),                                   # 被驳回
+            ModelReply(tool_calls=[tc("d4", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="已修复并验证通过。"),
+        ]
+    )
+    bus2 = EventBus()
+    core2 = AgentCore(
+        adapter2, _gate_registry(stub2),
+        config=AgentConfig(max_turns=8, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=2),
+        bus=bus2,
+    )
+    state2 = await core2.run("修好它并跑测试", workspace=sb.dir)
+    await bus2.drain()
+    check(stub2.calls == 2, f"★ 被驳回后模型重跑了一次命令（{stub2.calls} 次）")
+    check(state2.status is TaskStatus.DONE, f"★ 重新验证成功后正常完成（{state2.status.value}）")
+    check(state2.verification_retries == 1, f"驳回计数为 1（{state2.verification_retries}）")
+
+    # ---- V3 命令成功 → 不受影响 ----
+    stub3 = StubRunTool([0])
+    adapter3 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("e1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("e2", "edit_file", {"path": "a.py"})]),
+            ModelReply(tool_calls=[tc("e3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="测试通过，完成。"),
+        ]
+    )
+    bus3 = EventBus()
+    core3 = AgentCore(
+        adapter3, _gate_registry(stub3),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False, use_reflect_phase=False),
+        bus=bus3,
+    )
+    state3 = await core3.run("跑测试", workspace=sb.dir)
+    await bus3.drain()
+    check(state3.status is TaskStatus.DONE, f"命令成功 → done（{state3.status.value}）")
+    check(state3.verification_retries == 0, "成功路径不触发驳回")
+
+    # ---- V4 没有执行过命令（纯分析任务）→ 不受影响 ----
+    adapter4 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("f1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("f2", "edit_file", {"path": "a.py"})]),
+            ModelReply(content="这个项目用了 FastAPI。"),
+        ]
+    )
+    core4 = AgentCore(
+        adapter4, _gate_registry(StubRunTool([1])),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state4 = await core4.run("分析这个项目", workspace=sb.dir)
+    check(state4.status is TaskStatus.DONE, f"★ 纯分析任务（无命令）不受闸门影响（{state4.status.value}）")
+
+    # ---- V5 闸门可关闭（对比实验用）----
+    stub5 = StubRunTool([1])
+    adapter5 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("g1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("g2", "edit_file", {"path": "a.py"})]),
+            ModelReply(tool_calls=[tc("g3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="所有测试已通过。"),
+        ]
+    )
+    core5 = AgentCore(
+        adapter5, _gate_registry(stub5),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=0),
+        bus=EventBus(),
+    )
+    state5 = await core5.run("跑测试", workspace=sb.dir)
+    check(state5.status is TaskStatus.DONE, "max_verification_retries=0 时闸门关闭（对照）")
+
+    # ---- V6 ★ 观测型任务：不改文件、命令失败、如实汇报 → 应该正常完成 ----
+    # 真实 E2E 踩过的坑：任务目标是「跑一下 pytest 把结果告诉我」，
+    # Agent 如实写了"退出码 1、沙箱无网络导致失败"，闸门却驳回两次并强制
+    # aborted —— 把**要报告的内容本身**当成了"修复没做成"。
+    stub6 = StubRunTool([1])
+    adapter6 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("h1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("h2", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="退出码 1：2 个用例，1 通过 1 失败。"
+                               "失败的是 test_remote，原因是容器无网络。"),
+        ]
+    )
+    bus6 = EventBus()
+    core6 = AgentCore(
+        adapter6, _gate_registry(stub6),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False, use_reflect_phase=False),
+        bus=bus6,
+    )
+    state6 = await core6.run("跑一下 pytest 把真实结果告诉我", workspace=sb.dir)
+    await bus6.drain()
+    check(state6.status is TaskStatus.DONE,
+          f"★ 观测型任务（没改文件）如实报告失败也判 done（{state6.status.value}）")
+    check(state6.verification_retries == 0, "观测型任务不触发驳回")
+    check("退出码 1" in state6.final_answer, "如实汇报的内容原样保留")
+
+
+# --------------------------------------------------------------------------- #
+# [P] 计划步骤：状态必须由证据决定
+# --------------------------------------------------------------------------- #
+async def test_plan_truth(sb: Sandbox) -> None:
+    """[P] 步骤不能靠"轮次跑够了"或"任务要结束了"变成完成。"""
+    print("\n[P] 计划步骤真实状态")
+
+    # ---- P1 没开工的步骤，任务结束也不许打勾 ----
+    adapter = FakeAdapter(
+        [
+            ModelReply(content='{"steps":['
+                               '{"title":"看结构","check":"observation"},'
+                               '{"title":"改代码","check":"change"},'
+                               '{"title":"跑测试","check":"command_ok","completion":"pytest 退出码 0"}],"note":""}'),
+            ModelReply(tool_calls=[tc("p1", "list_files", {"path": "."})]),
+            ModelReply(content="我做完了。"),
+        ]
+    )
+    bus = EventBus()
+    core = AgentCore(
+        adapter, build_default_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_reflect_phase=False),
+        bus=bus,
+    )
+    state = await core.run("改点东西", workspace=sb.dir)
+    await bus.drain()
+    check([s.status.value for s in state.plan] == ["done", "pending", "pending"],
+          f"★ 只完成有证据的那一步（{[s.status.value for s in state.plan]}）")
+    check(state.plan[1].started_turn == 0, "★ 没开工的步骤 started_turn 仍是 0")
+    check("未完成验证" in state.final_answer, "★ 最终答复里列出未完成步骤")
+
+    # ---- P2 状态机：失败/阻塞都不推进索引 ----
+    st = TaskState(goal="x", workspace=sb.dir)
+    st.set_plan([PlanStep(index=0, title="a", check="command_ok"), PlanStep(index=1, title="b")])
+    st.note_command("python -m pytest -q", 1, False)
+    check(st.finish_current_step()[0] is False, "★ 命令失败 → 完成条件不满足")
+    st.fail_current_step("测试还是红")
+    check(st.plan[0].status is StepStatus.FAILED, "★ 可以标记失败")
+    check(st.current_step_index == 0, "★ 失败不推进索引（停在原地）")
+    st.block_current_step("命中禁止路径")
+    check(st.plan[0].status is StepStatus.BLOCKED, "★ 可以标记被阻塞")
+    st.note_command("python -m pytest -q", 0, True)
+    check(st.finish_current_step()[0] is True, "★ 后来有了成功命令 → 同一页面可以完成")
+    check(st.plan[0].status is StepStatus.DONE and st.current_step_index == 1, "★ 完成后才推进")
+    st.reconcile_plan()
+    check(st.plan[1].status is StepStatus.PENDING,
+          "★ reconcile 不会把没开工的步骤补成 done")
+
+    # ---- P3 步骤按自己的完成条件结算（失败→保持，成功→打勾）----
+    stub = StubRunTool([1, 0])
+    adapter3 = FakeAdapter(
+        [
+            ModelReply(content='{"steps":[{"title":"跑测试","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("q1", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(tool_calls=[tc("q2", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="现在过了。"),
+        ]
+    )
+    core3 = AgentCore(
+        adapter3, _gate_registry(stub),
+        config=AgentConfig(max_turns=8, min_evidence=1, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state3 = await core3.run("跑测试", workspace=sb.dir)
+    check([s.status.value for s in state3.plan] == ["done"], f"★ 命令成功后步骤才完成（{[s.status.value for s in state3.plan]}）")
+    check("退出码 0" in (state3.plan[0].evidence or ""), "★ 完成时记录了证据")
+
+    # ---- P4 预算耗尽 → 不自动完成剩余步骤 ----
+    adapter4 = FakeAdapter(
+        [
+            ModelReply(content='{"steps":[{"title":"a"},{"title":"b"},{"title":"c"}],"note":""}'),
+            ModelReply(tool_calls=[tc("r1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("r2", "list_files", {"path": "."})]),
+            ModelReply(content="（不该到这里）"),
+        ]
+    )
+    core4 = AgentCore(
+        adapter4, build_default_registry(),
+        # ★ 为什么用 tool_calls=1 而不是 max_turns=2：
+        #   max_turns=2 时 PLAN + ACT 就吃光了轮数，Policy 会在工具执行前
+        #   以"预算耗尽"拒掉调用 —— 那测到的是另一条路径。
+        #   这里让第一个工具真的跑完（步骤拿到证据），再用工具预算掐断任务。
+        config=AgentConfig(max_turns=3, max_tool_calls=1, min_evidence=1, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state4 = await core4.run("做三件事", workspace=sb.dir)
+    done = sum(1 for s in state4.plan if s.status.value == "done")
+    check(done == 1, f"★ 预算耗尽只完成真正有证据的 1 步（实际 {done}）")
+    check(state4.end_reason.startswith("budget"), f"结束原因是预算（{state4.end_reason}）")
+    check(len(state4.incomplete_steps()) == 2, "★ 剩余 2 步保持未完成")
+    check("未完成" in state4.final_answer, "★ 中断答复里说明还有步骤没做完")
+
+    # ---- P5 取消 → 不自动完成 ----
+    holder: list[Any] = []          # 工具里要能拿到 core，用列表绕开构造顺序
+
+    class _CancelTool(Tool):
+        name = "list_files"
+        description = "列目录（第一次调用就模拟用户取消）"
+        parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+        risk = RiskLevel.READ
+
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def run(self, args, ctx):  # type: ignore[override]
+            self.n += 1
+            if self.n == 1 and holder:
+                holder[0].cancel()      # 模拟用户在执行中点「停止」
+            return ToolResult.success(self.name, "列出目录", data={"path": "."})
+
+    reg5 = ToolRegistry()
+    reg5.register(_CancelTool(), group="readonly")
+    core5 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"a"},{"title":"b"}],"note":""}'),
+            ModelReply(tool_calls=[tc("s1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("s2", "list_files", {"path": "."})]),
+            ModelReply(content="（不该到这里）"),
+        ]),
+        reg5,
+        config=AgentConfig(max_turns=8, min_evidence=1, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    holder.append(core5)
+    state5 = await core5.run("做两件事", workspace=sb.dir)
+    check(state5.status is TaskStatus.ABORTED and state5.end_reason == "cancelled",
+          f"★ 取消后任务收敛为 cancelled（{state5.status.value}/{state5.end_reason}）")
+    check(sum(1 for s in state5.plan if s.status.value == "done") == 1,
+          "★ 取消不把剩余步骤补成 done")
+
+    # ---- P6 没有详细计划的简单任务照样能结束 ----
+    adapter6 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("t1", "list_files", {"path": "."})]),
+            ModelReply(content="目录里有个 main.py。"),
+        ]
+    )
+    core6 = AgentCore(
+        adapter6, build_default_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state6 = await core6.run("看看目录", workspace=sb.dir)
+    check(state6.status is TaskStatus.DONE and not state6.plan, "★ 无计划任务正常结束")
+
+
+# --------------------------------------------------------------------------- #
+# [S] 改动范围审计
+# --------------------------------------------------------------------------- #
+class _StubWriter(Tool):
+    """真的写文件，但 risk=READ（不触发审批）—— 用来单独测审计与归因。"""
+
+    name = "write_file"
+    description = "测试用写入（不触发审批）"
+    parameters = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+        "required": ["path"],
+    }
+    risk = RiskLevel.READ
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+
+    async def run(self, args, ctx):  # type: ignore[override]
+        rel = args["path"]
+        full = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(full) or self.root, exist_ok=True)
+        existed = os.path.exists(full)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(args.get("content", "new\n"))
+        return ToolResult.success(
+            self.name, f"写入 {rel}",
+            data={"path": rel, "change": {"path": rel, "action": "overwrite" if existed else "create"}},
+        )
+
+
+async def test_scope_audit(sb: Sandbox) -> None:
+    """[S] 改动范围：基线不含用户预存修改，Agent 的增改删都要看得见。"""
+    print("\n[S] 改动范围审计")
+
+    # ---- S1 用户任务开始前就有的未提交修改，不算 Agent 的 ----
+    pre = Path(sb.dir, "user_notes.txt")
+    pre.write_text("我自己改的\n", encoding="utf-8")
+    adapter = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("u1", "list_files", {"path": "."})]),
+            ModelReply(content="看了一下目录。"),
+        ]
+    )
+    core = AgentCore(
+        adapter, build_default_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state = await core.run("看看这个目录", workspace=sb.dir)
+    changed_paths = [c["path"] for c in state.audit.get("changed", [])]
+    check("user_notes.txt" not in changed_paths,
+          f"★ 用户预存修改没有被算成 Agent 改动（changed={changed_paths}）")
+    check(state.audit.get("baseline_files", 0) >= 1, "★ 记录了任务开始时的基线文件数")
+
+    # ---- S2 Agent 新增 / 修改 / 删除都要进审计 ----
+    pre.unlink()
+    writer = _StubWriter(sb.dir)
+    reg = ToolRegistry()
+    reg.register(build_default_registry().get("list_files"), group="readonly")
+    reg.register(writer, group="mutating")
+    adapter2 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("w1", "write_file", {"path": "docs/new.md", "content": "# hi\n"})]),
+            ModelReply(tool_calls=[tc("w2", "write_file", {"path": "README.md", "content": "改过了\n"})]),
+            ModelReply(content="写完了。"),
+        ]
+    )
+    core2 = AgentCore(
+        adapter2, reg,
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state2 = await core2.run("建个文档并改 README", workspace=sb.dir)
+    by_path = {c["path"]: c for c in state2.audit.get("changed", [])}
+    check(by_path.get("docs/new.md", {}).get("kind") == "added", "★ 新增文件被发现")
+    check(by_path.get("README.md", {}).get("kind") == "modified", "★ 修改文件被发现")
+    check(by_path.get("docs/new.md", {}).get("via") == "tool", "★ 有工具留痕 → 归因为 tool")
+    check(state2.audit.get("unattributed") == [], "有留痕的改动不标为来源不明")
+
+    # ---- S3 来源不明：文件变了但没有工具留痕 ----
+    st3 = TaskState(goal="x", workspace=sb.dir)
+    st3.baseline_files = scan_tree(sb.dir)
+    Path(sb.dir, "sneaky.txt").write_text("命令副作用\n", encoding="utf-8")
+    core3 = AgentCore(FakeAdapter([]), build_default_registry(), bus=EventBus())
+    audit3 = core3._ensure_audit(st3)
+    hit = [c for c in audit3["changed"] if c["path"] == "sneaky.txt"]
+    check(bool(hit) and hit[0]["via"] == "unattributed",
+          f"★ 没有工具留痕的改动标为来源不明（{hit}）")
+    Path(sb.dir, "sneaky.txt").unlink()
+
+    # ---- S4 超出允许范围：标记但不拦 ----
+    # ★ 注意：allowed_paths 必须传给 run()，写在另一个 TaskState 上不生效
+    #   （这个测试之前是靠 norm_rel 的 bug 碰巧通过的，已修正）
+    writer4 = _StubWriter(sb.dir)
+    reg4 = ToolRegistry()
+    reg4.register(writer4, group="mutating")
+    core4 = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("x1", "write_file", {"path": "docs/out.md", "content": "x\n"})]),
+            ModelReply(content="写好了。"),
+        ]),
+        reg4,
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st4b = await core4.run("写文档", workspace=sb.dir, allowed_paths=["src"],
+                           forbidden_paths=["src/secret.py"])
+    check("docs/out.md" in st4b.audit.get("out_of_scope", []),
+          f"★ 超出允许范围被标记（{st4b.audit.get('out_of_scope')}）")
+    check(st4b.status is TaskStatus.DONE, "★ 第一版只标记不拦截（任务仍可结束）")
+
+    # ---- S5 禁止路径：Policy 直接拦，且步骤标 blocked ----
+    policy = Policy(build_default_registry())
+    st5 = TaskState(goal="x", workspace=sb.dir)
+    st5.forbidden_paths = ["src/secret.py"]
+    ctx5 = make_context(st5)
+    d5 = policy.check("write_file", {"path": "src/secret.py", "content": "x"}, st5, ctx5)
+    check(not d5.allow and "禁止" in (d5.result.summary if d5.result else ""),
+          "★ 禁止路径在 Policy 层被拒")
+    d5b = policy.check("write_file", {"path": "src/other.py", "content": "x"}, st5, ctx5)
+    check(d5b.needs_approval, "★ 没命中的路径仍按原流程走审批（不是一刀切全拦）")
+
+    reg5 = ToolRegistry()
+    reg5.register(build_default_registry().get("write_file"), group="mutating")
+    core5 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"改密钥文件","check":"change"}],"note":""}'),
+            ModelReply(tool_calls=[tc("y1", "write_file", {"path": "src/secret.py", "content": "x"})]),
+            ModelReply(content="改不了，被拦了。"),
+        ]),
+        reg5,
+        config=AgentConfig(max_turns=6, min_evidence=1, use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st5c = await core5.run("改一下 src/secret.py", workspace=sb.dir, forbidden_paths=["src/secret.py"])
+    check(st5c.plan[0].status is StepStatus.BLOCKED,
+          f"★ 被禁止路径挡住的步骤标记 blocked（{st5c.plan[0].status.value}）")
+
+    # ---- S6 禁止路径真被改到时，审计能兜底发现并写进报告 ----
+    writer6 = _StubWriter(sb.dir)
+    reg6 = ToolRegistry()
+    reg6.register(writer6, group="mutating")
+    events6: list[Event] = []
+    bus6 = EventBus()
+    events6 = collect(bus6)
+    core6 = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("z1", "write_file", {"path": "src/secret.py", "content": "x"})]),
+            ModelReply(content="写完了。"),
+        ]),
+        reg6,
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False, use_reflect_phase=False),
+        bus=bus6,
+    )
+    st6 = await core6.run("写密钥文件", workspace=sb.dir, forbidden_paths=["src/secret.py"])
+    await bus6.drain()
+    check("src/secret.py" in st6.audit.get("forbidden", []),
+          f"★ 审计兜底发现禁止路径被改（{st6.audit.get('forbidden')}）")
+    check(any(e.type == EventType.ERROR and e.data.get("kind") == "scope_audit" for e in events6),
+          "★ 事件流里有 scope_audit 提示")
+    check("文件改动范围审计" in st6.final_answer, "★ 最终答复附带机器审计块")
+    check("audit" in st6.to_dict(), "★ 审计结果进了 to_dict（任务快照能看见）")
+
+    # ---- S7 范围匹配函数本身 ----
+    from backend.agent.scope import hits, norm_rel, within_allowed
+    check(norm_rel("D:\\Proj\\a\\b.py") == "d:/proj/a/b.py", "norm_rel 统一分隔符+小写")
+    check(hits("src/a.py", ["src"]), "目录前缀匹配")
+    check(hits("src/a.py", ["SRC/A.PY"]), "大小写不敏感")
+    check(not hits("src/a.py", ["", "  "]), "空 pattern 不误伤")
+    check(within_allowed("a.py", []), "空 allowed = 整个工作区")
+    check(within_allowed("pipeline/a.py", ["."]),
+          "★ 默认 allowed=['.'] = 整个工作区，不能误判越界（压力测试抓到的真 bug）")
+    check(within_allowed("pipeline/a.py", ["./"]), "★ './' 也要当成整个工作区")
+    check(within_allowed("pipeline/a.py", ["pipeline"]), "声明了子目录就按子目录算")
+    check(not within_allowed("docs/a.md", ["pipeline"]), "子目录之外的算越界")
+
+
 async def main() -> int:
     global VERBOSE
     ap = argparse.ArgumentParser()
@@ -1424,6 +1965,18 @@ async def main() -> int:
         await test_approval_in_loop(sb)
         await test_termination(sb)
         await test_robustness(sb)
+        await test_verification_gate(sb)
+        await test_plan_truth(sb)
+        await test_scope_audit(sb)
+        await test_intent(sb)
+        await test_risk_detection(sb)
+        await test_evidence_grading(sb)
+        await test_risk_closure(sb)
+        await test_final_answer_hygiene(sb)
+        await test_scope_consistency(sb)
+        await test_read_cache(sb)
+        await test_compaction(sb)
+        await test_budget_and_read_index(sb)
     finally:
         sb.cleanup()
 
@@ -1438,6 +1991,984 @@ async def main() -> int:
                 print(f"  ✗ {label}")
     print("=" * 78)
     return 0 if ok == total else 1
+
+
+
+# --------------------------------------------------------------------------- #
+# [I] 任务意图 / 用户约束
+# --------------------------------------------------------------------------- #
+async def test_intent(sb: Sandbox) -> None:
+    """[I] 意图分类：显式约束 > 验证方式 > 关键词 > unknown。"""
+    print("\n[I] 任务意图与约束")
+
+    from backend.agent.intent import classify_intent, extract_constraints
+
+    def kind(goal: str, forbidden: list[str] | None = None) -> str:
+        return classify_intent(goal, forbidden_paths=forbidden).intent
+
+    check(kind("分析这个项目的架构，看看为什么测试失败") == "diagnostic", "诊断类")
+    check(kind("跑一下 pytest，把真实结果告诉我") == "verification", "验证类")
+    check(kind("修复 average 在空列表时的 bug") == "repair", "修复类")
+    check(kind("为 calc 模块补充单元测试") == "test_authoring", "测试编写类")
+    check(kind("实现一个导出 CSV 的新功能") == "implementation", "实现类")
+    check(kind("处理一下这个东西") == "unknown", "★ 没有关键词 → unknown（不猜）")
+    check(kind("分析并修复这个问题") == "unknown",
+          "★ 诊断/修复打平 → unknown（信息不足不擅自解释）")
+    check(kind("跑一下测试看看为什么失败") == "diagnostic",
+          "★ 跑测试+看原因 → 诊断（不是盲目修复）")
+
+    c = extract_constraints("不要修改测试，只运行 pytest 看结果")
+    check(c["no_test_modification"] is True, "识别出「不许改测试」")
+    check(kind("不要修改测试，只运行 pytest 看结果") == "verification",
+          "★ 禁止改测试 + 要求跑测试 → 验证任务")
+    c2 = extract_constraints("只检查代码，不要修改任何文件")
+    check(c2["read_only"] is True, "识别出「只读」")
+    check(kind("只检查代码，不要修改任何文件") == "diagnostic", "★ 只读 → 诊断任务")
+    check(kind("跑一下测试报告结果，不要修复") == "verification", "★ 声明不修复 → 验证任务")
+    check(kind("修复 bug，但不要改测试") == "repair", "修复任务仍然识别为修复")
+
+    # forbidden_paths 里有 tests/ 也算佐证
+    r = classify_intent("跑一下测试", forbidden_paths=["tests/"])
+    check(r.intent == "verification", "调用方禁 tests/ + 跑测试 → 验证任务")
+
+    # ---- 范围化禁令：限定了目标的"不许修改"不是全局只读（压力扩样抓到的 bug）----
+    from backend.agent.intent import extract_scoped_forbidden
+    r2 = classify_intent("给流水线新增分项报告：不许修改 tests/test_pipeline.py 和 data/input.csv，"
+                         "其余只许改 pipeline/")
+    check(r2.constraints.get("read_only") is False,
+          "★ 限定了目标的禁令 ≠ 全局只读（否则实现任务什么都写不了）")
+    check("tests/test_pipeline.py" in r2.scoped_forbidden
+          and "data/input.csv" in r2.scoped_forbidden,
+          f"★ 禁令里的路径被抽出来（{r2.scoped_forbidden}）")
+    check(extract_scoped_forbidden("只检查代码，不要修改任何文件") == [],
+          "★ 没跟具体路径的禁令保持全局只读")
+    # 「任何文件（包括 A、B）」是全局只读，不能因为括号里列了路径就降级
+    r3 = classify_intent("只做一件事：运行 pytest，把真实结果告诉我。"
+                         "不要修改、新建或删除任何文件（包括 tests/、data/ 和 pipeline/）。")
+    check(r3.constraints.get("read_only") is True,
+          "★ 「任何文件」= 全局只读（括号里的路径只是举例）")
+    check(r3.intent == "diagnostic", f"★ 诊断任务不被误判成 repair（{r3.intent}）")
+    check(extract_scoped_forbidden("不要修改任何文件（包括 tests/ 和 data/）") == [],
+          "★ 括号里的路径不会变成范围化禁令")
+    # 「不许修改 A 和 B，其余只许改 C」：C 是**允许**范围，不能当成禁止
+    from backend.agent.intent import extract_scoped_allowed
+    r4 = classify_intent("给流水线新增分项报告：不许修改 tests/test_pipeline.py 和 data/input.csv，"
+                         "其余只许改 pipeline/ 下的源码。")
+    check("pipeline" not in r4.scoped_forbidden,
+          f"★ 允许范围不会被误当禁止范围（禁止={r4.scoped_forbidden}）")
+    check("pipeline" in r4.scoped_allowed,
+          f"★ 「只许改 pipeline/」被抽成允许范围（{r4.scoped_allowed}）")
+
+    # ---- 约束要真的落到 Policy 上（验收 4/5）----
+    policy = Policy(build_default_registry())
+    ctx = make_context(TaskState(goal="x", workspace=sb.dir))
+
+    st_ro = TaskState(goal="只检查代码，不要修改任何文件", workspace=sb.dir)
+    st_ro.constraints = {"read_only": True}
+    d = policy.check("write_file", {"path": "a.py", "content": "x"}, st_ro, ctx)
+    check(not d.allow and "只检查" in (d.result.summary if d.result else ""),
+          "★ 用户要求只读 → 写操作被 Policy 拒绝")
+    d2 = policy.check("read_file", {"path": "main.py"}, st_ro, ctx)
+    check(d2.allow, "★ 只读任务仍然允许读")
+
+    st_nt = TaskState(goal="修复 bug，但不要修改测试", workspace=sb.dir)
+    st_nt.constraints = {"no_test_modification": True}
+    st_nt.forbidden_paths = ["tests/", "conftest.py", "pytest.ini", "tox.ini"]
+    d3 = policy.check("write_file", {"path": "tests/t.py", "content": "x"}, st_nt, ctx)
+    check(not d3.allow, "★ 说了别改测试 → 写 tests/ 被拒")
+    d4 = policy.check("write_file", {"path": "app/x.py", "content": "x"}, st_nt, ctx)
+    check(d4.needs_approval, "★ 非测试路径仍按原流程走审批（不是一刀切）")
+
+    # ---- 测试编写任务不该被自动禁测试 ----
+    core_ta = AgentCore(
+        FakeAdapter([ModelReply(content="写好了。")]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=4, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st_ta = await core_ta.run("为 mathx 补充单元测试", workspace=sb.dir)
+    check(st_ta.intent == "test_authoring", f"意图 test_authoring（{st_ta.intent}）")
+    check(all(not _scope_hits("tests/", [f]) for f in st_ta.forbidden_paths),
+          f"★ 测试编写任务不自动禁 tests（{st_ta.forbidden_paths}）")
+
+
+# --------------------------------------------------------------------------- #
+# [R] 验证可信度风险
+# --------------------------------------------------------------------------- #
+async def test_risk_detection(sb: Sandbox) -> None:
+    """[R] 能绕过验证的改动要被认出来，但合理的 mock 不能一棍子打死。"""
+    print("\n[R] 验证可信度风险")
+
+    from backend.agent.intent import detect_risks, scan_content_risks
+
+    def one(path: str, *, kind: str = "added", content: str = "",
+            constraints: dict | None = None, forbidden: list[str] | None = None) -> dict:
+        risks = detect_risks(
+            [{"path": path, "kind": kind, "via": "tool"}],
+            constraints=constraints or {},
+            forbidden_paths=forbidden or [],
+            read_text=lambda _p: content,
+        )
+        return risks[0] if risks else {}
+
+    # ---- 合理 mock 不误判 ----
+    r = one("tests/test_api.py", content="def test_x(monkeypatch):\n    monkeypatch.setattr('os.getcwd', lambda: '/tmp')\n")
+    check(r.get("level") == "low", f"★ 测试文件里的 monkeypatch 不误判（{r.get('level')}）")
+    r = one("tests/test_api.py", content="from unittest.mock import patch\n")
+    check(r.get("level") == "low", "★ 测试文件里的 mock 不误判")
+
+    # ---- 修复任务里动测试配置 → 中风险 ----
+    r = one("conftest.py", content="@pytest.fixture(autouse=True)\ndef _m():\n    yield\n")
+    check(r.get("level") == "medium", f"★ 新增 conftest.py → 中风险（{r.get('level')}）")
+    r = one("pytest.ini", content="[pytest]\naddopts = -p no:cacheprovider\n")
+    check(r.get("level") == "medium", "★ 改 pytest.ini → 中风险")
+    r = one("tests/test_a.py", kind="modified", content="import pytest\n@pytest.mark.skip(reason='x')\ndef test_a(): pass\n")
+    check(r.get("level") == "medium", "★ 引入 skip 标记 → 中风险")
+    r = one("tests/test_a.py", kind="modified", content="@pytest.mark.xfail\ndef test_a(): pass\n")
+    check(r.get("level") == "medium", "★ 引入 xfail → 中风险")
+    r = one("app/core.py", content="from unittest.mock import patch\n")
+    check(r.get("level") == "medium", "★ 非测试代码里引入 mock → 中风险")
+
+    # ---- 明确违反约束 → 高风险 ----
+    r = one("tests/test_a.py", constraints={"no_test_modification": True}, content="def test_a(): pass\n")
+    check(r.get("level") == "high", f"★ 说了别改测试还是改了 → 高风险（{r.get('level')}）")
+    r = one("conftest.py", constraints={"no_test_modification": True})
+    check(r.get("level") == "high", "★ 说了别改测试配置还是改了 → 高风险")
+    r = one("app/secret.py", forbidden=["app/secret.py"])
+    check(r.get("level") == "high", "★ 命中禁止路径 → 高风险")
+
+    # ---- 去重：同一路径只报一条 ----
+    risks = detect_risks(
+        [{"path": "conftest.py", "kind": "added", "via": "tool"},
+         {"path": "conftest.py", "kind": "modified", "via": "tool"}],
+        read_text=lambda _p: "x",
+    )
+    check(len(risks) == 1, f"★ 同一路径去重（{len(risks)} 条）")
+
+    # ---- 读不了内容 → 标不确定，不假装看到 ----
+    def boom(_p: str) -> str:
+        raise OSError("读不了")
+
+    risks2 = detect_risks([{"path": "conftest.py", "kind": "added", "via": "tool"}], read_text=boom)
+    check(risks2[0]["uncertain"] is True, "★ 读不了内容 → uncertain=True")
+    check(scan_content_risks("pytest.skip('x')") == ["skip"], "内容模式识别")
+
+
+# --------------------------------------------------------------------------- #
+# [E] 证据分级 + 意图感知闸门（集成）
+# --------------------------------------------------------------------------- #
+class _Writer(Tool):
+    """真的写文件但 risk=READ（不触发审批），用来单独测风险与审计。"""
+
+    name = "write_file"
+    description = "测试用写入（不触发审批）"
+    parameters = {"type": "object",
+                  "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                  "required": ["path"]}
+    risk = RiskLevel.READ
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+
+    async def run(self, args, ctx):  # type: ignore[override]
+        rel = args["path"]
+        full = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(full) or self.root, exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(args.get("content", "x\n"))
+        return ToolResult.success(self.name, f"写入 {rel}",
+                                  data={"path": rel,
+                                        "change": {"path": rel, "action": "create"}})
+
+
+async def test_evidence_grading(sb: Sandbox) -> None:
+    """[E] 证据必须指回用户目标，而不是只看退出码。"""
+    print("\n[E] 证据分级与意图感知闸门")
+
+    from backend.agent.intent import grade_evidence
+
+    # ---- 分级规则 ----
+    def g(cmds, turns, risks, intent="repair"):
+        return grade_evidence(command_history=cmds, change_turns=turns, risks=risks, intent=intent)
+
+    fail = [{"command": "pytest", "exit_code": 1, "ok": False, "turn": 2}]
+    okc = [{"command": "pytest", "exit_code": 0, "ok": True, "turn": 5}]
+    other = [{"command": "ls", "exit_code": 0, "ok": True, "turn": 5}]
+    check(g(fail + okc, [3], [])["grade"] == "A", "★ 同一命令失败→通过且无风险 = A")
+    med = [{"path": "conftest.py", "level": "medium"}]
+    check(g(fail + okc, [3], med)["grade"] == "B", "★ 失败→通过但有可疑改动 = B")
+    high = [{"path": "tests/t.py", "level": "high"}]
+    check(g(fail + okc, [3], high)["grade"] == "C", "★ 失败→通过但高风险 = C")
+    check(g(okc, [3], [])["grade"] == "B", "★ 只跑过无关命令 = B")
+    check(g(fail, [3], [])["grade"] == "C", "★ 最后仍失败 = C")
+    check(g([], [], [])["grade"] == "C", "★ 没有任何命令 = C")
+    check(g(fail, [3], [], intent="diagnostic")["grade"] == "B",
+          "★ 诊断任务的失败不是修复失败")
+
+    # ---- 集成：修复任务只跑无关命令就宣称完成 → 被拦 ----
+    reg = ToolRegistry()
+    reg.register(build_default_registry().get("list_files"), group="readonly")
+    reg.register(StubRunTool([0]), group="exec")      # 只有无关命令成功
+    reg.register(_Writer(sb.dir), group="mutating")
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"跑一下","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("e1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("e2", "write_file", {"path": "a.py", "content": "x"})]),
+            ModelReply(tool_calls=[tc("e3", "run_command", {"command": "ls"})]),
+            ModelReply(content="修复完成，测试都通过了。"),
+            ModelReply(content="真的修好了。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=8, min_evidence=1, use_reflect_phase=False,
+                           max_verification_retries=1),
+        bus=EventBus(),
+    )
+    st = await core.run("修复 main.py 的 bug", workspace=sb.dir)
+    check(st.evidence.get("grade") == "B",
+          f"★ 只跑过无关命令 → 证据等级 B（{st.evidence.get('grade')}）")
+    check("没有观察到失败场景" in "；".join(st.evidence.get("reasons") or []),
+          "★ B 级要在机器判定里说清缺什么")
+
+    # ---- 修复任务一条命令都没跑 → 等级 C，必须拦 ----
+    reg1b = ToolRegistry()
+    reg1b.register(build_default_registry().get("list_files"), group="readonly")
+    reg1b.register(_Writer(sb.dir), group="mutating")
+    core1b = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"改","check":"change"}],"note":""}'),
+            ModelReply(tool_calls=[tc("e1b", "write_file", {"path": "c.py", "content": "x"})]),
+            ModelReply(content="修复完成。"),
+            ModelReply(content="真的修好了。"),
+        ]),
+        reg1b,
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=EventBus(),
+    )
+    st1b = await core1b.run("修复 main.py 的 bug", workspace=sb.dir)
+    check(st1b.status is TaskStatus.ABORTED,
+          f"★ 修复任务一条命令都没跑 → 不能算完成（{st1b.status.value}）")
+    check(st1b.end_reason == "verification_failed", f"结束原因 {st1b.end_reason}")
+    check("证据" in st1b.final_answer, "答复里说明证据不足")
+
+    # ---- 集成：修复任务 失败→同一命令通过 → 正常完成 + 机器判定块 ----
+    reg2 = ToolRegistry()
+    reg2.register(build_default_registry().get("list_files"), group="readonly")
+    reg2.register(StubRunTool([1, 0]), group="exec")
+    reg2.register(_Writer(sb.dir), group="mutating")
+    core2 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"修","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("f1", "write_file", {"path": "b.py", "content": "x"})]),
+            ModelReply(tool_calls=[tc("f2", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(tool_calls=[tc("f3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="修好了，测试通过。"),
+        ]),
+        reg2,
+        config=AgentConfig(max_turns=8, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=2),
+        bus=EventBus(),
+    )
+    st2 = await core2.run("修复 pytest 失败的问题", workspace=sb.dir)
+    check(st2.status is TaskStatus.DONE, f"★ 失败→通过的正常修复不被拦（{st2.status.value}）")
+    check(st2.evidence.get("grade") == "A", f"证据等级 A（{st2.evidence.get('grade')}）")
+    check("机器判定" in st2.final_answer, "★ 答复附带机器判定块")
+
+    # ---- 集成：诊断任务如实报告失败 → 正常完成 ----
+    reg3 = ToolRegistry()
+    reg3.register(build_default_registry().get("list_files"), group="readonly")
+    reg3.register(StubRunTool([1]), group="exec")
+    core3 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"跑","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("g1", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="退出码 1：test_remote 因容器无网络失败，1 通过 1 失败。"),
+        ]),
+        reg3,
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st3 = await core3.run("分析这个项目测试为什么失败", workspace=sb.dir)
+    check(st3.intent == "diagnostic", f"意图识别为 diagnostic（{st3.intent}）")
+    check(st3.status is TaskStatus.DONE, f"★ 诊断任务如实汇报失败也判 done（{st3.status.value}）")
+    check("退出码 1" in st3.final_answer, "汇报内容保留")
+
+    # ---- 集成：修复任务新建 conftest.py → 中风险 + 事件 + 答复 ----
+    reg4 = ToolRegistry()
+    reg4.register(_Writer(sb.dir), group="mutating")
+    reg4.register(StubRunTool([1, 0]), group="exec")
+    bus4 = EventBus()
+    evs4 = collect(bus4)
+    core4 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"修","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("h1", "write_file", {"path": "conftest.py",
+                                                           "content": "@pytest.fixture(autouse=True)\ndef _m():\n    yield\n"})]),
+            ModelReply(tool_calls=[tc("h2", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(tool_calls=[tc("h3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="测试通过了。"),
+            ModelReply(content='{"explanations": [{"path": "conftest.py", "why": "隔离外部服务",'
+                               ' "changed_verification": true}]}'),
+        ]),
+        reg4,
+        config=AgentConfig(max_turns=10, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=bus4,
+    )
+    st4 = await core4.run("修复测试失败的问题", workspace=sb.dir)
+    await bus4.drain()
+    levels = {r["path"]: r["level"] for r in st4.risks}
+    check(levels.get("conftest.py") == "medium", f"★ conftest.py 被标中风险（{levels}）")
+    check(st4.evidence.get("grade") == "B", f"★ 有可疑改动 → 证据降为 B（{st4.evidence.get('grade')}）")
+    check(sum(1 for e in evs4 if e.type == EventType.ERROR
+              and e.data.get("kind") == "verification_risk") == 1,
+          "★ verification_risk 事件只发一次")
+    check("机器判定" in st4.final_answer and "conftest.py" in st4.final_answer,
+          "★ 最终答复里点名风险文件")
+
+
+
+
+# --------------------------------------------------------------------------- #
+# [K] 风险收尾确认（第四批）
+# --------------------------------------------------------------------------- #
+async def test_risk_closure(sb: Sandbox) -> None:
+    """[K] 中/高风险必须经过收尾确认；解释是证据，不是免检凭证。"""
+    print("\n[K] 风险收尾确认")
+
+    from backend.agent.core import AgentCore as AC  # noqa: F401  （保持 import 一致）
+
+    # ---- K1 无风险修复：不增加任何收尾循环 ----
+    reg = ToolRegistry(); reg.register(StubRunTool([1, 0]), group="exec")
+    reg.register(_Writer(sb.dir), group="mutating")
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"修","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("k1", "write_file", {"path": "fix.py", "content": "x"})]),
+            ModelReply(tool_calls=[tc("k2", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(tool_calls=[tc("k3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="修好了。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=8, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st = await core.run("修复 pytest 失败", workspace=sb.dir)
+    check(st.status is TaskStatus.DONE, f"无风险修复正常完成（{st.status.value}）")
+    check(st.risk_review_retries == 0 and not st.risk_reviews,
+          "★ 无风险 → 零次收尾确认（无额外循环）")
+
+    # ---- K2 修复任务新建 conftest.py → 必须经收尾确认，且矛盾会被以审计为准 ----
+    # ★ 共享 Sandbox：前面测试段写过 conftest.py，必须先删掉，
+    #   否则它在基线里已存在，这次"写入"不构成变更，风险根本不会出现。
+    (Path(sb.dir) / "conftest.py").unlink(missing_ok=True)
+    reg2 = ToolRegistry(); reg2.register(_Writer(sb.dir), group="mutating")
+    reg2.register(StubRunTool([1, 0]), group="exec")
+    core2 = AgentCore(
+        FakeAdapter([
+            # ★ 脚本顺序必须精确对应调用顺序：
+            #   PLAN → 写 → 跑(红) → 跑(绿) → 收尾文本 → [确认1: 撒谎] →
+            #   继续文本 → [确认2: 诚实承认] → 结束
+            ModelReply(content='{"steps":[{"title":"修","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("m1", "write_file", {"path": "conftest.py",
+                                                           "content": "@pytest.fixture(autouse=True)\ndef _m():\n    yield\n"})]),
+            ModelReply(tool_calls=[tc("m2", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(tool_calls=[tc("m3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="测试通过了。"),
+            # 第一次收尾确认：撒谎说没改变验证条件 → 与审计矛盾 → 驳回
+            ModelReply(content='{"explanations": [{"path": "conftest.py", "why": "只是加了个 fixture",'
+                               ' "changed_verification": false}]}'),
+            ModelReply(content="我重新检查了一遍，这个 fixture 确实会影响测试环境。"),
+            # 第二次收尾确认：诚实承认 → unresolved（情况 B）→ 放行并披露
+            ModelReply(content='{"explanations": [{"path": "conftest.py", "why": "mock 了外部服务",'
+                               ' "changed_verification": true}]}'),
+        ]),
+        reg2,
+        config=AgentConfig(max_turns=12, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st2 = await core2.run("修复测试失败的问题", workspace=sb.dir)
+    conftest_risk = next((r for r in st2.risks if r.get("path") == "conftest.py"), {})
+    check(len(st2.risk_reviews) == 2, f"★ conftest 变绿必须经收尾确认（{len(st2.risk_reviews)} 轮）")
+    check(conftest_risk.get("contradiction_seen") is True,
+          "★ 第一轮解释与审计矛盾 → 留下痕迹（以审计为准；第二轮已改口则当前轮不算矛盾）")
+    check(conftest_risk.get("status") == "unresolved",
+          f"★ 最终状态 unresolved（{conftest_risk.get('status')}）")
+    check(st2.status is TaskStatus.DONE,
+          f"情况 B：允许结束（实际 {st2.status.value}/{st2.end_reason}，"
+          f"reviews={json.dumps(st2.risk_reviews, ensure_ascii=False)[:300]}）")
+    check("未充分验证" in st2.final_answer or "未解决" in st2.final_answer,
+          "★ 答复中明确披露「未充分验证/未解决」")
+    check(st2.risk_review_retries == 2, f"重试计数 2（{st2.risk_review_retries}）")
+
+    # ---- K3 高风险（违反用户约束）→ 不能正常完成 ----
+    (Path(sb.dir) / "conftest.py").unlink(missing_ok=True)
+    reg3 = ToolRegistry(); reg3.register(_Writer(sb.dir), group="mutating")
+    reg3.register(StubRunTool([1, 0]), group="exec")
+    bus3 = EventBus()
+    evs3 = collect(bus3)
+    core3 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"修","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("n1", "write_file", {"path": "conftest.py", "content": "x"})]),
+            ModelReply(tool_calls=[tc("n2", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(tool_calls=[tc("n3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="通过了。"),
+            ModelReply(content='{"explanations": [{"path": "conftest.py", "why": "需要它",'
+                               ' "changed_verification": true}]}'),
+            ModelReply(content="我解释过了。"),
+        ]),
+        reg3,
+        config=AgentConfig(max_turns=10, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=bus3,
+    )
+    st3 = await core3.run("修复测试失败，但别改测试", workspace=sb.dir,
+                          forbidden_paths=["conftest.py"])
+    await bus3.drain()
+    check(st3.status is TaskStatus.ABORTED,
+          f"★ 违反约束的高风险 → 不能按正常完成收尾（{st3.status.value}/{st3.end_reason}）")
+    check(any(e.type == EventType.ERROR and e.data.get("kind") == "risk_review"
+              for e in evs3), "★ 收尾确认过程有事件可追踪")
+    risk3 = next((r for r in st3.risks if r.get("path") == "conftest.py"), {})
+    check(risk3.get("status") == "unresolved" and "违反用户约束" in str(risk3.get("resolution")),
+          "★ 解释不能消除约束违反")
+
+    # ---- K4 重试上限：不无限循环 ----
+    (Path(sb.dir) / "conftest.py").unlink(missing_ok=True)
+    reg4 = ToolRegistry(); reg4.register(_Writer(sb.dir), group="mutating")
+    reg4.register(StubRunTool([1, 0]), group="exec")
+    core4 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"修","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("o1", "write_file", {"path": "conftest.py", "content": "x"})]),
+            ModelReply(tool_calls=[tc("o2", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(tool_calls=[tc("o3", "run_command", {"command": "python -m pytest -q"})]),
+            ModelReply(content="通过了。"),
+            ModelReply(content="好吧。"),     # 收尾确认：不输出结构化解释
+            ModelReply(content="还是这段话。"),
+        ]),
+        reg4,
+        config=AgentConfig(max_turns=10, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=EventBus(),
+    )
+    st4 = await core4.run("修复测试失败的问题", workspace=sb.dir)
+    check(st4.status is TaskStatus.ABORTED,
+          f"★ 达到重试上限后如实收尾（{st4.status.value}/{st4.end_reason}）")
+    check(st4.risk_review_retries == 1, f"确认只进行了一轮（{st4.risk_review_retries}）")
+    r4 = next((r for r in st4.risks if r.get("path") == "conftest.py"), {})
+    check(r4.get("status") == "detected" and "未给出解释" in str(r4.get("resolution")),
+          "★ 未解释的风险保持 detected，不伪装成已解决")
+
+    # ---- K5 取消/状态序列化不会把风险标成已解决 ----
+    st5 = TaskState(goal="x", workspace=sb.dir)
+    st5.risks = [{"path": "conftest.py", "level": "medium", "status": "unresolved",
+                  "resolution": "解释尚无独立证据支持"}]
+    blob = json.dumps(st5.to_dict(), ensure_ascii=False)
+    back = json.loads(blob)
+    check(back["risks"][0]["status"] == "unresolved",
+          "★ 风险状态经序列化往返后保持不变（取消/恢复不误标）")
+
+    # ---- K6 评估器的矛盾判定（纯单元）----
+    core6 = AgentCore(FakeAdapter([]), build_default_registry(), bus=EventBus())
+    st6 = TaskState(goal="x", workspace=sb.dir)
+    st6.intent = "repair"
+    st6.note_command("python -m pytest -q", 1, False, turn=2)
+    st6.note_command("python -m pytest -q", 0, True, turn=5)
+    st6.change_records.append(ChangeRecord(path="conftest.py", action="create", turn=3))
+    risks6 = [{"path": "conftest.py", "level": "medium", "kind": "added", "status": "detected"}]
+    core6._evaluate_risk_explanations(
+        st6, risks6,
+        [{"path": "conftest.py", "why": "只是测试基础设施", "changed_verification": False}])
+    check(risks6[0]["status"] == "unresolved" and risks6[0].get("contradiction") is True,
+          "★ 解释与审计矛盾 → 以审计为准，标记矛盾")
+
+
+# --------------------------------------------------------------------------- #
+# [F] 最终答复卫生：REFLECT 形状的输出不能当答复
+# --------------------------------------------------------------------------- #
+async def test_final_answer_hygiene(sb: Sandbox) -> None:
+    """[F] 模型把进展汇报当答复交上来时，不能收尾。"""
+    print("\n[F] 最终答复卫生")
+
+    from backend.agent.core import _as_reflect_payload
+
+    check(_as_reflect_payload('{"progress":"p","next_action":"n","done":false}') is not None,
+          "★ 认得出 REFLECT 形状")
+    check(_as_reflect_payload('{"answer":"这是答复"}') is None, "普通 JSON 答复不被误判")
+    check(_as_reflect_payload("这就是一段正常中文答复") is None, "普通文本不被误判")
+
+    # 真实形态：模型交上来 {"progress":..., "next_action":..., "done":false}
+    reg = ToolRegistry()
+    reg.register(build_default_registry().get("list_files"), group="readonly")
+    bus = EventBus()
+    evs = collect(bus)
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"看目录"}],"note":""}'),
+            ModelReply(tool_calls=[tc("f1", "list_files", {"path": "."})]),
+            ModelReply(content='{"progress":"已经看过目录了","next_action":"继续读 main.py","done":false}'),
+            ModelReply(tool_calls=[tc("f2", "read_file", {"path": "main.py"})]),
+            ModelReply(content="看完了：main.py 里只有一个 print。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=8, min_evidence=1, use_reflect_phase=False),
+        bus=bus,
+    )
+    st = await core.run("看看 main.py", workspace=sb.dir)
+    await bus.drain()
+    check("已经看过目录了" not in st.final_answer,
+          f"★ 进展汇报没有被当成最终答复（{st.final_answer[:40]!r}）")
+    check("main.py 里只有一个 print" in st.final_answer, "★ 真正的答复被保留")
+    check(any(e.type == EventType.ERROR and e.data.get("kind") == "reflect_as_answer" for e in evs),
+          "★ 事件流里有 reflect_as_answer 提示")
+    check(st.status is TaskStatus.DONE, "★ 任务正常完成")
+
+    # done=true 的 REFLECT 形状 → 索要真正的答复
+    reg2 = ToolRegistry()
+    reg2.register(build_default_registry().get("list_files"), group="readonly")
+    core2 = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("g1", "list_files", {"path": "."})]),
+            ModelReply(content='{"progress":"做完了","next_action":"","done":true}'),
+            ModelReply(content="最终答复：目录里有 3 个条目。"),
+        ]),
+        reg2,
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st2 = await core2.run("列一下目录", workspace=sb.dir)
+    check("最终答复：目录里有 3 个条目。" in st2.final_answer,
+          f"★ done=true 的进展汇报会要一份真正的答复（{st2.final_answer[:40]!r}）")
+
+
+# --------------------------------------------------------------------------- #
+# [G] 约束一致性：多允许范围 / 禁止优先 / 执行前拦截 / 冲突不静默扩权
+# --------------------------------------------------------------------------- #
+async def test_scope_consistency(sb: Sandbox) -> None:
+    """[G] 允许范围与禁止范围必须自洽，冲突要暴露而不是被抹平。"""
+    print("\n[G2] 约束一致性")
+
+    from backend.agent.intent import detect_scope_conflicts, extract_mentioned_paths
+    from backend.agent.scope import within_allowed
+
+    # ---- 1. 多个允许目录 ----
+    check(within_allowed("pipeline/a.py", ["pipeline", "tests"]), "多允许范围：pipeline 命中")
+    check(within_allowed("tests/b.py", ["pipeline", "tests"]), "多允许范围：tests 命中")
+    check(not within_allowed("docs/c.md", ["pipeline", "tests"]), "多允许范围：范围外不命中")
+
+    # ---- 2. 冲突检测 ----
+    conflicts = detect_scope_conflicts(
+        "只允许修改 pipeline/ 下的源码，在 tests/ 下新增 test_breakdown.py",
+        allowed_paths=["pipeline"], forbidden_paths=["tests/test_pipeline.py"],
+    )
+    check(bool(conflicts), f"★ 目标与范围冲突能被检出（{conflicts}）")
+    check(any(c["kind"] == "outside_allowed" for c in conflicts), "★ 冲突类型：超出允许范围")
+    conflicts2 = detect_scope_conflicts(
+        "不要修改 tests/test_pipeline.py，但请把它修好",
+        allowed_paths=["."], forbidden_paths=["tests/test_pipeline.py"],
+    )
+    check(any(c["kind"] == "forbidden_but_requested" for c in conflicts2),
+          f"★ 同时被要求与被禁止的路径能检出（{conflicts2}）")
+    check(detect_scope_conflicts("把 main.py 改一下", allowed_paths=["."], forbidden_paths=[]) == [],
+          "★ 普通任务不误判冲突")
+
+    # ---- 3. 执行前拦截：范围外写入被 Policy 拒 ----
+    policy = Policy(build_default_registry())
+    st = TaskState(goal="x", workspace=sb.dir)
+    st.allowed_paths = ["pipeline"]
+    ctx = make_context(st)
+    d = policy.check("write_file", {"path": "docs/out.md", "content": "x"}, st, ctx)
+    check(not d.allow and "允许" in (d.result.summary if d.result else ""),
+          f"★ 范围外写入在执行前被拦（{d.result.summary if d.result else ''}）")
+    d2 = policy.check("write_file", {"path": "pipeline/ok.py", "content": "x"}, st, ctx)
+    check(d2.needs_approval, "★ 允许范围内的写入照常走审批")
+    st.allowed_paths = ["."]
+    d3 = policy.check("write_file", {"path": "docs/out.md", "content": "x"}, st, ctx)
+    check(d3.needs_approval, "★ 默认允许整个工作区 → 不拦任何写入")
+
+    # ---- 4. 禁止范围永远优先 ----
+    st2 = TaskState(goal="x", workspace=sb.dir)
+    st2.allowed_paths = ["pipeline", "tests"]
+    st2.forbidden_paths = ["tests/test_pipeline.py"]
+    d4 = policy.check("write_file", {"path": "tests/test_pipeline.py", "content": "x"}, st2, ctx)
+    check(not d4.allow, "★ 禁止范围优先于允许范围")
+
+    # ---- 5. 冲突不会静默扩大权限（端到端）----
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"改"}],"note":""}'),
+            ModelReply(tool_calls=[tc("g1", "write_file", {"path": "tests/new_test.py",
+                                                           "content": "x = 1\n"})]),
+            ModelReply(content="我已经处理完了。"),
+        ]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st3 = await core.run("只允许修改 pipeline/ 下的源码，在 tests/ 下新增 test_new.py",
+                         workspace=sb.dir)
+    check(bool(st3.scope_conflicts), f"★ 端到端也能检出冲突（{st3.scope_conflicts}）")
+    check(st3.allowed_paths == ["pipeline"],
+          f"★ 冲突时允许范围没有被悄悄放大（{st3.allowed_paths}）")
+    check(not (Path(sb.dir) / "tests" / "new_test.py").exists(),
+          "★ 范围外的文件没有被写出来")
+
+
+# --------------------------------------------------------------------------- #
+# [H] 文件读取复用与缓存失效
+# --------------------------------------------------------------------------- #
+async def test_read_cache(sb: Sandbox) -> None:
+    """[H] 重复读取要能复用，但绝不会给过期内容。"""
+    print("\n[H2] 文件读取复用")
+
+    (Path(sb.dir) / "main.py").write_text("print('v1')\n", encoding="utf-8")
+
+    # ---- 1. 同文件重复读取：第二条只放命中标记 ----
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("h1", "read_file", {"path": "main.py"})]),
+            ModelReply(tool_calls=[tc("h2", "read_file", {"path": "main.py"})]),
+            ModelReply(content="读完了。"),
+        ]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st = await core.run("读一下 main.py", workspace=sb.dir)
+    tool_msgs = [m for m in core._history if m.role == "tool"]
+    check(len(tool_msgs) == 2, f"★ 两次读取都产生了工具消息（{len(tool_msgs)}）")
+    check("读取复用" in (tool_msgs[1].content or ""),
+          f"★ 第二次读取折叠成命中标记（{str(tool_msgs[1].content)[:60]}）")
+    check("print('v1')" in (tool_msgs[0].content or ""), "★ 第一次仍是完整内容")
+    check("main.py" in st.read_cache and st.read_cache["main.py"].get("hash"),
+          "★ 缓存里记下了文件 hash")
+
+    # ---- 2. 文件被改后再读 → 不得复用旧内容 ----
+    reg_rw = ToolRegistry()
+    reg_rw.register(build_default_registry().get("read_file"), group="readonly")
+    reg_rw.register(_Writer(sb.dir), group="mutating")   # 免审批的写桩
+    core2 = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("h3", "read_file", {"path": "main.py"})]),
+            ModelReply(tool_calls=[tc("h4", "write_file", {"path": "main.py",
+                                                           "content": "print('v2')\n"})]),
+            ModelReply(tool_calls=[tc("h5", "read_file", {"path": "main.py"})]),
+            ModelReply(content="读完了。"),
+        ]),
+        reg_rw,
+        config=AgentConfig(max_turns=8, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st2 = await core2.run("读、改、再读 main.py", workspace=sb.dir)
+    tool_msgs2 = [m for m in core2._history if m.role == "tool"]
+    last = tool_msgs2[-1].content or ""
+    check("print('v2')" in last, f"★ 改完再读拿到的是新内容（{last[:60]}）")
+    check("读取复用" not in last, "★ 内容变了就不能折叠成复用标记")
+    check(any("失效" in n or "被改动" in n for n in st2.cache_notes),
+          f"★ 缓存失效被记录（{st2.cache_notes}）")
+
+    # ---- 3. 缓存不绕过权限：读越界文件仍被拒 ----
+    core3 = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("h6", "read_file", {"path": "../outside.py"})]),
+            ModelReply(content="读不到工作区外的文件。"),
+        ]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st3 = await core3.run("读 ../outside.py", workspace=sb.dir)
+    check(not st3.read_cache, "★ 越界读取没进缓存")
+
+
+# --------------------------------------------------------------------------- #
+# [I] 上下文压缩 MVP
+# --------------------------------------------------------------------------- #
+class _SummaryCore(AgentCore):
+    """可控摘要器的 AgentCore（不消耗 FakeAdapter 的剧本）。"""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.summary_calls: list[str] = []
+        self.summary_text: str | None = "摘要：已定位失败原因并改完两处。"
+
+    async def _summarize_history(self, text: str) -> str | None:
+        self.summary_calls.append(text)
+        if self.summary_text is None:
+            return None
+        return self.summary_text
+
+
+async def test_compaction(sb: Sandbox) -> None:
+    """[I] 压缩要真的接进 Agent Loop，且不能丢权威状态。"""
+    print("\n[I2] 上下文压缩")
+
+    from backend.agent.compaction import (ContextCompactor, build_state_block, measure,
+                                         split_turns)
+
+    # ---- 1. 轮次切分保持 tool 配对 ----
+    from backend.models.adapter import Message as M
+    turns = split_turns([M.assistant("x"), M.tool_result("c1", "read_file", "r1"),
+                         M.tool_result("c2", "read_file", "r2"), M.assistant("y")])
+    check(len(turns) == 2, f"★ 轮次切分正确（{len(turns)}）")
+    check(turns[0][0].role == "assistant" and turns[0][1].role == "tool",
+          "★ 每轮都以 assistant 开头（tool 配对不破）")
+
+    # ---- 2. 权威状态块包含目标/约束/未完成步骤/未解决风险 ----
+    st = TaskState(goal="修复 pipeline 的口径问题", workspace=sb.dir)
+    st.intent = "repair"
+    st.forbidden_paths = ["tests/"]
+    st.allowed_paths = ["pipeline"]
+    st.set_plan([PlanStep(0, "改 aggregate", check="change"),
+                 PlanStep(1, "跑测试", check="command_ok")])
+    st.plan[0].status = StepStatus.DONE
+    st.plan[0].evidence = "已改"
+    st.risks = [{"path": "conftest.py", "level": "medium", "status": "unresolved",
+                  "resolution": "解释不足"}]
+    st.evidence = {"grade": "B", "reasons": ["只有间接证据"], "unverified": ["原始问题未复验"]}
+    block = build_state_block(st)
+    check("修复 pipeline 的口径问题" in block, "★ 摘要保留用户原始目标")
+    check("tests/" in block, "★ 摘要保留禁止修改的路径")
+    check("改 aggregate" in block and "跑测试" in block, "★ 摘要包含计划步骤")
+    check("已改" in block, "★ 摘要包含已完成步骤的证据")
+    check("unresolved" in block or "解释不足" in block, "★ 摘要保留未解决风险")
+    check("原始问题未复验" in block, "★ 摘要保留未验证项")
+    check("只跑过无关命令" not in block, "★ 摘要不会编造未发生的验证")
+
+    # ---- 3. 未达阈值不触发；达到阈值触发且规模下降 ----
+    comp = ContextCompactor(max_chars=10_000, keep_recent_turns=1)
+    small = [M.system("x" * 100)]
+    need, reason, stats = comp.should_compact(small)
+    check(not need, "★ 未达阈值不触发压缩")
+    big = [M.system("x" * 20_000)]
+    need2, reason2, _ = comp.should_compact(big)
+    check(need2, f"★ 达到阈值触发压缩（{reason2}）")
+
+    # ---- 4. 端到端：压缩真的发生在 Agent Loop 里 ----
+    core = _SummaryCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"a"}],"note":""}'),
+            ModelReply(tool_calls=[tc("i1", "read_file", {"path": "main.py"})]),
+            ModelReply(tool_calls=[tc("i2", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("i3", "read_file", {"path": "main.py"})]),
+            ModelReply(content="做完了：main.py 只有一个 print。"),
+        ]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=8, min_evidence=0, use_reflect_phase=False,
+                           compact_max_chars=400, compact_keep_turns=1),
+        bus=EventBus(),
+    )
+    st2 = await core.run("读一下 main.py", workspace=sb.dir)
+    check(bool(st2.compaction_log), "★ 压缩在真实运行中发生过")
+    rec = st2.compaction_log[-1]
+    check(rec["triggered"], "★ 压缩被触发")
+    check(rec["after"]["chars"] < rec["before"]["chars"],
+          f"★ 压缩后规模下降（{rec['before']['chars']} → {rec['after']['chars']}）")
+    check(core.summary_calls, "★ 摘要器被调用过")
+    check(st2.status is TaskStatus.DONE, "★ 压缩后任务仍能正常完成")
+    check("做完了" in st2.final_answer, "★ 压缩后的最终答复正常")
+    # 压缩后历史里不能留下"孤立的 tool 消息"
+    roles = [m.role for m in core._history]
+    orphan = any(roles[i] == "tool" and (i == 0 or roles[i - 1] not in ("assistant", "tool", "user", "system"))
+                 for i in range(len(roles)))
+    check(not orphan, "★ 压缩后没有孤立的 tool 消息")
+    check("修复" not in core._history[0].content or "任务状态" in core._history[0].content,
+          "★ 压缩后的第一条是状态块")
+
+    # ---- 5. 摘要失败 → 降级但不丢权威状态 ----
+    core3 = _SummaryCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("j1", "read_file", {"path": "main.py"})]),
+            ModelReply(tool_calls=[tc("j2", "list_files", {"path": "."})]),
+            ModelReply(content="好了。"),
+        ]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=8, min_evidence=0, use_reflect_phase=False,
+                           compact_max_chars=300, compact_keep_turns=1),
+        bus=EventBus(),
+    )
+    core3.summary_text = None          # 摘要失败
+    st3 = await core3.run("读一下 main.py", workspace=sb.dir)
+    rec3 = (st3.compaction_log or [{}])[-1]
+    check(rec3.get("degraded") is True, "★ 摘要失败标记为降级")
+    check("任务状态" in (core3._history[0].content if core3._history else ""),
+          "★ 降级后仍保留权威状态块")
+    check(st3.status is TaskStatus.DONE, "★ 摘要失败不影响任务完成")
+
+
+
+
+# --------------------------------------------------------------------------- #
+# [J2] 预算策略与已读文件清单（第六批）
+# --------------------------------------------------------------------------- #
+async def test_budget_and_read_index(sb: Sandbox) -> None:
+    """[J2] 预算要有分类和边界；已读清单要真实反映上下文状态。"""
+    print("\n[J2] 预算策略与已读文件清单")
+
+    verdict = AgentCore._budget_verdict
+
+    # ---- 1. 耗尽原因分类（纯逻辑，直接喂可观测事实）----
+    def mk(intent="repair", *, conflicts=False, events=None, plan=None, evidence=0, cmds=0):
+        st = TaskState(goal="x", workspace=sb.dir)
+        st.intent = intent
+        if conflicts:
+            st.scope_conflicts = [{"path": "tests/x.py", "kind": "outside_allowed", "reason": "r"}]
+        for e in (events or []):
+            st.tool_events.append(e)
+        for c in range(cmds):
+            st.note_command("pytest", 0, True)
+        if plan:
+            st.set_plan(plan)
+        return st
+
+    # 有效进展：最近有成功调用 → repair 意图 → 续期
+    ev_ok = [ToolEvent(call_id=f"e{i}", tool="read_file", args={"path": f"f{i}.py"},
+                       ok=True, summary="ok") for i in range(4)]
+    st = mk("repair", events=ev_ok)
+    check(verdict(AgentCore, st, "turns")["extend"] is True, "★ 有效进展 → repair 续期一次")
+    check(verdict(AgentCore, st, "turns")["label"] == "productive_progress", "分类=productive_progress")
+
+    # 范围冲突 → 不续期
+    st = mk("repair", conflicts=True, events=ev_ok)
+    check(verdict(AgentCore, st, "turns")["extend"] is False, "★ 有范围冲突 → 不续期")
+    check(verdict(AgentCore, st, "turns")["label"] == "scope_conflict", "分类=scope_conflict")
+
+    # 重复循环：连续相同调用 → 不续期
+    ev_dup = [ToolEvent(call_id=f"d{i}", tool="read_file",
+                        args={"path": "main.py"}, ok=True, summary="ok") for i in range(4)]
+    st = mk("repair", events=ev_dup)
+    check(verdict(AgentCore, st, "turns")["extend"] is False, "★ 重复读取同一文件 → 不续期")
+    check(verdict(AgentCore, st, "turns")["label"] == "repeated_loop", "分类=repeated_loop")
+
+    # 诊断任务 → 不续期（诊断拖得久多半在原地打转）
+    st = mk("diagnostic", events=ev_ok)
+    check(verdict(AgentCore, st, "turns")["extend"] is False, "★ 诊断任务不续期")
+
+    # ---- 2. 端到端：有效进展的任务获得一次续期并完成 ----
+    reg = ToolRegistry()
+    reg.register(build_default_registry().get("read_file"), group="readonly")
+    reg.register(build_default_registry().get("list_files"), group="readonly")
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"修","check":"change"}],"note":""}'),
+            ModelReply(tool_calls=[tc("b1", "read_file", {"path": "main.py"})]),
+            ModelReply(tool_calls=[tc("b2", "read_file", {"path": "README.md"})]),
+            ModelReply(tool_calls=[tc("b3", "read_file", {"path": "requirements.txt"})]),
+            ModelReply(content="读完了，main.py 内容是 hello。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=3, min_evidence=0, use_reflect_phase=False,
+                           budget_extend_turns=10, budget_extend_enabled=True),
+        bus=EventBus(),
+    )
+    st = await core.run("修复 main.py 的注释", workspace=sb.dir)
+    check(st.budget_extended is True,
+          f"★ 有效进展获得续期（extended={st.budget_extended}，reason={st.budget_reason}）")
+    check("productive_progress" in st.budget_reason, f"续期原因={st.budget_reason}")
+    check(st.status is TaskStatus.DONE, f"★ 续期后任务完成（{st.status.value}）")
+
+    # ---- 3. 用户取消优先于续期 ----
+    st_cancel = TaskState(goal="x", workspace=sb.dir)
+    st_cancel.status = TaskStatus.ABORTED
+    st_cancel.end_reason = "cancelled"
+    check(st_cancel.end_reason == "cancelled", "★ 取消的终止原因不会被续期改写（状态层保证）")
+
+    # ---- 4. 已读文件清单反映上下文状态 ----
+    (Path(sb.dir) / "idx.py").write_text("x = 1\n", encoding="utf-8")
+    reg2 = ToolRegistry()
+    reg2.register(build_default_registry().get("read_file"), group="readonly")
+    core2 = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("r1", "read_file", {"path": "idx.py"})]),
+            ModelReply(content="读完了。"),
+        ]),
+        reg2,
+        config=AgentConfig(max_turns=4, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st2 = await core2.run("读 idx.py", workspace=sb.dir)
+    check(bool(st2.read_index), "★ 生成已读文件清单")
+    item = st2.read_index[0]
+    check(item.get("path") == "idx.py" and item.get("in_context") is True,
+          f"★ 清单标注原文在上下文中可用（{item}）")
+    # 清单本身要进上下文（progress 提醒）
+    msgs = core2.context.build(st2, system_prompt="s", history=core2._history)
+    check(any("已读取文件" in m.content for m in msgs), "★ 清单进入模型上下文")
+
+    # ---- 5. 压缩掉原文后，清单不再假装有原文 ----
+    st3 = TaskState(goal="x", workspace=sb.dir)
+    st3.read_cache["idx.py"] = {"hash": "a" * 16, "lines": 1, "size": 5, "turn": 3}
+    core3 = AgentCore(FakeAdapter([]), build_default_registry(), bus=EventBus())
+    core3._state = st3
+    idx3 = core3._build_read_index(st3)
+    check(idx3[0]["in_context"] is False,
+          "★ 历史里没有原文 → 清单标注「已被压缩，需要时重读」")
+
+    # ---- 6. 权限冲突不被预算绕过（冲突时即使有进展也不续期）----
+    core4 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"改 tests"}],"note":""}'),
+            ModelReply(tool_calls=[tc("k1", "read_file", {"path": "main.py"})]),
+            ModelReply(tool_calls=[tc("k2", "read_file", {"path": "main.py"})]),
+            ModelReply(tool_calls=[tc("k3", "write_file", {"path": "tests/x.py", "content": "x"})]),
+            ModelReply(content="我改不了，需要授权。"),
+        ]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=3, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, budget_extend_turns=10),
+        bus=EventBus(),
+    )
+    st4 = await core4.run("改 tests/x.py", workspace=sb.dir, forbidden_paths=["tests/"])
+    check(st4.budget_extended is False, "★ 有范围冲突 → 不续期")
+    check(st4.scope_conflicts, "★ 冲突被记录")
+
+    # ---- 7. PLAN 完成条件启发式：repair 意图下"修改"步骤不再只凭观测 ----
+    adapter = FakeAdapter([
+        ModelReply(content='{"steps":['
+                           '{"title":"修改 pipeline 源码"},'
+                           '{"title":"重跑 pytest 验证"},'
+                           '{"title":"阅读测试文件"}],"note":""}'),
+        ModelReply(content="ok"),
+    ])
+    core5 = AgentCore(adapter, build_default_registry(),
+                      config=AgentConfig(max_turns=4, min_evidence=0), bus=EventBus())
+    st5 = await core5.run("修复 pipeline 的口径问题", workspace=sb.dir)
+    checks = [s.check for s in st5.plan]
+    check(checks[0] == "change", f"★ 「修改源码」步骤 → change（{checks[0]}）")
+    check(checks[1] == "command_ok", f"★ 「重跑测试」步骤 → command_ok（{checks[1]}）")
+    check(checks[2] == "observation", f"★ 「阅读」步骤保持 observation（{checks[2]}）")
+
+    # ---- 8. run_command 整条命令 → 纠正提示 ----
+    reg3 = ToolRegistry()
+    reg3.register(build_default_registry().get("run_command"), group="exec")
+    core6 = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("n1", "run_command",
+                                       {"command": "python -m pytest -q"})]),
+            ModelReply(content="好。"),
+        ]),
+        reg3,
+        config=AgentConfig(max_turns=4, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, budget_extend_enabled=False),
+        bus=EventBus(),
+    )
+    st6 = await core6.run("跑测试", workspace=sb.dir)
+    bad = [e for e in st6.tool_events if not e.ok]
+    check(bool(bad) and "正确写法" in str(bad[0].summary or ""),
+          f"★ 整条命令被拒并给出正确写法（{str(bad[0].summary)[:60]}）")
 
 
 if __name__ == "__main__":

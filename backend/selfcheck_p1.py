@@ -26,7 +26,7 @@ from backend.agent.state import (
     TaskState,
     TaskStatus,
 )
-from backend.config import Config
+from backend.config import Config, ModelConfig
 from backend.events import Event, EventBus, EventType, collect
 
 
@@ -131,22 +131,28 @@ async def main() -> int:
     check(not st4.has_enough_evidence(), "失败的证据不算数")
 
     # ------------------------------------------------------------------ #
-    print("\n[7] 计划推进")
+    print("\n[7] 计划推进（第二批：由证据决定）")
     st5 = TaskState(goal="x", workspace="D:/w")
     st5.set_plan(
         [
-            PlanStep(0, "看目录"),
-            PlanStep(1, "读关键文件"),
-            PlanStep(2, "给结论"),
+            PlanStep(0, "看目录", check="observation"),
+            PlanStep(1, "读关键文件", check="observation"),
+            PlanStep(2, "给结论", check="observation"),
         ],
         note="先摸清结构",
     )
     check(st5.current_step.title == "看目录", "当前步 = 第 0 步")
-    st5.advance_step()
+    st5.start_current_step()
+    check(st5.current_step.status == StepStatus.IN_PROGRESS, "开工后是 in_progress")
+    check(st5.finish_current_step()[0] is False, "★ 没有新证据不能算完成（不再按轮次打勾）")
+    st5.add_evidence(Evidence(source="list_files", summary="看到目录", ok=True))
+    check(st5.finish_current_step()[0] is True, "★ 有新证据才标记完成")
     check(st5.plan[0].status == StepStatus.DONE, "第 0 步标记完成")
     check(st5.current_step.title == "读关键文件", "推进到第 1 步")
-    st5.advance_step()
-    st5.advance_step()
+    st5.fail_current_step("读不到")
+    check(st5.current_step.status == StepStatus.FAILED, "可以标记失败")
+    check(st5.current_step_index == 1, "★ 失败不推进索引")
+    st5.current_step_index = 3
     check(st5.current_step is None, "越界返回 None（不抛异常）")
 
     # ------------------------------------------------------------------ #
@@ -213,12 +219,20 @@ async def main() -> int:
     check(cfg.server.port == 8765, f"默认端口 8765（实际 {cfg.server.port}）")
     check(cfg.budgets.max_turns == 20, f"max_turns=20（C2，实际 {cfg.budgets.max_turns}）")
     check(cfg.budgets.min_evidence == 1, f"min_evidence=1（C3，实际 {cfg.budgets.min_evidence}）")
-    check(cfg.model.provider in ("bailian", "deepseek"), f"供应商合法（{cfg.model.provider}）")
+    # ★ 断言改成"在 presets 里"，而不是写死名单：
+    #   加新供应商（xfyun）时这条测试不该跟着改。
+    check(cfg.model.provider in ModelConfig().PRESETS,
+          f"供应商合法（{cfg.model.provider}）")
+    check(cfg.model.models and cfg.model.models[0] == cfg.model.model,
+          f"候选列表首项即主模型（{cfg.model.models[:2]}）")
     check(isinstance(cfg.model.configured, bool), f"API Key 是否配置：{cfg.model.configured}")
 
     # ------------------------------------------------------------------ #
     print("\n[12] 枚举取值与设计文档一致")
-    check(len(EventType) == 16, f"事件类型共 16 种（实际 {len(EventType)}）")
+    # 第五批新增 context.compacted（上下文压缩）→ 17 种
+    check(len(EventType) == 17, f"事件类型共 17 种（实际 {len(EventType)}）")
+    check(EventType.CONTEXT_COMPACTED.value == "context.compacted",
+          "★ 上下文压缩事件已注册")
     check(EventType.APPROVAL_REQUEST.value == "approval.request", "审批事件命名 <域>.<动作>")
     check(EventType.TOOL_CALL.value == "tool.call", "工具事件命名 <域>.<动作>")
 

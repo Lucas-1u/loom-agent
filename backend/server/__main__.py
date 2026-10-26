@@ -50,7 +50,10 @@ def port_available(host: str, port: int) -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m backend.server", description="Loom Agent HTTP 服务")
-    p.add_argument("-m", "--model", default="bailian", help="模型提供方（bailian / deepseek）")
+    # ★ 默认空字符串 = 交给 .env 的 LOOM_DEFAULT_MODEL 决定；
+    #   写死 "bailian" 会把 .env 里的设置覆盖掉（踩过一次：切到 xfyun 却不生效）。
+    p.add_argument("-m", "--model", default="",
+                   help="模型提供方（bailian / deepseek / xfyun）；留空则用 .env 的 LOOM_DEFAULT_MODEL")
     p.add_argument("--host", default="", help="监听地址，默认 127.0.0.1")
     p.add_argument("--port", type=int, default=0, help="监听端口，默认 8765")
     p.add_argument("--db", default="", help="SQLite 路径，默认 sandbox/loom.db")

@@ -120,6 +120,7 @@ class OpenAICompatAdapter(ModelAdapter):
         temperature: float = 0.2,
         timeout_s: float = 35.0,
         max_retries: int = 2,
+        models: list[str] | None = None,
     ) -> None:
         if not api_key:
             raise ModelError(
@@ -128,7 +129,11 @@ class OpenAICompatAdapter(ModelAdapter):
                 retryable=False,
             )
         self.name = provider
-        self.model = model
+        # ★ 有序候选模型（同一个 API Key，不换 key）：
+        #   某个模型没额度/被下线时自动换下一个，并把"用不了"的记下来不再试。
+        self.models: list[str] = [m for m in (models or []) if m] or [model]
+        self.model = self.models[0]
+        self._dead_models: set[str] = set()
         self.base_url = base_url
         self._temperature = temperature
         self._timeout_s = timeout_s
@@ -146,6 +151,7 @@ class OpenAICompatAdapter(ModelAdapter):
             temperature=cfg.temperature,
             timeout_s=cfg.timeout_s,
             max_retries=cfg.max_retries,
+            models=list(getattr(cfg, "models", []) or []),
         )
 
     @staticmethod
@@ -164,6 +170,77 @@ class OpenAICompatAdapter(ModelAdapter):
         """暴露底层 client，供诊断脚本 / 探针使用。"""
         return self._client
 
+    # ---- 模型轮换（额度/下线时换下一个）--------------------------------
+    def _candidates(self, *, reset: bool = True) -> list[str]:
+        """当前可用的候选模型（跳过已判定不可用的）。
+
+        ★ 全部都被判死时**重置**并从头再来：
+          额度是会恢复的（充值/次日重置），不能因为一次欠费就永久拉黑。
+        ★ reset=False 用于轮换途中的"选下一个"——
+          那时不能重置，否则刚标记的不可用模型立刻又被选中。
+        """
+        alive = [m for m in self.models if m not in self._dead_models]
+        if alive or not reset:
+            return alive
+        log.warning("[%s] 全部候选模型此前都不可用，重新从头尝试：%s",
+                    self.name, ", ".join(self.models))
+        self._dead_models.clear()
+        return list(self.models)
+
+    @staticmethod
+    def _should_rotate(err: ModelError) -> bool:
+        """这个错误是否值得换下一个模型再试。
+
+        ★ 换模型的判断只看"**这个模型**用不了"的错误：
+          额度不足 / 账户欠费 / 模型被下线 / 认证与权限。
+          参数错误、超时、网络错误**不换** —— 换模型也解决不了，
+          换了反而掩盖真正的错误。
+        """
+        if err.kind in ("quota_error", "auth_error", "permission_error"):
+            return True
+        raw = (err.raw or "").lower()
+        if err.kind == "bad_request" and any(
+            k in raw for k in ("model not found", "model does not exist",
+                               "invalid model", "not support", "unsupported model",
+                               "model_not_found", "not available")
+        ):
+            return True   # 模型名过期/下线：换下一个
+        return False
+
+    def _mark_dead(self, model: str, err: ModelError) -> None:
+        self._dead_models.add(model)
+        if self.model == model:
+            alive = self._candidates(reset=False)
+            if alive:
+                self.model = alive[0]
+        log.warning("[%s] 模型 %s 不可用（%s），换下一个：%s",
+                    self.name, model, err.kind, self.model)
+
+    def _build_payload(
+        self,
+        model: str,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        *,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        """构造一次请求的 payload（把 model 单独拎出来，方便轮换）。"""
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [m.to_dict() for m in messages],
+            "temperature": self._temperature if temperature is None else temperature,
+        }
+        if stream:
+            payload["stream"] = True
+        if tools:
+            payload["tools"] = [t.to_dict() for t in tools]
+            payload["tool_choice"] = "auto"
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        return payload
+
     # ===================================================================== #
     # 非流式
     # ===================================================================== #
@@ -175,25 +252,26 @@ class OpenAICompatAdapter(ModelAdapter):
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> ModelReply:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [m.to_dict() for m in messages],
-            "temperature": self._temperature if temperature is None else temperature,
-        }
-        if tools:
-            payload["tools"] = [t.to_dict() for t in tools]
-            payload["tool_choice"] = "auto"
-        if max_tokens:
-            payload["max_tokens"] = max_tokens
-
         t0 = time.time()
-        try:
-            resp = await self._create_with_fallback(payload)
-        except Exception as exc:  # noqa: BLE001
-            raise self._translate_exception(exc) from exc
+        last_err: ModelError | None = None
+        for model in self._candidates():
+            payload = self._build_payload(model, messages, tools, temperature, max_tokens)
+            try:
+                resp = await self._create_with_fallback(payload)
+            except Exception as exc:  # noqa: BLE001
+                err = self._translate_exception(exc)
+                if not self._should_rotate(err):
+                    raise err from exc
+                # ★ 这个模型用不了（没额度/被下线）→ 换下一个，同一把 key
+                last_err = err
+                self._mark_dead(model, err)
+                continue
+            duration_ms = int((time.time() - t0) * 1000)
+            return self._parse_response(resp, duration_ms)
 
-        duration_ms = int((time.time() - t0) * 1000)
-        return self._parse_response(resp, duration_ms)
+        raise last_err or ModelError(
+            "所有候选模型都不可用", kind="model_error", retryable=False,
+        )
 
     async def _create_with_fallback(self, payload: dict[str, Any]) -> Any:
         """
@@ -208,6 +286,14 @@ class OpenAICompatAdapter(ModelAdapter):
             text = str(first)
             if "400" not in text and "invalid" not in text.lower():
                 raise
+
+            # ---- 讯飞 MaaS 的间歇性 400（code 10005 invalid request）----
+            # 同一载荷立刻重试一次：真参数错误会再失败并抛出，
+            # 供应商侧抖动则直接恢复（真实 E2E 里实现任务在第 10 轮被它打断）。
+            try:
+                return await self._client.chat.completions.create(**payload)
+            except Exception:  # noqa: BLE001 —— 重试也失败，走原有降级
+                pass
 
             stripped = dict(payload)
             for key in ("response_format", "max_tokens", "temperature", "tool_choice"):
@@ -323,26 +409,29 @@ class OpenAICompatAdapter(ModelAdapter):
           正确做法是用 dict[index] 累加 arguments 字符串；
           id / name 只在第一片出现，后续片为 None，**不可覆盖已有值**。
         """
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [m.to_dict() for m in messages],
-            "temperature": self._temperature if temperature is None else temperature,
-            "stream": True,
-        }
-        if tools:
-            payload["tools"] = [t.to_dict() for t in tools]
-            payload["tool_choice"] = "auto"
-        if max_tokens:
-            payload["max_tokens"] = max_tokens
-
         # 累加器：index -> {id, name, args_str}
         acc: dict[int, dict[str, str]] = {}
         emitted: set[int] = set()
 
-        try:
-            stream = await self._client.chat.completions.create(**payload)
-        except Exception as exc:  # noqa: BLE001
-            raise self._translate_exception(exc) from exc
+        # ★ 与非流式一致：模型不可用就按顺序换下一个（流式在第一次产出前换是安全的）
+        stream = None
+        last_err: ModelError | None = None
+        for model in self._candidates():
+            payload = self._build_payload(model, messages, tools, temperature, max_tokens, stream=True)
+            try:
+                stream = await self._client.chat.completions.create(**payload)
+                break
+            except Exception as exc:  # noqa: BLE001
+                err = self._translate_exception(exc)
+                if not self._should_rotate(err):
+                    raise err from exc
+                last_err = err
+                self._mark_dead(model, err)
+                continue
+        if stream is None:
+            raise last_err or ModelError(
+                "所有候选模型都不可用", kind="model_error", retryable=False,
+            )
 
         try:
             async for chunk in stream:

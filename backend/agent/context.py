@@ -250,11 +250,38 @@ class ContextBuilder:
         if remaining <= 3:
             lines.append(f"\n⚠ 剩余轮次不多（{remaining} 轮）。请优先收敛，给出结论。")
 
+        # ---- 第五批：范围冲突与读取缓存状态 ------------------------------
+        # ★ 这两样必须在**每一轮**都出现在模型眼前：
+        #   冲突 → 模型才会知道自己撞了权限墙，而不是反复重试；
+        #   缓存 → 模型才知道某个文件它已经读过，不必重复读。
+        if getattr(state, "scope_conflicts", None):
+            lines.append("\n# ⚠ 任务要求与权限范围存在冲突（需要用户授权，不要擅自扩大权限）")
+            for c in state.scope_conflicts[:5]:
+                lines.append(f"- {c.get('path')}：{c.get('reason')}")
+        if getattr(state, "cache_notes", None):
+            lines.append("\n# 文件读取状态")
+            for note in state.cache_notes[-4:]:
+                lines.append(f"- {note}")
+
+        # ---- 第六批：已读取文件清单 + 复用规则 --------------------------
+        # ★ 目的：让模型**主动复用**已读内容，而不是机械地再读一遍。
+        #   只放索引与状态（不放全文），避免"为了省读取而涨上下文"的反效果。
+        idx = getattr(state, "read_index", None)
+        if idx:
+            lines.append("\n# 已读取文件（复用指南）")
+            lines.append("规则：原文仍在上下文且文件未变化 → 直接用，不必重读；"
+                         "原文已被压缩 → 需要精确内容时重新读取；"
+                         "不确定文件是否变化 → 重新读取；此清单不改变任何权限。")
+            for item in idx:
+                avail = "原文在上下文中可用" if item.get("in_context") else "原文已被压缩（需要时请重读）"
+                rng = f"，范围 {item.get('range')}" if item.get("range") else ""
+                lines.append(
+                    f"- {item.get('path')}｜hash:{item.get('hash')}｜"
+                    f"第 {item.get('turn')} 轮读｜{item.get('lines')} 行{rng}｜{avail}"
+                )
+
         return "\n".join(lines)
 
-    # ===================================================================== #
-    # 历史压缩
-    # ===================================================================== #
     def compress_history(self, history: list[Message]) -> list[Message]:
         """
         历史压缩：最近 N 个工具结果保留完整内容，更早的截断。

@@ -84,6 +84,9 @@ class EventType(str, Enum):
     ERROR = "error"                    # 可恢复/不可恢复错误
     BUDGET_EXCEEDED = "budget.exceeded"  # 预算（轮数/时长/重复）耗尽，强制收敛
 
+    # ---- 上下文管理 ---------------------------------------------------------
+    CONTEXT_COMPACTED = "context.compacted"  # 上下文被压缩（前后规模、降级情况）
+
     # ---- 前端可用的辅助信号 -------------------------------------------------
     STATE_SNAPSHOT = "state.snapshot"  # 全量状态快照（重连/初始化时同步用）
 
@@ -358,6 +361,12 @@ class EventBus:
     def error(self, kind: str, message: str, fatal: bool = False, turn: int = 0) -> Event:
         return self.emit(
             Event.make(EventType.ERROR, {"kind": kind, "message": message, "fatal": fatal}, turn=turn)
+        )
+
+    def context_compacted(self, payload: dict[str, Any], turn: int = 0) -> Event:
+        """上下文压缩事件（前后规模、保留轮数、降级情况）。"""
+        return self.emit(
+            Event.make(EventType.CONTEXT_COMPACTED, payload, turn=turn)
         )
 
     def budget_exceeded(self, kind: str, limit: Any, used: Any, turn: int = 0) -> Event:

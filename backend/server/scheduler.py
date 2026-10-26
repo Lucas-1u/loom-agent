@@ -69,6 +69,7 @@ class TaskScheduler:
 
         self._runtimes: dict[str, TaskRuntime] = {}
         self._session_of: dict[str, str] = {}
+        self._scope_of: dict[str, tuple[list[str], list[str]]] = {}
         self._running: set[str] = set()
         self._queue: list[str] = []
         self._lock = asyncio.Lock()
@@ -85,6 +86,8 @@ class TaskScheduler:
         workspace: str,
         model: str = "",
         idem_key: str = "",
+        allowed_paths: list[str] | None = None,
+        forbidden_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         """
         创建任务并尝试调度。
@@ -121,6 +124,9 @@ class TaskScheduler:
 
         async with self._lock:
             self._session_of[tid] = session_id
+            # ★ 范围声明跟着任务走：排队任务可能几秒后才启动，
+            #   不能依赖"提交时的局部变量"还在。
+            self._scope_of[tid] = (list(allowed_paths or []), list(forbidden_paths or []))
             self._queue.append(tid)
 
         await self.pump()
@@ -170,6 +176,7 @@ class TaskScheduler:
     async def _launch(self, task_id: str) -> None:
         """真正启动一个任务（锁外执行）。"""
         session_id = self._session_of.get(task_id, "")
+        allowed_paths, forbidden_paths = self._scope_of.get(task_id, ([], []))
         row = await self._store.get_task(task_id)
         if row is None:
             log.error("任务 %s 在库里不存在，跳过", task_id)
@@ -183,6 +190,8 @@ class TaskScheduler:
             goal=row["goal"],
             workspace=row["workspace"],
             model=row["model"],
+            allowed_paths=allowed_paths,
+            forbidden_paths=forbidden_paths,
             adapter=self._adapter,
             registry=self._registry,
             config=self._config,
@@ -342,7 +351,10 @@ class TaskScheduler:
             snap["queue_position"] = pos
             return snap
 
-        row = await self._store.get_task(task_id)
+        # ★ with_state=True：任务结束后 runtime 会从内存里消失，
+        #   这时计划和审计只存在于 state_json。不带上它，
+        #   前端/调试接口就再也看不到"任务到底做到哪一步"。
+        row = await self._store.get_task(task_id, with_state=True)
         if row is None:
             return None
 

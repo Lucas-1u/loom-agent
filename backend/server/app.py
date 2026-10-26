@@ -61,6 +61,10 @@ class CreateTaskBody(BaseModel):
     goal: str = Field(min_length=1)
     session_id: str
     workspace: str = ""
+    # 改动范围声明（可选，相对工作区）。默认只允许整个工作区、不禁任何路径。
+    # forbidden 里的路径会在 Policy 层直接拦下；allowed 只在事后审计里标记。
+    allowed_paths: list[str] = Field(default_factory=list)
+    forbidden_paths: list[str] = Field(default_factory=list)
 
 
 class ApprovalBody(BaseModel):
@@ -318,6 +322,8 @@ def create_app(
             goal=body.goal,
             workspace=workspace,
             idem_key=key,
+            allowed_paths=body.allowed_paths or None,
+            forbidden_paths=body.forbidden_paths or None,
         )
         return snap
 

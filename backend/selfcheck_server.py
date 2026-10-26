@@ -125,16 +125,18 @@ async def test_store(db: TmpDB) -> None:
     tid, created = await store.create_task(mk_task("t1", "s1"))
     check(created is True, "新建任务 created=True")
 
-    row = await store.get_task("t1")
+    # ★ 显式要 state：get_task 默认不带 state_json（列表接口不需要），
+    #   单任务快照才带 —— 这里测的就是"还没有快照"这个语义。
+    row = await store.get_task("t1", with_state=True)
     check(row is not None, "任务能读回来")
     check(row["status"] == "created", f"初始状态 created（实际 {row['status']}）")
     check(row["created_at"] > 0, "★ created_at 有值")
     check(row["started_at"] is None, "★★ 排队中 started_at = NULL")
-    check(row["state"] is None, "还没有快照")
+    check(not row.get("state"), "还没有快照")
 
     # ---- mark_started：填 started_at ----
     await store.mark_started("t1")
-    row = await store.get_task("t1")
+    row = await store.get_task("t1", with_state=True)
     check(row["status"] == "running", "mark_started 后状态 running")
     check(row["started_at"] is not None, "★★ started_at 被填上了")
     check(row["started_at"] >= row["created_at"], "started_at >= created_at")
@@ -143,7 +145,7 @@ async def test_store(db: TmpDB) -> None:
     snap = {"task_id": "t1", "status": "done", "final_answer": "完成", "turn": 2}
     await store.save_task("t1", status="done", state=snap, result="完成", end_reason="agent_done",
                           ended_at=time.time(), turn=2)
-    row = await store.get_task("t1")
+    row = await store.get_task("t1", with_state=True)
     check(row["status"] == "done", "摘要 status 更新")
     check(row["status"] == row["state"]["status"], "★★ 摘要 status 与 state_json 一致")
     check(row["result"] == "完成", "result 落库")
@@ -225,7 +227,7 @@ async def test_store(db: TmpDB) -> None:
     fixed = await restart.mark_orphans_failed()
     check(set(fixed) >= {"torphan", "tawait"}, f"扫到了未完成任务：{fixed}")
 
-    ro = await restart.get_task("torphan")
+    ro = await restart.get_task("torphan", with_state=True)
     check(ro["status"] == "failed", f"★★ running → failed（实际 {ro['status']}）")
     check(ro["end_reason"] == "server_restarted", f"★★ end_reason=server_restarted（实际 {ro['end_reason']}）")
     check(ro["state"]["status"] == "failed", "★★ state_json 里的 status 也改了（与摘要一致）")
@@ -441,7 +443,7 @@ async def test_runtime(db: TmpDB) -> None:
         check(all(c["session_id"] == "s1" for c in collected), "★★ 都带对的 session_id")
 
         # ---- 落盘 ----
-        row = await store.get_task("task_rt1")
+        row = await store.get_task("task_rt1", with_state=True)
         check(row["status"] == rt.status, "★ 终态落库")
         check(row["started_at"] is not None, "★ started_at 落库")
         check(row["ended_at"] is not None, "★ ended_at 落库")
@@ -573,7 +575,7 @@ async def test_runtime_persist_failure(db: TmpDB) -> None:
     check(rt2.persist_error is not None and rt2.persist_error["stage"] == "final",
           "★★ 终态故障单独记录 stage=final", actual=rt2.persist_error)
 
-    row = await store.get_task("task_pf2")
+    row = await store.get_task("task_pf2", with_state=True)
     # mark_started 是先写成功的，所以库里停在 running；
     # 关键是**没有**假的 done —— 落盘失败就是失败，不静默改成成功。
     check(row["status"] == "running",
@@ -615,7 +617,7 @@ async def test_runtime_persist_failure(db: TmpDB) -> None:
     finally:
         store.save_task = real_save_task2  # type: ignore[method-assign]
 
-    row3 = await store.get_task("task_pf3")
+    row3 = await store.get_task("task_pf3", with_state=True)
     check(row3["status"] == rt3.status,
           "★★ 慢的旧写入不会把库里的状态写回退（awaiting_approval 不能盖掉 running）",
           actual=row3["status"])
@@ -1130,6 +1132,16 @@ def test_session_isolation(db: TmpDB) -> None:
         ma3 = client2.get(f"/api/sessions/{a['session_id']}/messages").json()["messages"]
         check(any("ALPHA-LLMSTUDY" in m["content"] for m in ma3), "重启后 A 的历史消息还在")
         check(all("BETA-TRYAGENT" not in m["content"] for m in ma3), "★★ 重启后 A 仍看不到 B 的内容")
+
+        # ---- ⑧b 单任务快照重启后仍带 state（计划/审计不会随 runtime 消失）----
+        tid_a2 = ta.json()["task_id"]
+        snap2 = client2.get(f"/api/tasks/{tid_a2}").json()
+        # ★ 注意：describe 是把 state_json **展开**进快照的（`**base`），
+        #   所以字段在顶层，没有 "state" 这一层。
+        check(isinstance(snap2.get("plan"), list),
+              "★★ 重启后 /api/tasks/{id} 仍带计划（不随 runtime 消失）")
+        check(isinstance(snap2.get("audit"), dict),
+              "★★ 重启后 /api/tasks/{id} 仍带改动范围审计")
 
         # ---- ⑨ 事件历史：重启后确实不保留，接口要如实说不可用 ----
         tid_a = ta.json()["task_id"]

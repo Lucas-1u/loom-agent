@@ -43,9 +43,24 @@ from typing import Any
 
 from ..tools.base import ErrorKind, Tool, ToolContext, ToolResult
 from ..tools.registry import ToolRegistry
+from .scope import hits as _scope_hits, rel_in_workspace, within_allowed
 from .state import RiskLevel, TaskState
 
 log = logging.getLogger("loom.policy")
+
+
+def _hits_forbidden(workspace: str, target: str, forbidden: list[str]) -> bool:
+    """
+    `target`（可能是绝对路径或相对路径）是否落在禁止范围内。
+
+    ★ 故意不解析符号链接：这里判的是"用户声明不许动哪些路径"，
+      与安全边界（resolve_in_workspace）是两件事。传进来的 target 已经
+      被 path_safety 校验过，不会越出工作区。
+    """
+    raw = (target or "").replace("\\", "/")
+    if raw.lower().startswith(workspace.replace("\\", "/").lower().rstrip("/") + "/"):
+        raw = raw[len(workspace.replace("\\", "/").rstrip("/")) + 1:]
+    return _scope_hits(raw, forbidden)
 
 
 # --------------------------------------------------------------------------- #
@@ -220,6 +235,74 @@ class Policy:
                 ),
                 reason=f"确定性失败熔断（{prev_fail.error_kind}）",
             )
+
+        # ---- ⑤b2 用户声明"只读" → 一切**写文件**的操作都不放行 ----------
+        # ★ 为什么单独一条：read_only 是**意图级约束**，不是路径列表。
+        #   它由 AgentCore 从任务原话里识别出来（intent.constraints）。
+        # ★ 为什么只拦 WRITE 不拦 EXEC：真实 E2E 里诊断任务被这条规则卡死 ——
+        #   "只运行 pytest 把结果告诉我，不要修改任何文件"里，命令执行是**只读**的，
+        #   却被当成写操作拦下，模型连测试都跑不了。
+        #   权衡：只拦写工具；命令的文件副作用由事后审计兜底（不假装命令绝对安全）。
+        if state.constraints.get("read_only") and tool.risk is RiskLevel.WRITE:
+            return PolicyDecision.deny(
+                ToolResult.failure(
+                    tool_name,
+                    ErrorKind.PERMISSION_DENIED,
+                    "本次任务被用户要求「只检查、不修改」，已拒绝任何写操作",
+                    hint="如果确实需要修改，请让用户明确授权，或新建一个允许修改的任务。",
+                ),
+                reason="用户要求只读",
+            )
+
+        # ---- ⑤c 禁止路径（用户显式声明时才生效）--------------------------
+        # ★ 为什么默认不拦：不传 forbidden_paths 时列表为空，这一步直接跳过，
+        #   行为与之前完全一致。只有用户明确说了"这些路径不许动"才生效。
+        # ★ 为什么在这里拦而不是等事后审计：禁止路径是**意图**，不是观察；
+        #   事后标记只能告诉用户"已经被改了"，拦下来才能防止既成事实。
+        if state.forbidden_paths and tool.risk in (RiskLevel.WRITE, RiskLevel.EXEC):
+            # ★ EXEC 只看显式的 path（如有）：run_command 把 cwd 放进禁止目录
+            #   并不等于"修改"—— 去那儿跑个测试是只读行为。真正的写入副作用
+            #   由事后审计兜底；按 cwd 拦会把"进去跑个测试"也误杀
+            #   （真实 E2E 里诊断任务的 pytest 被连拒两次，就是这么来的）。
+            target = args.get("path") if tool.risk is RiskLevel.EXEC else (
+                args.get("path") or args.get("cwd")
+            )
+            if target and _hits_forbidden(state.workspace, str(target), state.forbidden_paths):
+                return PolicyDecision.deny(
+                    ToolResult.failure(
+                        tool_name,
+                        ErrorKind.PERMISSION_DENIED,
+                        f"路径 '{target}' 在本次任务明确禁止修改的范围内",
+                        hint=(
+                            f"禁止范围：{', '.join(state.forbidden_paths)}。"
+                            "请换一个目标，或向用户说明为什么需要改这里。"
+                        ),
+                    ),
+                    reason="命中禁止修改路径",
+                )
+
+        # ---- ⑤d 允许范围：范围外写入在**执行前**就被拦 --------------------
+        # ★ 第五批：允许范围从"事后审计标记"升级为"执行前拦截"。
+        #   前提：默认 allowed=["."]（= 整个工作区）时什么都不拦，行为不变。
+        #   只有用户明确限定了范围（API 传入或从原话里抽取）才生效。
+        # ★ 禁止范围永远优先：它在上一步（⑤c）已经拦掉了，这里只管"允许但超出"。
+        if tool.risk is RiskLevel.WRITE and state.allowed_paths:
+            target = args.get("path")
+            if target:
+                rel = rel_in_workspace(state.workspace, str(target))
+                if rel and not within_allowed(rel, state.allowed_paths):
+                    return PolicyDecision.deny(
+                        ToolResult.failure(
+                            tool_name,
+                            ErrorKind.PERMISSION_DENIED,
+                            f"路径 '{rel}' 不在允许修改的范围内（允许：{', '.join(state.allowed_paths)}）",
+                            hint=(
+                                "需要修改这个文件的话，得由用户明确授权。"
+                                "可以在答复里说明这个需求，等授权后再改。"
+                            ),
+                        ),
+                        reason="超出允许修改范围",
+                    )
 
         # ---- ⑥ 审批 -----------------------------------------------------
         if tool.needs_approval:

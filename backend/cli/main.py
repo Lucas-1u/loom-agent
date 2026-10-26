@@ -62,7 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("goal", nargs="?", default="", help="任务描述。省略则进入交互模式。")
     p.add_argument("-w", "--workspace", default=".", help="工作区根目录（Agent 只能操作这里面的文件）")
-    p.add_argument("-m", "--model", default="", choices=["", "bailian", "deepseek"], help="模型供应商")
+    p.add_argument("-m", "--model", default="", choices=["", "bailian", "deepseek", "xfyun"],
+                   help="模型供应商（留空则用 .env 的 LOOM_DEFAULT_MODEL）")
     p.add_argument("--model-name", default="", help="覆盖具体模型名，如 qwen3.7-plus / deepseek-chat")
     p.add_argument("--host", default="", help="服务监听地址（v0.1a 未起 HTTP，仅预留）")
     p.add_argument("--max-turns", type=int, default=0, help="最大轮次（默认 20）")

@@ -384,13 +384,13 @@ class TaskStore:
     async def save_task(self, task_id: str, **kwargs: Any) -> None:
         await asyncio.to_thread(self.save_task_sync, task_id, **kwargs)
 
-    def get_task_sync(self, task_id: str) -> dict[str, Any] | None:
+    def get_task_sync(self, task_id: str, *, with_state: bool = False) -> dict[str, Any] | None:
         with self._tx() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
-        return _task_row_to_dict(row) if row else None
+        return _task_row_to_dict(row, with_state=with_state) if row else None
 
-    async def get_task(self, task_id: str) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self.get_task_sync, task_id)
+    async def get_task(self, task_id: str, *, with_state: bool = False) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self.get_task_sync, task_id, with_state=with_state)
 
     def list_tasks_sync(self, session_id: str | None = None) -> list[dict[str, Any]]:
         with self._tx() as conn:

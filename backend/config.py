@@ -100,6 +100,10 @@ class ModelConfig:
 
     provider: str = "bailian"     # bailian | deepseek
     model: str = "qwen3.7-plus"
+    # ★ 有序候选模型列表（第四批后的用户要求）：
+    #   同一个 API Key，按顺序用；某个模型没额度/不可用就换下一个。
+    #   models[0] 才是真正的主模型（model 字段与之保持一致）。
+    models: list[str] = field(default_factory=list)
     base_url: str = ""
     api_key: str = ""
     temperature: float = 0.2      # Agent 任务要稳定，低温
@@ -119,6 +123,12 @@ class ModelConfig:
                 "model": "deepseek-chat",
                 "key_env": "DEEPSEEK_API_KEY",
             },
+            # 讯飞 MaaS（2026-10-26 切换）：/v2/chat/completions 是标准 OpenAI 形状
+            "xfyun": {
+                "base_url": "https://maas-api.cn-huabei-1.xf-yun.com/v2",
+                "model": "spark-x2.6",
+                "key_env": "XFYUN_API_KEY",
+            },
         },
         repr=False,
     )
@@ -137,14 +147,28 @@ class ModelConfig:
                 "deepseek-chat",
                 "DEEPSEEK_API_KEY",
             ),
+            "xfyun": (
+                "https://maas-api.cn-huabei-1.xf-yun.com/v2",
+                "spark-x2.6",
+                "XFYUN_API_KEY",
+            ),
         }
         prov = (provider or _env("LOOM_DEFAULT_MODEL", "bailian")).lower()
         if prov not in presets:
             prov = "bailian"
         base_url, model, key_env = presets[prov]
+        primary = _env("LOOM_MODEL", model)
+        # LOOM_MODELS：逗号/空格分隔的有序候选列表；第一个是主模型
+        raw = _env("LOOM_MODELS", "")
+        models = [m.strip() for m in raw.replace(",", " ").split() if m.strip()]
+        if not models:
+            models = [primary]
+        elif primary and primary not in models:
+            models = [primary] + models
         return cls(
             provider=prov,
-            model=_env("LOOM_MODEL", model),
+            model=models[0],
+            models=models,
             base_url=_env("LOOM_BASE_URL", base_url),
             api_key=_env(key_env, ""),
             temperature=_env_float("LOOM_TEMPERATURE", 0.2),
@@ -170,9 +194,17 @@ class BudgetConfig:
     approval_timeout_s: float = 180.0
     min_evidence: int = 1
 
+    # ---- 上下文压缩（第五批）-------------------------------------------
+    # ★ 阈值用**字符数**表达：没有可靠 tokenizer，不假装精确 token 数。
+    #   60k 字符 ≈ 40k token（按 1.5 字符/token 估算）。
+    compact_max_chars: int = 60_000
+    compact_keep_turns: int = 3
+
     @classmethod
     def from_env(cls) -> "BudgetConfig":
         return cls(
+            compact_max_chars=_env_int("LOOM_COMPACT_CHARS", 60_000),
+            compact_keep_turns=_env_int("LOOM_COMPACT_KEEP_TURNS", 3),
             max_turns=_env_int("LOOM_MAX_TURNS", 20),
             max_seconds=_env_float("LOOM_MAX_SECONDS", 300.0),
             max_tool_calls=_env_int("LOOM_MAX_TOOL_CALLS", 40),

@@ -66,6 +66,7 @@ class StepStatus(str, Enum):
     DONE = "done"
     SKIPPED = "skipped"
     FAILED = "failed"
+    BLOCKED = "blocked"          # 第二批新增：被外部条件挡住（如命中禁止路径）
 
 
 class ApprovalStatus(str, Enum):
@@ -133,12 +134,29 @@ class Budgets:
 # --------------------------------------------------------------------------- #
 @dataclass
 class PlanStep:
-    """计划中的一步。刻意保持极简 —— 计划是「给人看的路线图」，不是工作流引擎。"""
+    """
+    计划中的一步。
+
+    第二批新增的四个字段（`completion` / `check` / `evidence` / `marks`）是为了解决
+    「进度由循环记账而非证据决定」的问题：步骤能不能算完成，必须由
+    **这一步开始之后产生的新证据**说话，而不是"又跑了一轮"。
+
+    ★ 兼容性：四个字段都有默认值，旧的持久化 state_json 缺字段也能加载。
+    """
 
     index: int
     title: str
     status: StepStatus = StepStatus.PENDING
     detail: str = ""
+    # ---- 完成条件（计划本身声明的）---------------------------------
+    completion: str = ""          # 自然语言：这一步怎样算做完
+    check: str = "observation"    # 机器可判定的检查类型（见 step_check_met）
+    # ---- 完成证据（实际结算时写入）---------------------------------
+    evidence: str = ""            # 满足完成条件的那条证据摘要
+    started_turn: int = 0
+    ended_turn: int = 0
+    # 步骤开始时的三个游标：(证据数, 命令数, 变更数)。不进 to_dict。
+    marks: tuple[int, int, int] = (0, 0, 0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -146,6 +164,11 @@ class PlanStep:
             "title": self.title,
             "status": self.status.value,
             "detail": self.detail,
+            "completion": self.completion,
+            "check": self.check,
+            "evidence": self.evidence,
+            "started_turn": self.started_turn,
+            "ended_turn": self.ended_turn,
         }
 
 
@@ -176,6 +199,40 @@ class Evidence:
             "ref": self.ref,
             "ok": self.ok,
             "ts": self.ts,
+        }
+
+
+# --------------------------------------------------------------------------- #
+# 命令执行记录（完成验证闸门用）
+# --------------------------------------------------------------------------- #
+@dataclass
+class CommandRecord:
+    """
+    一次「有退出码的执行」的结果。
+
+    ★ 为什么单独记一份，而不是从 evidence_summary 推？
+      evidence 只留「成功的观测」，失败的命令根本不会进去。
+      而"最后一次命令是红的"恰恰是**判断任务有没有完成**最关键的一条事实。
+
+    ★ 为什么只记最后 20 条？
+      闸门只关心最近一次；留一点历史是为了出问题时能回看。
+    """
+
+    command: str
+    exit_code: int | None
+    ok: bool
+    turn: int = 0
+    ts: float = field(default_factory=time.time)
+    stderr_tail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "exit_code": self.exit_code,
+            "ok": self.ok,
+            "turn": self.turn,
+            "ts": self.ts,
+            "stderr_tail": self.stderr_tail,
         }
 
 
@@ -329,6 +386,7 @@ class ChangeRecord:
     removed: int = 0
     approval_id: str = ""
     backup_path: str = ""   # 覆盖前备份位置（给用户后悔的机会）
+    turn: int = 0           # 发生在第几轮（证据分级要按轮次对齐）
     ts: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -341,6 +399,7 @@ class ChangeRecord:
             "removed": self.removed,
             "approval_id": self.approval_id,
             "backup_path": self.backup_path,
+            "turn": self.turn,
             "ts": self.ts,
         }
 
@@ -379,6 +438,54 @@ class TaskState:
     tool_events: list[ToolEvent] = field(default_factory=list)
     evidence_summary: list[Evidence] = field(default_factory=list)
     reflections: list[dict[str, Any]] = field(default_factory=list)
+
+    # ---- 执行结果（完成验证闸门的依据）-------------------------------------
+    # ★ 与 evidence_summary 的分工：
+    #   evidence 记「成功的观测」，用来判断"有没有看过"；
+    #   command_history 记「带退出码的执行」，用来判断"最后到底过没过"。
+    command_history: list[CommandRecord] = field(default_factory=list)
+    verification_retries: int = 0      # 因为"最后一条命令失败"被驳回的次数
+
+    # ---- 第二批：改动范围审计 ----------------------------------------------
+    # 允许/禁止的路径（相对工作区）。默认只允许整个工作区、不禁任何路径，
+    # 所以不传这两项时行为与之前完全一致。
+    allowed_paths: list[str] = field(default_factory=lambda: ["."])
+    forbidden_paths: list[str] = field(default_factory=list)
+    # 任务开始时的文件快照：{相对路径: {size, mtime_ns, sha}}
+    # ★ 为什么需要基线：用户任务开始前就有的未提交修改**不是** Agent 干的。
+    #   没有基线就会把用户的改动算到 Agent 头上。
+    baseline_files: dict[str, Any] = field(default_factory=dict)
+    audit: dict[str, Any] = field(default_factory=dict)
+    # ---- 第三批：任务意图 / 用户约束 / 验证风险 / 证据等级 ----
+    intent: str = "unknown"
+    intent_confidence: str = "unknown"
+    intent_reasons: list[str] = field(default_factory=list)
+    constraints: dict[str, bool] = field(default_factory=dict)
+    risks: list[dict[str, Any]] = field(default_factory=list)
+    evidence: dict[str, Any] = field(default_factory=dict)
+    # ---- 第四批：风险收尾确认 ----
+    # 每条 risk 自带 status: detected / explained / resolved / unresolved
+    risk_review_retries: int = 0
+    risk_reviews: list[dict[str, Any]] = field(default_factory=list)
+    # ---- 第五批：范围冲突 / 读取缓存 / 压缩记录 -------------------------
+    # 任务目标与权限范围的冲突（要求改的范围在允许范围之外，或同时被禁止）
+    scope_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    # 任务级文件读取缓存：{相对路径: {hash, lines, size, turn, tool}}
+    read_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 缓存相关的可观测说明（命中/失效），给摘要与审计用
+    cache_notes: list[str] = field(default_factory=list)
+    # 已读取文件清单（每轮由 AgentCore 重建，进 progress 提醒）
+    read_index: list[dict[str, Any]] = field(default_factory=list)
+    # 压缩记录（最多留最近 10 次）
+    compaction_log: list[dict[str, Any]] = field(default_factory=list)
+    # ---- 第六批：预算续期与耗尽原因分类 ----
+    budget_extended: bool = False
+    budget_reason: str = ""
+    # 上下文规模（最近一次 / 峰值）—— 字符数是实测，token 是估算
+    context_last: dict[str, Any] = field(default_factory=dict)
+    context_peak_chars: int = 0
+    # 读取复用命中次数（同文件同 hash，折叠成标记而不是再贴一遍全文）
+    read_reuse_hits: int = 0
 
     # ---- 审批 --------------------------------------------------------------
     pending_approval: PendingApproval | None = None   # 非空 = 正在挂起
@@ -516,8 +623,62 @@ class TaskState:
         return self.budgets.check(self.started_at)
 
     def has_enough_evidence(self) -> bool:
-        """是否已满足最小证据数（C3）。"""
-        return len([e for e in self.evidence_summary if e.ok]) >= self.budgets.min_evidence
+        """
+        是否已满足最小证据数（C3）。
+
+        ★ 第三批：诊断/验证任务里，**失败的执行也是证据**。
+          "跑一下测试把结果告诉我"这种任务，命令退出码非 0 恰恰是它要报告的内容。
+          旧实现只数成功的观测，于是这类任务永远收不了尾 ——
+          模型如实汇报失败，却被驳回"你还没有实际查看过任何内容"（真实跑出来过）。
+          现在按意图区分：观测型任务有执行记录就算有证据；
+          修复/实现型任务仍然要求至少一次成功观测。
+        """
+        ok = [e for e in self.evidence_summary if e.ok]
+        if self.intent in ("diagnostic", "verification") and self.command_history:
+            return True
+        return len(ok) >= self.budgets.min_evidence
+
+    # ===================================================================== #
+    # 执行结果（完成验证闸门）
+    # ===================================================================== #
+    def note_command(
+        self,
+        command: str,
+        exit_code: int | None,
+        ok: bool,
+        *,
+        turn: int = 0,
+        stderr_tail: str = "",
+    ) -> None:
+        """记一次带退出码的执行。只保留最近 20 条 —— 闸门只关心最后一条。"""
+        self.command_history.append(
+            CommandRecord(
+                command=command[:200],
+                exit_code=exit_code,
+                ok=ok,
+                turn=turn,
+                stderr_tail=(stderr_tail or "")[-400:],
+            )
+        )
+        del self.command_history[:-20]
+
+    @property
+    def last_command(self) -> CommandRecord | None:
+        return self.command_history[-1] if self.command_history else None
+
+    def failed_verification(self) -> CommandRecord | None:
+        """
+        最后一次执行是失败的 → 返回那条记录；否则 None。
+
+        ★ 只看**最后一条**，不做"曾经失败过就永久拦住"：
+          改完代码重新跑、这次过了，就说明问题解决了。
+          反过来，最后一条是红的，就不该有"任务完成"这个结论 ——
+          哪怕中间某次是绿的（那是修复前的旧证据）。
+        """
+        last = self.last_command
+        if last is None or last.ok:
+            return None
+        return last
 
     # ===================================================================== #
     # 计划
@@ -525,12 +686,111 @@ class TaskState:
     def set_plan(self, steps: list[PlanStep], note: str = "") -> None:
         self.plan = steps
         self.plan_note = note
+        self.current_step_index = 0
 
-    def advance_step(self) -> None:
-        """把当前步标为完成并推进到下一步（REFLECT 阶段调用）。"""
-        if 0 <= self.current_step_index < len(self.plan):
-            self.plan[self.current_step_index].status = StepStatus.DONE
-        self.current_step_index += 1
+    # ===================================================================== #
+    # 计划步骤状态机（第二批重写：由证据决定，不由轮次决定）
+    # ===================================================================== #
+    def _marks(self) -> tuple[int, int, int]:
+        """当前三个留痕队列的长度，用作"这一步之后产生了什么"的基线。"""
+        return (len(self.evidence_summary), len(self.command_history), len(self.change_records))
+
+    def step_check_met(self, step: PlanStep, marks: tuple[int, int, int]) -> tuple[bool, str]:
+        """
+        这一步的完成条件是否被 `marks` 之后产生的新证据满足？
+
+        三种可判定的检查类型（计划里声明，默认 observation）：
+
+            observation → 这一步开始后出现过任何**成功的观测**
+                          （读文件、列目录……适合"看清楚"类步骤）
+            change      → 这一步开始后发生过**文件修改**
+                          （适合"改代码"类步骤）
+            command_ok  → 这一步开始后有一条**退出码为 0 的命令**
+                          （适合"跑测试/跑构建"类步骤）
+
+        ★ 为什么只看 marks 之后的？
+          否则第 1 步读文件留下的证据，会把第 3 步也一起判成完成。
+        """
+        ev_from, cmd_from, chg_from = marks
+        if step.check == "command_ok":
+            fresh = [c for c in self.command_history[cmd_from:] if c.ok]
+            if fresh:
+                return True, f"命令 `{fresh[-1].command}` 退出码 {fresh[-1].exit_code}"
+            return False, ""
+        if step.check == "change":
+            fresh = self.change_records[chg_from:]
+            if fresh:
+                return True, "修改了 " + "、".join(c.path for c in fresh[:3])
+            return False, ""
+        # observation（默认）
+        fresh = [e for e in self.evidence_summary[ev_from:] if e.ok]
+        if fresh:
+            return True, fresh[-1].summary
+        return False, ""
+
+    def start_current_step(self) -> None:
+        """当前步从 PENDING 进入 IN_PROGRESS，并记下证据基线。"""
+        step = self.current_step
+        if step is not None and step.status == StepStatus.PENDING:
+            step.status = StepStatus.IN_PROGRESS
+            step.started_turn = self.turn
+            step.marks = self._marks()
+
+    def finish_current_step(self) -> tuple[bool, str]:
+        """
+        按完成条件结算当前步。返回 `(是否完成, 证据)`。
+
+        ★ 只在条件真的满足时才推进索引 —— 条件不满足就停在原地，
+          模型可以下一轮补上证据，不会出现"轮次跑了但步骤糊弄过去"。
+        """
+        step = self.current_step
+        if step is None:
+            return False, ""
+        ok, evidence = self.step_check_met(step, step.marks)
+        if ok:
+            step.status = StepStatus.DONE
+            step.evidence = evidence
+            step.ended_turn = self.turn
+            self.current_step_index += 1
+            return True, evidence
+        return False, ""
+
+    def fail_current_step(self, reason: str) -> None:
+        """当前步标记失败。**不推进索引** —— 失败要停在原地让人看见。"""
+        step = self.current_step
+        if step is not None and step.status not in (StepStatus.DONE, StepStatus.FAILED):
+            step.status = StepStatus.FAILED
+            step.evidence = reason[:300]
+            step.ended_turn = self.turn
+
+    def block_current_step(self, reason: str) -> None:
+        """当前步被外部条件挡住（例如命中禁止修改的路径）。"""
+        step = self.current_step
+        if step is not None and step.status not in (StepStatus.DONE, StepStatus.BLOCKED):
+            step.status = StepStatus.BLOCKED
+            step.evidence = reason[:300]
+            step.ended_turn = self.turn
+
+    def reconcile_plan(self) -> list[PlanStep]:
+        """
+        收尾前用「步骤自己开始后积累的证据」再结算一次。
+
+        ★ 只处理 IN_PROGRESS 的步骤：PENDING 的步骤说明从没开工，
+          不能因为任务要结束了就给它打个勾（旧实现正是这么伪造进度的）。
+        ★ 返回仍未满足完成条件的步骤 —— 调用方必须把它如实呈现给用户。
+        """
+        for step in self.plan:
+            if step.status != StepStatus.IN_PROGRESS:
+                continue
+            ok, evidence = self.step_check_met(step, step.marks)
+            if ok:
+                step.status = StepStatus.DONE
+                step.evidence = evidence
+                step.ended_turn = self.turn
+        return self.incomplete_steps()
+
+    def incomplete_steps(self) -> list[PlanStep]:
+        return [s for s in self.plan if s.status not in (StepStatus.DONE, StepStatus.SKIPPED)]
 
     @property
     def current_step(self) -> PlanStep | None:
@@ -577,6 +837,29 @@ class TaskState:
             "current_step_index": self.current_step_index,
             "tool_events": [e.to_dict() for e in self.tool_events],
             "evidence_summary": [e.to_dict() for e in self.evidence_summary],
+            "command_history": [c.to_dict() for c in self.command_history],
+            "verification_retries": self.verification_retries,
+            "allowed_paths": self.allowed_paths,
+            "forbidden_paths": self.forbidden_paths,
+            "audit": self.audit,
+            "intent": self.intent,
+            "intent_confidence": self.intent_confidence,
+            "intent_reasons": self.intent_reasons,
+            "constraints": self.constraints,
+            "risks": self.risks,
+            "evidence": self.evidence,
+            "risk_review_retries": self.risk_review_retries,
+            "risk_reviews": self.risk_reviews,
+            "scope_conflicts": self.scope_conflicts,
+            "read_cache": self.read_cache,
+            "cache_notes": self.cache_notes,
+            "read_index": self.read_index,
+            "compaction_log": self.compaction_log[-10:],
+            "budget_extended": self.budget_extended,
+            "budget_reason": self.budget_reason,
+            "context_last": self.context_last,
+            "context_peak_chars": self.context_peak_chars,
+            "read_reuse_hits": self.read_reuse_hits,
             "reflections": self.reflections,
             "pending_approval": self.pending_approval.to_dict() if self.pending_approval else None,
             "approval_history": [a.to_dict() for a in self.approval_history],
