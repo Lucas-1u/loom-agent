@@ -200,9 +200,15 @@ class BudgetConfig:
     compact_max_chars: int = 60_000
     compact_keep_turns: int = 3
 
+    # ---- 编排引擎（M1）--------------------------------------------------
+    # legacy = 现有 _loop 主循环（默认，行为不变）；graph = LangGraph 引擎（尚未实现）。
+    # ★ 未知值必须报错，绝不静默切到别的引擎。
+    orchestrator: str = "legacy"
+
     @classmethod
     def from_env(cls) -> "BudgetConfig":
         return cls(
+            orchestrator=validate_orchestrator(_env("LOOM_ORCHESTRATOR", "legacy")),
             compact_max_chars=_env_int("LOOM_COMPACT_CHARS", 60_000),
             compact_keep_turns=_env_int("LOOM_COMPACT_KEEP_TURNS", 3),
             max_turns=_env_int("LOOM_MAX_TURNS", 20),
@@ -358,3 +364,29 @@ def setup_logging(level: str = "INFO") -> None:
     for noisy in ("httpx", "httpcore", "openai", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     _configured = True
+
+
+# --------------------------------------------------------------------------- #
+# 编排引擎（M1）
+# --------------------------------------------------------------------------- #
+ORCHESTRATOR_LEGACY = "legacy"
+ORCHESTRATOR_GRAPH = "graph"
+ORCHESTRATORS = {ORCHESTRATOR_LEGACY, ORCHESTRATOR_GRAPH}
+
+
+def validate_orchestrator(value: str) -> str:
+    """
+    校验编排器配置值。
+
+    ★ 为什么 graph 也要在这里拦：M1 只交付"切换入口 + 历史持久化"，
+      graph 引擎尚未实现。如果在这里放行，服务会"假装切换成功"——
+      那正是 M1-A 明确禁止的。graph 就绪后从 ORCHESTRATORS 里启用即可。
+    """
+    v = (value or "").strip().lower()
+    if v not in ORCHESTRATORS:
+        raise ValueError(
+            f"编排器配置非法：{value!r}（合法值：{' | '.join(sorted(ORCHESTRATORS))}）"
+        )
+    # M2：graph 已实现。langgraph 未安装时在引擎构造处报可诊断错误
+    #（不在这里拦 —— 配置合法性与可选依赖的可用性是两件事）。
+    return v

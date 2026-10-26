@@ -32,6 +32,7 @@ from typing import Any
 
 from ..agent.approval import ApprovalManager
 from ..agent.core import AgentConfig, AgentCore
+from ..agent.history_log import StoreHistorySink
 from ..events import Event, EventBus
 from ..models.adapter import ModelAdapter
 from ..tools.registry import ToolRegistry
@@ -76,7 +77,11 @@ class TaskRuntime:
         self.bus = EventBus()
         self.bus.bind_task(task_id)
         self.approvals = ApprovalManager(timeout_s=config.approval_timeout_s)
-        self.core = AgentCore(adapter, registry, config=config, bus=self.bus, approvals=self.approvals)
+        self.core = AgentCore(
+            adapter, registry, config=config, bus=self.bus, approvals=self.approvals,
+            # M1：消息历史随任务持久化（store.task_history）
+            history_sink=StoreHistorySink(self._store),
+        )
 
         # ---- 服务层状态 ----
         self.status: str = "created"
@@ -131,6 +136,8 @@ class TaskRuntime:
                 model_label=self.model,
                 allowed_paths=self.allowed_paths,
                 forbidden_paths=self.forbidden_paths,
+                # ★ M2.1：必须用调度器的 task_id —— 否则历史/审计挂在另一个 id 下
+                task_id=self.task_id,
             )
 
             self.status = state.status.value

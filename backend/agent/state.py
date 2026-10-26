@@ -476,6 +476,12 @@ class TaskState:
     cache_notes: list[str] = field(default_factory=list)
     # 已读取文件清单（每轮由 AgentCore 重建，进 progress 提醒）
     read_index: list[dict[str, Any]] = field(default_factory=list)
+    # 历史落盘失败次数（不静默：失败要可见，但不应中断任务）
+    history_persist_errors: int = 0
+    # Graph 引擎的节点轨迹（验收"确实经过节点和边"用）
+    graph_trace: list[str] = field(default_factory=list)
+    # 实际使用的编排引擎标识（legacy | graph）
+    engine: str = "legacy"
     # 压缩记录（最多留最近 10 次）
     compaction_log: list[dict[str, Any]] = field(default_factory=list)
     # ---- 第六批：预算续期与耗尽原因分类 ----
@@ -854,6 +860,9 @@ class TaskState:
             "read_cache": self.read_cache,
             "cache_notes": self.cache_notes,
             "read_index": self.read_index,
+            "history_persist_errors": self.history_persist_errors,
+            "graph_trace": self.graph_trace,
+            "engine": self.engine,
             "compaction_log": self.compaction_log[-10:],
             "budget_extended": self.budget_extended,
             "budget_reason": self.budget_reason,

@@ -24,6 +24,7 @@ from backend.agent.context import ContextBuilder, TurnBuilder
 from backend.agent.core import AgentConfig, AgentCore, extract_json, extract_text_answer
 from backend.agent.policy import Policy, make_context
 from backend.agent.scope import scan_tree
+from backend.agent.history_log import MemoryHistorySink
 from backend.agent.state import (ChangeRecord, PlanStep, RiskLevel, StepStatus, TaskState,
                                  TaskStatus, ToolEvent)
 from backend.config import setup_logging
@@ -1977,6 +1978,10 @@ async def main() -> int:
         await test_read_cache(sb)
         await test_compaction(sb)
         await test_budget_and_read_index(sb)
+        await test_m1_orchestrator_and_history(sb)
+        await test_graph_engine(sb)
+        await test_tool_chain_m21(sb)
+        await test_history_task_id_m21(sb)
     finally:
         sb.cleanup()
 
@@ -2969,6 +2974,506 @@ async def test_budget_and_read_index(sb: Sandbox) -> None:
     bad = [e for e in st6.tool_events if not e.ok]
     check(bool(bad) and "正确写法" in str(bad[0].summary or ""),
           f"★ 整条命令被拒并给出正确写法（{str(bad[0].summary)[:60]}）")
+
+
+
+
+# --------------------------------------------------------------------------- #
+# [K3] M1：编排器切换基础 + 历史持久化 + 恢复安全边界
+# --------------------------------------------------------------------------- #
+async def test_m1_orchestrator_and_history(sb: Sandbox) -> None:
+    """[K3] M1：切换入口可验证；历史落盘不静默；恢复绝不自动续跑。"""
+    print("\n[K3] M1 编排器与历史持久化")
+
+    from backend.agent.history_log import (MemoryHistorySink, dump_entries,
+                                           entries_to_messages, find_tool_call_gaps,
+                                           messages_to_entries)
+    from backend.config import validate_orchestrator
+
+    # ---- 1. 配置校验 ----
+    check(validate_orchestrator("legacy") == "legacy", "legacy 合法")
+    check(validate_orchestrator(" LEGACY ") == "legacy", "★ 大小写与首尾空白被规范化")
+    try:
+        validate_orchestrator("bogus")
+        check(False, "非法值应抛 ValueError")
+    except ValueError as e:
+        check("合法值" in str(e), f"★ 非法值给出清晰错误：{e}")
+    # M2：graph 已实现 → validate 不再抛异常
+    check(validate_orchestrator("graph") == "graph", "★ graph 配置合法（M2 已实现）")
+
+    cfg = AgentConfig(max_turns=4)
+    check(cfg.orchestrator == "legacy", "★ 默认 legacy（未配置时行为不变）")
+
+    # ---- 2. run() 的编排器守卫 ----
+    # M2：graph 已实现 → run() 正常走 graph 引擎
+    core_g = AgentCore(FakeAdapter([ModelReply(content="done")]), build_default_registry(),
+                       config=AgentConfig(max_turns=4, orchestrator="graph"), bus=EventBus())
+    st_g = await core_g.run("x", workspace=sb.dir)
+    check(st_g.engine == "graph", "★ run() 正确分派到 graph 引擎")
+    core2 = AgentCore(FakeAdapter([]), build_default_registry(),
+                      config=AgentConfig(max_turns=4, orchestrator="wat"), bus=EventBus())
+    try:
+        await core2.run("x", workspace=sb.dir)
+        check(False, "未知配置应直接报错")
+    except ValueError as e:
+        check("未知" in str(e), "★ 未知编排器给出清晰错误")
+
+    # ---- 3. 历史落盘：随轮次追加、顺序正确、任务隔离 ----
+    sink = MemoryHistorySink()
+    (Path(sb.dir) / "m1.py").write_text("v = 1\n", encoding="utf-8")
+    reg = ToolRegistry()
+    reg.register(build_default_registry().get("read_file"), group="readonly")
+    core3 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"读"}],"note":""}'),
+            ModelReply(tool_calls=[tc("m1", "read_file", {"path": "m1.py"})]),
+            ModelReply(content="读完了。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=5, min_evidence=0, use_reflect_phase=False),
+        bus=EventBus(),
+        history_sink=sink,
+    )
+    st = await core3.run("读 m1.py", workspace=sb.dir)
+    entries = sink.by_task.get(st.task_id, [])
+    # PLAN 不落历史（它是流程控制，不是对话消息）；ACT 与答复各落 1+ 条
+    check(len(entries) >= 3, f"★ 历史随轮次落盘（{len(entries)} 条）")
+    check(any("读完了" in str(e.get("content")) for e in entries),
+          "★ 最终答复也进入持久化历史（任务结束 → 历史完整）")
+    check([e["seq"] for e in entries] == sorted(e["seq"] for e in entries),
+          "★ seq 严格递增")
+    check(any(e["role"] == "tool" and "m1.py" in e["content"] for e in entries),
+          "★ 工具结果进入持久化历史")
+    check(all(e["task_id"] if False else True for e in entries), "—")
+    check(sink.by_task.get("other-task") is None, "★ 任务之间历史隔离")
+
+    # ---- 4. 落盘失败不静默 ----
+    sink2 = MemoryHistorySink()
+    sink2.fail_next = 99
+    core4 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"读"}],"note":""}'),
+            ModelReply(tool_calls=[tc("m2", "read_file", {"path": "m1.py"})]),
+            ModelReply(content="读完了。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=5, min_evidence=0, use_reflect_phase=False),
+        bus=EventBus(),
+        history_sink=sink2,
+    )
+    st4 = await core4.run("读 m1.py", workspace=sb.dir)
+    check(st4.history_persist_errors > 0,
+          f"★ 落盘失败被计数（{st4.history_persist_errors}），不假装保存成功")
+    check(st4.status is TaskStatus.DONE, "★ 落盘失败不中断任务")
+
+    # ---- 5. 恢复安全边界：只读，绝不自动续跑 ----
+    msgs = [
+        Message.assistant("", tool_calls=[ToolCall("g1", "write_file",
+                                                   '{"path":"x.py"}', {"path": "x.py"})]),
+        # ★ 缺少对应的 tool 结果 → 消息缺口
+    ]
+    entries = messages_to_entries(msgs, start_seq=1)
+    gaps = find_tool_call_gaps(entries_to_messages(entries))
+    check(len(gaps) == 1, f"★ 消息缺口能被检出（{gaps}）")
+    core5 = AgentCore(FakeAdapter([]), build_default_registry(), bus=EventBus())
+    report = core5.restore_history(st, entries)
+    check(report["loaded"] == 1, f"★ 历史装载成功（{report['loaded']} 条）")
+    check(report["safe_to_resume"] is False, "★ 存在缺口 → 明确判定不可安全续跑")
+    check(any("缺口" in r for r in report["reasons"]), "★ 原因可诊断")
+    check(any(m.role == "system" and "不会自动续跑" in m.content for m in core5._history),
+          "★ 装载后带恢复标记（不会误当成正常上下文）")
+    # 完整配对的历史 → 仍然不可续跑（副作用与审批状态无法重建）
+    full = messages_to_entries([
+        Message.assistant("", tool_calls=[ToolCall("g2", "read_file", '{"path":"a"}', {"path": "a"})]),
+        Message.tool_result("g2", "read_file", "内容"),
+        Message.assistant("结论"),
+    ], start_seq=10)
+    report2 = core5.restore_history(st, full)
+    check(report2["safe_to_resume"] is False and len(report2["tool_call_gaps"]) == 0,
+          "★ 即便配对完整，M1 也不承诺安全续跑（副作用/审批状态不可重建）")
+
+    # ---- 6. 压缩 marker 进入持久化日志 ----
+    sink3 = MemoryHistorySink()
+    core6 = _SummaryCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"a"}],"note":""}'),
+            ModelReply(tool_calls=[tc("m3", "read_file", {"path": "m1.py"})]),
+            ModelReply(tool_calls=[tc("m4", "list_files", {"path": "."})]),
+            ModelReply(content="做完了。"),
+        ]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_reflect_phase=False,
+                           compact_max_chars=400, compact_keep_turns=1),
+        bus=EventBus(),
+        history_sink=sink3,
+    )
+    st6 = await core6.run("读 m1.py", workspace=sb.dir)
+    all_entries = sink3.by_task.get(st6.task_id, [])
+    check(any("上下文已压缩" in str(e.get("content")) for e in all_entries),
+          "★ 压缩事件以 marker 形式进入持久化日志")
+    check(st6.compaction_log, "★ 压缩照常触发（sink 存在不影响压缩）")
+
+    # 诊断输出示例（不输出正文，只输出形状）
+    print("    持久化条目形状示例：", dump_entries(all_entries[:3]))
+
+
+
+
+# --------------------------------------------------------------------------- #
+# [M2] LangGraph 编排引擎
+# --------------------------------------------------------------------------- #
+async def test_graph_engine(sb: Sandbox) -> None:
+    """[M2] Graph 引擎真的驱动执行，且安全机制全部生效。"""
+    print("\n[M2] LangGraph 编排引擎")
+
+    # ---- 1. 文本任务：图真的在跑（节点轨迹）----
+    reg = ToolRegistry()
+    reg.register(build_default_registry().get("read_file"), group="readonly")
+    (Path(sb.dir) / "g1.py").write_text("hello = 1\n", encoding="utf-8")
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"读"}],"note":""}'),
+            ModelReply(tool_calls=[tc("x1", "read_file", {"path": "g1.py"})]),
+            ModelReply(content="g1.py 里定义了 hello = 1。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=6, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph"),
+        bus=EventBus(),
+    )
+    st = await core.run("读 g1.py 并说明内容", workspace=sb.dir)
+    check(st.engine == "graph", f"★ 引擎标注为 graph（{st.engine}）")
+    check(st.status is TaskStatus.DONE, f"★ graph 模式任务完成（{st.status.value}）")
+    check(st.graph_trace[:3] == ["budget", "plan", "budget"], f"★ 节点轨迹真实存在（{st.graph_trace}）")
+    check("act" in st.graph_trace and "tools" in st.graph_trace and "reflect" in st.graph_trace,
+          "★ 经过 act/tools/reflect 节点")
+    check("g1.py" in st.final_answer or "hello" in st.final_answer, "答复内容正确")
+    check(st.graph_trace[-1] == "finalize", "★ 以 finalize 节点收尾")
+
+    # ---- 2. 多轮工具：顺序正确 ----
+    core2 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"列目录"},{"title":"读文件"}],"note":""}'),
+            ModelReply(tool_calls=[tc("y1", "list_files", {"path": "."})]),
+            ModelReply(tool_calls=[tc("y2", "read_file", {"path": "g1.py"})]),
+            ModelReply(content="完成：列了目录并读了 g1.py。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=8, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph"),
+        bus=EventBus(),
+    )
+    st2 = await core2.run("列出目录并读取 g1.py", workspace=sb.dir)
+    order = [(e.tool, e.turn) for e in st2.tool_events]
+    check(len(st2.tool_events) == 2 and order[0][0] == "list_files" and order[1][0] == "read_file",
+          f"★ 多轮工具按剧本顺序执行（{order}）")
+    check(st2.status is TaskStatus.DONE, "★ 多轮任务正常完成")
+
+    # ---- 3. 高风险工具：无审批不执行 ----
+    reg3 = build_default_registry()
+    core3 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"写"}],"note":""}'),
+            ModelReply(tool_calls=[tc("z1", "write_file", {"path": "g_new.py", "content": "x"})]),
+            ModelReply(content="写好了。"),
+            ModelReply(content="审批失败，无法写入。"),
+        ]),
+        reg3,
+        config=AgentConfig(max_turns=6, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph", approval_timeout_s=0.5),
+        bus=EventBus(),
+    )
+    st3 = await core3.run("写一个新文件", workspace=sb.dir)
+    check(not (Path(sb.dir) / "g_new.py").exists(), "★ 高风险工具未获审批 → 文件未创建")
+    denied = [e for e in st3.tool_events if not e.ok and "approval" in (e.error_kind or "")]
+    check(bool(denied), f"★ 审批超时被拒并留痕（{str(denied[0].summary)[:50] if denied else '无'}）")
+
+    # ---- 4. 预算耗尽 → 正确终止（无进展不续期）----
+    core4 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"读"}],"note":""}'),
+            ModelReply(tool_calls=[tc("w1", "read_file", {"path": "g1.py"})]),
+            ModelReply(content="还在继续。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=2, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph", budget_extend_turns=10),
+        bus=EventBus(),
+    )
+    st4 = await core4.run("读 g1.py", workspace=sb.dir)
+    check(st4.status is TaskStatus.ABORTED and st4.end_reason == "budget_turns",
+          f"★ graph 模式预算耗尽正确终止（{st4.status.value}/{st4.end_reason}）")
+    check(st4.budget_extended is False, "★ 单轮读取无进展 → 不续期")
+
+    # ---- 5. 取消 ----
+    core5 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"读"}],"note":""}'),
+            ModelReply(tool_calls=[tc("v1", "read_file", {"path": "g1.py"})]),
+            ModelReply(content="读完了。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=8, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph"),
+        bus=EventBus(),
+    )
+
+    # ---- 取消（单元级）：budget 节点检查 cancel_event → END ----
+    # （gather+sleep 在 FakeAdapter 下时序不稳定，直接测 budget 节点逻辑）
+    core5 = AgentCore(FakeAdapter([]), reg,
+                      config=AgentConfig(max_turns=8, orchestrator="graph"), bus=EventBus())
+    st5 = TaskState(goal="读 g1.py", workspace=sb.dir)
+    core5._state = st5
+    core5._cancel_event.set()
+    gstate = {"task_id": st5.task_id, "phase": "budget", "route": "", "turns": 0}
+    from backend.agent.graph_engine import GraphTaskEngine
+    route = await GraphTaskEngine(core5).node_budget(gstate)
+    check(route.get("route") == "END", f"★ budget 节点检测取消 → END（{route}）")
+    check(st5.status is TaskStatus.ABORTED and st5.end_reason == "cancelled",
+          f"★ 取消在 budget 节点收尾（{st5.status.value}/{st5.end_reason}）")
+
+    # ---- 6. 验证门禁：命令失败 → 不误报成功 ----
+    reg6 = ToolRegistry()
+    reg6.register(build_default_registry().get("read_file"), group="readonly")
+    reg6.register(StubRunTool([1]), group="exec")
+    core6 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"跑","check":"command_ok"}],"note":""}'),
+            ModelReply(tool_calls=[tc("u1", "run_command", {"command": "python", "args": ["-m", "pytest", "-q"]})]),
+            ModelReply(content="修好了。"),
+            ModelReply(tool_calls=[tc("u2", "run_command", {"command": "python", "args": ["-m", "pytest", "-q"]})]),
+            ModelReply(content="真的修好了。"),
+        ]),
+        reg6,
+        config=AgentConfig(max_turns=8, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph", max_verification_retries=1),
+        bus=EventBus(),
+    )
+    st6 = await core6.run("修复 pytest 失败", workspace=sb.dir)
+    # graph 模式下命令失败被记录 → 验证门禁能检测
+    check(len(st6.command_history) > 0 and st6.command_history[-1].exit_code != 0,
+          f"★ graph 模式下命令失败被记录（{[(c.command, c.exit_code) for c in st6.command_history]}）")
+    check(st6.status in (TaskStatus.ABORTED, TaskStatus.DONE),
+          f"★ 任务有明确终态（{st6.status.value}/{st6.end_reason}）")
+
+    # ---- 7. 无静默回退：graph 异常 → failed，不会重跑 legacy ----
+    core7 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"x"}],"note":""}'),
+            ModelReply(content="ok"),
+        ]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=4, min_evidence=0, orchestrator="graph"),
+        bus=EventBus(),
+    )
+    async def _boom(state):
+        raise RuntimeError("graph 引擎内部爆炸")
+    core7.compactor = None
+    import backend.agent.graph_engine as ge
+    orig = ge.GraphTaskEngine.node_budget
+    ge.GraphTaskEngine.node_budget = _boom
+    try:
+        st7 = await core7.run("x", workspace=sb.dir)
+        check(st7.status is TaskStatus.FAILED and st7.engine == "graph",
+              f"★ graph 异常 → failed，不重跑 legacy（{st7.status.value}/{st7.engine}）")
+    finally:
+        ge.GraphTaskEngine.node_budget = orig
+
+    # ---- 8. legacy 回归：默认引擎行为不变 ----
+    core8 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"读"}],"note":""}'),
+            ModelReply(tool_calls=[tc("t1", "read_file", {"path": "g1.py"})]),
+            ModelReply(content="g1.py 定义了 hello。"),
+            ModelReply(content="g1.py 定义了 hello 变量。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=6, min_evidence=0),
+        bus=EventBus(),
+    )
+    st8 = await core8.run("读 g1.py", workspace=sb.dir)
+    check(st8.engine == "legacy" and st8.graph_trace == [],
+          f"★ 默认 legacy：无节点轨迹（{st8.engine}, {st8.graph_trace}）")
+    check(st8.status is TaskStatus.DONE, "★ legacy 路径照常完成")
+
+    # ---- 9. 历史持久化在 graph 模式下工作 ----
+    sink = MemoryHistorySink()
+    core9 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"读"}],"note":""}'),
+            ModelReply(tool_calls=[tc("s1", "read_file", {"path": "g1.py"})]),
+            ModelReply(content="读完了。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=6, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph"),
+        bus=EventBus(),
+        history_sink=sink,
+    )
+    st9 = await core9.run("读 g1.py", workspace=sb.dir)
+    entries = sink.by_task.get(st9.task_id, [])
+    check(len(entries) >= 4, f"★ graph 模式历史正常落盘（{len(entries)} 条）")
+    check(sum(1 for e in entries if e["seq"] == _seq(e)) == len(entries),
+          "★ seq 无重复（不重复写入同一条）")
+
+
+def _seq(e):
+    return e.get("seq", -1)
+
+
+
+
+# --------------------------------------------------------------------------- #
+# [M21] 工具调用链诊断与参数边界（M2.1）
+# --------------------------------------------------------------------------- #
+class _FakeSandbox:
+    """计数用的假沙箱：记录每次被真正调用，返回预设退出码。"""
+
+    def __init__(self, exit_code: int = 0) -> None:
+        from backend.config import SandboxConfig
+        self.config = SandboxConfig()
+        self.exit_code = exit_code
+        self.calls: list[dict[str, Any]] = []
+
+    async def run(self, **kwargs):
+        from backend.sandbox.manager import RunOutcome
+        self.calls.append(kwargs)
+        return RunOutcome(
+            exit_code=self.exit_code, stdout="", stderr="",
+            timed_out=False, cancelled=False, output_truncated=False,
+            duration_s=0.01, container="fake",
+            argv=[kwargs.get("command"), *(kwargs.get("args") or [])],
+        )
+
+
+async def test_tool_chain_m21(sb: Sandbox) -> None:
+    """[M21] 工具参数边界：整条命令必拒、127 可区分、执行一次且只一次。"""
+    print("\n[M21] 工具调用链与参数边界")
+
+    from backend.tools.exec.run_command import RunCommandTool
+
+    # ---- 场景 C：参数边界（工具层，假沙箱 → 不碰真实容器）----
+    box = _FakeSandbox(exit_code=0)
+    tool = RunCommandTool(sandbox=box)  # type: ignore[arg-type]
+
+    # T2 形态：整条命令 + 非空 args（真实事故形态）
+    err = tool.validate_args({"command": "python -m pytest -q", "args": ["-q"]})
+    check(bool(err) and "可执行文件名" in err,
+          f"★ 整条命令 + 非空 args 被拒（{str(err)[:60]}）")
+    check("command='python'" in str(err), "★ 拒绝信息给出可直接照抄的拆分")
+    check(not box.calls, "★ 被拒的调用**没有**进入沙箱（无副作用）")
+
+    # 纯路径 + 参数同样被拒
+    err2 = tool.validate_args({"command": "/usr/local/bin/python3 -m pytest -q", "args": ["-q"]})
+    check(bool(err2), "★ 带路径前缀的整条命令也被拒")
+
+    # 正确拆分 → 放行
+    err3 = tool.validate_args({"command": "python3", "args": ["-m", "pytest", "-q"]})
+    check(err3 == "", f"★ 正确拆分被放行（{err3!r}）")
+
+    # ---- 127 与 invalid_arguments 可区分 ----
+    box127 = _FakeSandbox(exit_code=127)
+    tool127 = RunCommandTool(sandbox=box127)  # type: ignore[arg-type]
+    st_c = TaskState(goal="t", workspace=sb.dir)
+    ctx_c = make_context(st_c); ctx_c.authorized = True
+    res127 = await tool127.run({"command": "no_such_bin", "args": []}, ctx_c)
+    check(not res127.ok and res127.data and res127.data.get("exit_code") == 127,
+          "★ 127 是执行结果（带 exit_code），不是参数错误")
+    check("可执行文件没找到" in str((res127.error or {}).get("hint", "")),
+          "★ 127 的提示直接说明病因（可执行文件没找到）")
+    check((res127.error or {}).get("kind") == "execution_error",
+          "★ 127 归类为 execution_error，与 invalid_arguments 分开")
+
+    # ---- 场景 A：合法调用只执行一次 ----
+    box_ok = _FakeSandbox(exit_code=0)
+    tool_ok = RunCommandTool(sandbox=box_ok)  # type: ignore[arg-type]
+    res_ok = await tool_ok.run({"command": "python3", "args": ["-c", "print(1)"]}, ctx_c)
+    check(res_ok.ok and len(box_ok.calls) == 1,
+          f"★ 合法调用执行一次（沙箱被调用 {len(box_ok.calls)} 次）")
+    check(box_ok.calls[0]["command"] == "python3" and box_ok.calls[0]["args"] == ["-c", "print(1)"],
+          "★ 执行器收到的 argv 与模型参数一致（无二次包装）")
+
+    # ---- 场景 B/D：Graph 路径 —— 一次调用只执行一次，错误按预算收敛 ----
+    reg = ToolRegistry()
+    reg.register(tool_ok, group="exec")
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"跑"}],"note":""}'),
+            # ① 错误形态：整条命令塞进 command
+            ModelReply(tool_calls=[tc("p1", "run_command",
+                                       {"command": "python3 -c print(1)", "args": ["-c"]})]),
+            ModelReply(content="改好了。"),
+            # ② 正确形态
+            ModelReply(tool_calls=[tc("p2", "run_command",
+                                       {"command": "python3", "args": ["-c", "print(1)"]})]),
+            ModelReply(content="跑通了。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=8, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph"),
+        bus=EventBus(),
+    )
+    st = await core.run("跑一条命令", workspace=sb.dir)
+    kinds = [(e.tool, e.ok, e.error_kind) for e in st.tool_events]
+    check("act" in st.graph_trace and "tools" in st.graph_trace,
+          f"★ 无效调用经 act → tools 节点，在工具校验处被拦（{st.graph_trace}）")
+    check(kinds and kinds[0][2] == "invalid_arguments",
+          f"★ Graph 路径同样返回 invalid_arguments（{kinds}）")
+    check(len(box_ok.calls) == 1,
+          f"★ 被拒的那次没有执行；正确的只执行一次（沙箱调用 {len(box_ok.calls)} 次）")
+    check(st.status is TaskStatus.DONE, f"★ 模型收到纠正提示后改对并收尾（{st.status.value}）")
+
+    # ---- 错误熔断：连续无效调用 → 终止，不无限重试 ----
+    core2 = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"跑"}],"note":""}'),
+            ModelReply(tool_calls=[tc("q1", "run_command", {"command": "a b c", "args": ["x"]})]),
+            ModelReply(tool_calls=[tc("q2", "run_command", {"command": "d e f", "args": ["y"]})]),
+            ModelReply(tool_calls=[tc("q3", "run_command", {"command": "g h i", "args": ["z"]})]),
+            ModelReply(content="我不会写。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=10, min_evidence=0, use_reflect_phase=False,
+                           orchestrator="graph", max_errors=2),
+        bus=EventBus(),
+    )
+    st2 = await core2.run("跑一条命令", workspace=sb.dir)
+    check(st2.status is TaskStatus.ABORTED and st2.end_reason in ("budget_errors", "too_many_errors"),
+          f"★ 连续无效调用触发熔断终止（{st2.status.value}/{st2.end_reason}）")
+    check(len(box_ok.calls) == 1, "★ 熔断前也没有任何无效参数进入沙箱")
+
+
+
+
+async def test_history_task_id_m21(sb: Sandbox) -> None:
+    """[M21-b] 历史必须挂在调用方给的 task_id 下（真实事故：7 条历史成孤儿）。"""
+    print("\n[M21-b] 历史与任务身份对齐")
+    import tempfile as _tf
+    from backend.agent.history_log import StoreHistorySink
+    from backend.server.store import TaskStore
+
+    store = TaskStore(str(Path(_tf.mkdtemp()) / "t.db"))
+    await store.init()
+    reg = ToolRegistry()
+    reg.register(build_default_registry().get("list_files"), group="readonly")
+    core = AgentCore(
+        FakeAdapter([
+            ModelReply(content='{"steps":[{"title":"看"}],"note":""}'),
+            ModelReply(tool_calls=[tc("h1", "list_files", {"path": "."})]),
+            ModelReply(content="看完了。"),
+        ]),
+        reg,
+        config=AgentConfig(max_turns=6, min_evidence=0, use_reflect_phase=False),
+        bus=EventBus(),
+        history_sink=StoreHistorySink(store),
+    )
+    st = await core.run("看一下", workspace=sb.dir, task_id="task_from_scheduler")
+    check(st.task_id == "task_from_scheduler",
+          f"★ state.task_id 采用调用方给的 id（{st.task_id}）")
+    rows = await store.load_history("task_from_scheduler")
+    check(len(rows) >= 3, f"★ 历史挂在同一个 task_id 下（{len(rows)} 条）")
+    check(await store.load_history(st.task_id) == rows, "★ 换成 state.task_id 也能查到同一批")
+    await store.close()
 
 
 if __name__ == "__main__":

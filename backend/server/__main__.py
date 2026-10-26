@@ -154,6 +154,7 @@ async def amain(args: argparse.Namespace) -> int:
     print("=" * 62)
     print(f"  地址      http://{host}:{port}")
     print(f"  模型      {cfg.model.provider} / {cfg.model.model}")
+    print(f"  编排器    {cfg.budgets.orchestrator}")
     print(f"  数据库    {db_path}")
     print(f"  并发上限  {args.max_tasks}")
     print(f"  命令沙箱  {sb_line}")

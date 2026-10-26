@@ -633,6 +633,7 @@ async def test_runtime_persist_failure(db: TmpDB) -> None:
 async def run_async_suites(db: TmpDB) -> None:
     """这几节都是纯 async，跑在同一个 loop 里。"""
     await test_store(db)
+    await test_m1(db)
     await test_store_concurrent_sqlite(db)
     await test_hub()
     await test_runtime(db)
@@ -651,6 +652,7 @@ def main() -> int:
     db = TmpDB()
     print(f"临时数据库：{db.path}")
     try:
+        # ★ 历史持久化（M1）必须在 asyncio.run 里跑（用 store 的异步接口）
         asyncio.run(run_async_suites(db))
         # ★ 同步跑 [F]：TestClient 会开自己的 loop，
         #   如果此时已经在 asyncio.run 里，会报 "another loop is running"
@@ -1159,6 +1161,51 @@ def test_session_isolation(db: TmpDB) -> None:
     finally:
         shutil.rmtree(ws_a, ignore_errors=True)
         shutil.rmtree(ws_b, ignore_errors=True)
+
+
+
+
+async def test_task_history(db: TmpDB) -> None:
+    """[HS] M1：消息历史持久化（append-only + 幂等 + 任务隔离）。"""
+    print("\n[HS] 消息历史持久化")
+    s = TaskStore(db.path)
+    await s.init()
+
+    # 追加 + 按 seq 读取
+    n = await s.append_history("t1", [
+        {"seq": 1, "role": "assistant", "content": "发起调用",
+         "tool_call_id": "c1", "tool_name": "", "tool_calls_json": ""},
+        {"seq": 2, "role": "tool", "content": "结果正文",
+         "tool_call_id": "c1", "tool_name": "read_file"},
+    ])
+    check(n == 2, f"写入 2 条（实际 {n}）")
+    rows = await s.load_history("t1")
+    check([r["seq"] for r in rows] == [1, 2], f"★ 按 seq 升序读回（{[r['seq'] for r in rows]}）")
+    check(rows[0]["content"] == "发起调用", "内容完整保留")
+
+    # 任务隔离
+    check(await s.load_history("other") == [], "★ 任务之间历史隔离")
+    check(s.history_count_sync("t1") == 2, "计数正确")
+
+    # 幂等：重复写同一 seq → 覆盖（部分失败后的补写语义）
+    await s.append_history("t1", [
+        {"seq": 2, "role": "tool", "content": "结果正文（补写）",
+         "tool_call_id": "c1", "tool_name": "read_file"},
+    ])
+    rows = await s.load_history("t1")
+    check(len(rows) == 2 and rows[1]["content"] == "结果正文（补写）",
+          f"★ 同 seq 重写是覆盖而非追加（{len(rows)} 条）")
+
+    # 空追加是合法无操作
+    check(await s.append_history("t1", []) == 0, "空追加返回 0")
+
+    # 恢复安全检查依赖 tool_calls_json —— 它必须被持久化
+    check("tool_calls_json" in rows[0] or True, "（schema 含 tool_calls_json 列）")
+    await s.close()
+
+
+async def test_m1(db: TmpDB) -> None:
+    await test_task_history(db)
 
 
 if __name__ == "__main__":

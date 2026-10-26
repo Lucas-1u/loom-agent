@@ -59,7 +59,11 @@ class RunCommandTool(Tool):
         "properties": {
             "command": {
                 "type": "string",
-                "description": "可执行文件名，例如 python / pytest / ls。不要传整条 shell 字符串。",
+                "description": (
+                    "只写**可执行文件名**（不含任何参数、不含空格），例如 python3 / pytest / ls。"
+                    "✅ 正确：command=\"python3\" + args=[\"-m\",\"pytest\",\"-q\"]；"
+                    "❌ 错误：command=\"python3 -m pytest -q\"（会报 127 / invalid_arguments）。"
+                ),
             },
             "args": {
                 "type": "array",
@@ -96,16 +100,24 @@ class RunCommandTool(Tool):
         if "\x00" in cmd or len(cmd) > MAX_COMMAND_CHARS:
             return f"command 非法（含 NUL 或超过 {MAX_COMMAND_CHARS} 字符）"
 
-        # ---- 第六批：检测"整条命令塞进 command"--------------------------
-        # 真实 E2E：模型三次把 "python -m pytest -q" 整条塞进 command，
-        # 容器 exec 报 127（No such file or directory），白白烧掉 3 轮。
-        # 在这里提前失败并给出**可直接照抄**的纠正写法，
+        # ---- M2.1：command 里出现空格一律拒（不管 args 是否为空）---------
+        # 真实证据（spark-x2.6）：模型常把整条命令塞进 command，
+        # **并且同时**传一个非空的 args（例如 command="python -m pytest -q",
+        # args=["-q"]）。旧实现只在 args 为空时检查，于是这种形态直接进了容器：
+        #   tini: exec python -m pytest -q failed: No such file or directory → 127
+        # 结果是白白烧掉几轮、还被计成 execution_error。
+        # 这里提前失败并给出**可直接照抄**的纠正写法；
         # 不自动拆分执行 —— 引号/管道拆错比多一轮更危险。
-        if args.get("args") in (None, []) and " " in cmd.strip():
+        if " " in cmd.strip():
             parts = cmd.strip().split()
+            exists = args.get("args") or []
+            extra = ""
+            if exists:
+                extra = (f"（注意：你已经传了 args={exists!r}，"
+                         f"其中可能包含重复参数，请按上面的拆法重新对齐。）")
             return (
-                f"command 应该只是可执行文件名，不要把整条命令塞进来（检测到 {cmd.strip()[:60]!r}）。"
-                f"正确写法：command={parts[0]!r}, args={parts[1:]!r}"
+                f"command 只能是**可执行文件名**，不能是整条命令（检测到 {cmd.strip()[:60]!r}）。"
+                f"正确写法：command={parts[0]!r}, args={parts[1:]!r}。{extra}"
             )
 
         raw_args = args.get("args")
@@ -306,11 +318,25 @@ class RunCommandTool(Tool):
                     duration_ms=t.ms,
                 )
 
+            # ---- M2.1：127 要给出可操作的诊断，而不是"自己看 stderr"------
+            # 127 = 容器里 exec 失败（可执行文件不存在）。两种常见原因：
+            #   ① command 里带了空格/参数（应只放可执行文件名）；
+            #   ② 该命令不在沙箱镜像里（例如镜像只装了 python3，没有 python）。
+            if outcome.exit_code == 127:
+                hint = (
+                    "退出码 127 表示**可执行文件没找到**。请检查："
+                    "① command 是否只写了可执行文件名（不要把 '-m pytest -q' 这类参数写进 command，"
+                    '应放 args，例如 command="python3", args=["-m","pytest","-q"]）；'
+                    "② 该命令是否存在于沙箱镜像里（用 list_files 或 `ls /usr/local/bin` 确认；"
+                    "本镜像通常只有 python3，没有 python）。"
+                )
+            else:
+                hint = "读 stderr / stdout 找原因；修完代码或改参数后可以重试。"
             return ToolResult.failure(
                 self.name,
                 ErrorKind.EXECUTION_ERROR,
                 f"命令退出码 {outcome.exit_code}{note}",
-                hint="读 stderr / stdout 找原因；修完代码或改参数后可以重试。",
+                hint=hint,
                 data=data,
                 duration_ms=t.ms,
             )

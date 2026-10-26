@@ -19,3 +19,6 @@ python-dotenv>=1.0.0
 
 # ---- HTTPS 证书（替代旧项目的 verify=False，见 Step1 分析报告） ----
 certifi
+
+# ---- Graph 编排引擎（M2，可选：legacy 模式不需要） ----
+langgraph>=0.2,<0.7

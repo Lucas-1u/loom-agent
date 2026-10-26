@@ -82,6 +82,9 @@ from .approval import ApprovalManager, Decision, args_fingerprint, build_pending
 from .context import ContextBuilder, TurnBuilder, phase_hint
 from .policy import Policy, make_context
 from .compaction import ContextCompactor, ContextStats, measure
+from .history_log import (HistorySink, StoreHistorySink, dump_entries,
+                          entries_to_messages, find_tool_call_gaps,
+                          messages_to_entries)
 from .intent import (classify_intent, detect_risks, detect_scope_conflicts,
                      extract_scoped_allowed, extract_scoped_forbidden, grade_evidence,
                      is_test_config_path)
@@ -131,6 +134,8 @@ class AgentConfig:
         # 有界续期：只续一次，幅度固定。出现循环/停滞/冲突时绝不续。
         budget_extend_turns: int = 10,
         budget_extend_enabled: bool = True,
+        # ---- 编排引擎（M1）：legacy 默认；graph 未实现，配置层会拒绝 ----
+        orchestrator: str = "legacy",
     ) -> None:
         self.max_turns = max_turns
         self.max_seconds = max_seconds
@@ -150,10 +155,12 @@ class AgentConfig:
         self.compact_keep_turns = compact_keep_turns
         self.budget_extend_turns = budget_extend_turns
         self.budget_extend_enabled = budget_extend_enabled
+        self.orchestrator = orchestrator
 
     @classmethod
     def from_budget_config(cls, b: Any, **overrides: Any) -> "AgentConfig":
         cfg = cls(
+            orchestrator=getattr(b, "orchestrator", "legacy"),
             compact_max_chars=getattr(b, "compact_max_chars", 60_000),
             compact_keep_turns=getattr(b, "compact_keep_turns", 3),
             max_turns=b.max_turns,
@@ -272,6 +279,7 @@ class AgentCore:
         registry: ToolRegistry,
         *,
         config: AgentConfig | None = None,
+        history_sink: "HistorySink | None" = None,
         bus: EventBus | None = None,
         approvals: ApprovalManager | None = None,
         allowed_tools: set[str] | None = None,
@@ -285,12 +293,15 @@ class AgentCore:
         self.policy = Policy(registry, allowed_tools=allowed_tools)
         self.context = ContextBuilder()
         self.extra_rules = extra_rules
+        # M1：历史落盘的抽象出口（runtime 传 StoreHistorySink；单测不传 → 不持久化）
+        self.history_sink = history_sink
 
         # 运行期状态（每次 run 重置）
         self._state: TaskState | None = None
         self._history: list[Message] = []
         self._system_prompt: str = ""
-        self._cancel_event: asyncio.Event | None = None
+        # 取消事件：__init__ 就创建（cancel() 不依赖 run() 已启动）
+        self._cancel_event: asyncio.Event = asyncio.Event()
 
     # ===================================================================== #
     # 公开属性
@@ -320,6 +331,7 @@ class AgentCore:
         model_label: str = "",
         allowed_paths: list[str] | None = None,
         forbidden_paths: list[str] | None = None,
+        task_id: str = "",
     ) -> TaskState:
         """
         跑一个完整任务，返回最终 TaskState。
@@ -329,14 +341,32 @@ class AgentCore:
         `allowed_paths` / `forbidden_paths`（第二批新增，相对工作区）：
           · 默认 `allowed=["."]`、`forbidden=[]` → 行为与之前完全一致
           · forbidden 会在 Policy 层**直接拦下**写入；allowed 只在事后审计里标记
+
+        编排引擎由 <code>self.config.orchestrator</code> 决定（M1）：
+          · legacy（默认）= 现有 _loop；graph 尚未实现，进入即报可诊断错误
         """
+        # ---- 编排引擎选择（M1/M2）----------------------------------------
+        # ★ 合法值校验在配置层（validate_orchestrator）；这里只分派。
+        # ★ graph 引擎异常直接向上抛 → 由下方顶层 except 收尾为 failed，
+        #   绝不静默切回 legacy 重跑（工具副作用可能已经发生）。
+        orch = getattr(self.config, "orchestrator", "legacy")
+        if orch not in ("legacy", "graph"):
+            raise ValueError(
+                f"未知的编排器配置：{orch!r}（合法值：legacy | graph）"
+            )
+
         # ---- 初始化 -----------------------------------------------------
         root = normalize_root(workspace)
+        # ★ M2.1：task_id 可以由调用方（TaskRuntime）指定。
+        #   不指定时自生成 —— 但那样历史会挂在另一个 id 下，
+        #   与 tasks 表 / 前端 / 事件里的 task_id 对不上（真实事故：7 条历史成了孤儿）。
         state = TaskState(
             goal=goal.strip(),
             workspace=root,
             model=model_label or getattr(self.adapter, "model", "") or self.adapter.name,
+            **({"task_id": task_id} if task_id else {}),
         )
+        state.engine = orch
         state.allowed_paths = list(allowed_paths) if allowed_paths else ["."]
         state.forbidden_paths = list(forbidden_paths) if forbidden_paths else []
 
@@ -411,7 +441,10 @@ class AgentCore:
             keep_recent_turns=self.config.compact_keep_turns,
             summarizer=self._summarize_history,
         )
-        self._cancel_event = asyncio.Event()
+        # ---- 历史持久化（M1）：sink 在 __init__ 注入；这里只重置游标 ------
+        self._history_persisted = 0
+        self._history_seq = 0
+        self._cancel_event.clear()
         self.bus.bind_task(state.task_id)
 
         # ---- 系统提示 ---------------------------------------------------
@@ -434,7 +467,12 @@ class AgentCore:
                  state.task_id, state.goal[:60], root, len(state.baseline_files))
 
         try:
-            await self._loop(state)
+            if self.config.orchestrator == "graph":
+                # M2：LangGraph 编排引擎驱动同一组阶段方法与安全检查点
+                from .graph_engine import GraphTaskEngine
+                await GraphTaskEngine(self).run(state)
+            else:
+                await self._loop(state)
         except asyncio.CancelledError:
             state.finish(TaskStatus.ABORTED, self._fallback_answer(state, "cancelled"), "cancelled")
             self.bus.emit(
@@ -452,6 +490,11 @@ class AgentCore:
             self.bus.error("internal_error", f"{type(exc).__name__}: {exc}", fatal=True)
             self.bus.task_end("failed", state.final_answer, "internal_error")
 
+        # ---- 最终历史落盘（M1）：保证"任务结束 → 历史已到最新"------------
+        try:
+            await self._flush_history(state)
+        except Exception as exc:  # noqa: BLE001 —— 落盘失败已在 _flush 里记录
+            log.warning("任务 %s 最终历史落盘失败：%s", state.task_id, exc)
         self._record_audit(state)
         return state
 
@@ -538,93 +581,11 @@ class AgentCore:
                 continue
 
             # ---- 分支 B：模型直接给文本 → 收尾 -------------------------
-            # ★ 先看这是不是"REFLECT 形状"的输出（progress/next_action/done）：
-            #   是的话它不是答复，不能收尾 —— done:false 记成 done 是虚假完成。
-            reflect_obj = _as_reflect_payload(reply.content)
-            if reflect_obj is not None:
-                self._history.append(Message.assistant(reply.content, reasoning=reply.reasoning))
-                if reflect_obj.get("done"):
-                    self._history.append(Message.user(
-                        "[系统] 你给的是进展汇报，不是给用户的最终答复。"
-                        "请直接输出最终答复正文（说明做了什么、结果如何、还有什么没做完）。"
-                    ))
-                else:
-                    nxt = str(reflect_obj.get("next_action") or reflect_obj.get("progress") or "").strip()
-                    self._history.append(Message.user(
-                        f"[系统] 继续执行：{nxt}" if nxt else
-                        "[系统] 你还没有完成本次任务，请继续调用工具推进。"
-                    ))
-                self.bus.error(
-                    "reflect_as_answer",
-                    "模型交上来的是进展汇报（REFLECT 格式），已按'继续执行'处理",
-                    fatal=False,
-                    turn=turn,
-                )
-                continue
-
-            answer = extract_text_answer(reply.content)
-
-            if not answer.strip():
-                # 既没工具调用也没正文 → 空回复，收尾
-                if state.evidence_summary:
-                    # ★ 不是直接落模板 —— 已经收集到证据，就该让模型真正作答。
-                    #   走 _final_phase 时它自己会 finish + 发 final_answer/task_end。
-                    self.bus.error(
-                        "empty_reply",
-                        "模型未给出正文，转为收尾作答",
-                        fatal=False,
-                        turn=turn,
-                    )
-                    await self._final_phase(state, reason="no_more_actions")
-                else:
-                    state.finish(
-                        TaskStatus.ABORTED,
-                        "模型没有给出任何内容，也没有调用工具。请换个说法重试，或检查模型配置。",
-                        "empty_reply",
-                    )
-                    self.bus.final_answer(state.final_answer, turn=turn)
-                    self.bus.task_end("aborted", state.final_answer, state.end_reason)
+            # M2：逻辑提取到 _finalize_text_reply（legacy 与 graph 引擎共用），
+            # 返回 "continue"（回灌继续）或 "stop"（已收尾）。
+            route = await self._finalize_text_reply(state, reply)
+            if route != "continue":
                 return
-
-            # ---- 证据闸门（C3）------------------------------------------
-            if not state.has_enough_evidence() and state.budgets.min_evidence > 0:
-                # 模型急着答，但还没观测过环境 → 不采纳，提示它先看
-                self.bus.error(
-                    "insufficient_evidence",
-                    f"模型在没有任何观测的情况下试图作答，已驳回（需至少 {state.budgets.min_evidence} 条证据）",
-                    fatal=False,
-                    turn=turn,
-                )
-                self._history.append(Message.assistant(reply.content, reasoning=reply.reasoning))
-                self._history.append(
-                    Message.user(
-                        "[系统] 你还没有实际查看过任何内容，不能直接下结论。"
-                        "请先调用工具观测工作区，再给出结论。"
-                    )
-                )
-                continue
-
-            # ---- FINAL --------------------------------------------------
-            # ★ 完成验证闸门：模型说"完事了"不算数，先看最后一次执行过没过。
-            gate, detail = await self._verification_gate(state)
-            if gate == "reject":
-                self.bus.error("unverified_completion", detail, fatal=False, turn=turn)
-                self._history.append(Message.assistant(reply.content, reasoning=reply.reasoning))
-                self._history.append(Message.user(detail))
-                continue
-            if gate == "fail":
-                answer = self._stamp_unverified(answer, detail)
-                state.finish(TaskStatus.ABORTED, answer, "verification_failed")
-                self.bus.final_answer(answer, turn=turn)
-                self.bus.task_end("aborted", answer, "verification_failed")
-                return
-
-            answer = self._note_incomplete_steps(state, answer)
-            answer = self._note_verification(state, answer, TaskStatus.DONE)
-            state.finish(TaskStatus.DONE, answer, "agent_done")
-            self.bus.final_answer(answer, turn=turn)
-            self.bus.task_end("done", answer, "agent_done")
-            return
 
     # ===================================================================== #
     # PLAN 阶段
@@ -1332,6 +1293,103 @@ class AgentCore:
     # 模型调用
     # ===================================================================== #
     # ===================================================================== #
+    # 消息历史持久化（M1）
+    # ===================================================================== #
+    async def _flush_history(self, state: TaskState) -> None:
+        """
+        把内存历史里**尚未落盘**的消息追加到存储。
+
+        ★ 语义：
+          · append-only 过程记录（不是内存历史的实时镜像）：
+            压缩发生时会追加 marker，而旧条目不会删除 —— 读回的是完整过程。
+          · 失败**不静默**：计入 state.history_persist_errors 并发事件；
+            不更新游标 → 下次 flush 自动重试（seq 不变，幂等覆盖）。
+          · 落盘内容是"模型看到了什么"，供诊断与未来恢复机制使用。
+        """
+        sink = self.history_sink
+        if sink is None:
+            return
+        pending = len(self._history) - self._history_persisted
+        if pending <= 0:
+            return
+        new_msgs = self._history[self._history_persisted:]
+        entries = messages_to_entries(new_msgs, start_seq=self._history_seq + 1)
+        try:
+            await sink.append(state.task_id, entries)
+        except Exception as exc:  # noqa: BLE001 —— 不让落盘失败中断任务
+            state.history_persist_errors += 1
+            log.warning("任务 %s 历史落盘失败（%d 条未持久化）：%s",
+                        state.task_id, pending, exc)
+            self.bus.error(
+                "history_persist_failed",
+                f"历史落盘失败（第 {state.history_persist_errors} 次，{pending} 条暂存内存）",
+                fatal=False, turn=state.turn,
+            )
+            return
+        self._history_seq += len(entries)
+        self._history_persisted = len(self._history)
+
+    async def _persist_marker(self, state: TaskState, seq: int, note: str) -> None:
+        """往持久化日志追加一条系统 marker（压缩等编排事件的留痕）。失败不静默但不致命。"""
+        sink = self.history_sink
+        if sink is None:
+            return
+        entry = [{"seq": seq, "role": "system", "content": f"[编排事件] {note}",
+                  "reasoning": "", "tool_call_id": "", "tool_name": ""}]
+        try:
+            await sink.append(state.task_id, entry)
+        except Exception as exc:  # noqa: BLE001
+            state.history_persist_errors += 1
+            log.warning("任务 %s 历史事件落盘失败：%s", state.task_id, exc)
+
+    # --------------------------------------------------------------------- #
+    # 恢复安全边界（M1-C）：只读恢复，绝不自动续跑
+    # --------------------------------------------------------------------- #
+    def restore_history(self, state: TaskState, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        """
+        把持久化历史装载进内存，用于**诊断与未来恢复机制**。
+
+        ★ M1 的安全立场（必须如实理解）：
+          · 装载历史 ≠ 可以安全续跑。原因：
+            ① 消息缺口 = 工具可能已执行而结果未保存 → 重复执行有副作用风险；
+            ② 等待中的审批状态不在历史里（审批是内存 Future）；
+            ③ 工具副作用（文件系统）无法从消息重建。
+          · 因此本方法**只装配历史并给出诊断报告**，不改任务状态、不触发任何
+            工具调用、不解除任何闸门。真正的安全续跑属于后续阶段
+            （需要：工具结果持久化 + 副作用对账 + 审批状态持久化）。
+
+        返回 RestoreReport：
+          loaded            装载的消息条数
+          tool_call_gaps    消息缺口清单（assistant 有 tool_calls 但 tool 结果不足）
+          safe_to_resume    M1 恒为 False（除非历史为空）
+          reasons           为什么不能自动续跑
+        """
+        messages = entries_to_messages(entries)
+        gaps = find_tool_call_gaps(messages)
+        reasons: list[str] = []
+        if gaps:
+            reasons.append(f"存在 {len(gaps)} 处消息缺口（工具可能已执行但结果未保存）")
+        if messages and messages[-1].role != "assistant":
+            reasons.append("最后一条不是 assistant 消息，执行位置不明确")
+        if entries:
+            reasons.append("工具副作用与审批状态无法从消息历史重建（M1 边界）")
+        safe = not reasons and not messages
+
+        marker = Message.system(
+            f"[恢复] 已从持久化历史装载 {len(messages)} 条消息"
+            f"（M1：仅供诊断，不会自动续跑；安全结论见 RestoreReport）"
+        )
+        self._history = [marker] + messages
+        self._history_persisted = len(self._history)
+        self._history_seq = (max((int(e.get("seq") or 0) for e in entries), default=0))
+        return {
+            "loaded": len(messages),
+            "tool_call_gaps": gaps,
+            "safe_to_resume": safe,
+            "reasons": reasons,
+        }
+
+    # ===================================================================== #
     # 上下文压缩接线（第五批）
     # ===================================================================== #
     async def _prepare_messages(
@@ -1365,6 +1423,10 @@ class AgentCore:
                 phase_hint=phase_hint,
             )
 
+        # ---- 历史落盘（M1）：每轮构建消息前，把新追加的消息刷进存储 ------
+        # 放在这里而不是各 append 点：一次覆盖全部追加路径，顺序有保证。
+        await self._flush_history(state)
+
         # ---- 已读文件清单（第六批）：让模型知道自己手里有什么 ------------
         state.read_index = self._build_read_index(state)
 
@@ -1390,6 +1452,12 @@ class AgentCore:
             return msgs
 
         self._history = outcome.new_history
+        # 压缩是历史日志里的一个事件：追加 marker，让持久化日志与内存演进对得上
+        self._history_seq += 1
+        await self._persist_marker(state, self._history_seq,
+                                   f"上下文已压缩（保留最近 {outcome.kept_turns} 轮，"
+                                   f"{outcome.summarized_turns} 轮转为摘要）")
+        self._history_persisted = len(self._history)
         log.info(
             "任务 %s 上下文已压缩：%s（%d→%d 消息，%d→%d 字符，保留 %d 轮，降级=%s）",
             state.task_id, outcome.reason,
@@ -1485,6 +1553,106 @@ class AgentCore:
             label, extend = "unknown", False
 
         return {"label": label, "extend": extend and not state.budget_extended}
+
+
+    async def _finalize_text_reply(self, state: TaskState, reply: Any) -> str:
+        """
+        分支 B：模型直接给文本 → 收尾处理（M2 提取，legacy 与 graph 共用）。
+
+        返回路由："continue"（回灌后继续执行）| "stop"（任务已收尾）。
+        ★ 提取时不改任何行为：这里的代码就是 legacy _loop 分支 B 的原样搬迁，
+          两种编排器走同一份逻辑 → 安全行为不可能分叉。
+        """
+        turn = state.turn
+        # ★ 先看这是不是"REFLECT 形状"的输出（progress/next_action/done）：
+        #   是的话它不是答复，不能收尾 —— done:false 记成 done 是虚假完成。
+        reflect_obj = _as_reflect_payload(reply.content)
+        if reflect_obj is not None:
+            self._history.append(Message.assistant(reply.content, reasoning=reply.reasoning))
+            if reflect_obj.get("done"):
+                self._history.append(Message.user(
+                    "[系统] 你给的是进展汇报，不是给用户的最终答复。"
+                    "请直接输出最终答复正文（说明做了什么、结果如何、还有什么没做完）。"
+                ))
+            else:
+                nxt = str(reflect_obj.get("next_action") or reflect_obj.get("progress") or "").strip()
+                self._history.append(Message.user(
+                    f"[系统] 继续执行：{nxt}" if nxt else
+                    "[系统] 你还没有完成本次任务，请继续调用工具推进。"
+                ))
+            self.bus.error(
+                "reflect_as_answer",
+                "模型交上来的是进展汇报（REFLECT 格式），已按'继续执行'处理",
+                fatal=False,
+                turn=turn,
+            )
+            return "continue"
+
+        answer = extract_text_answer(reply.content)
+
+        if not answer.strip():
+            # 既没工具调用也没正文 → 空回复，收尾
+            if state.evidence_summary:
+                # ★ 不是直接落模板 —— 已经收集到证据，就该让模型真正作答。
+                #   走 _final_phase 时它自己会 finish + 发 final_answer/task_end。
+                self.bus.error(
+                    "empty_reply",
+                    "模型未给出正文，转为收尾作答",
+                    fatal=False,
+                    turn=turn,
+                )
+                await self._final_phase(state, reason="no_more_actions")
+            else:
+                state.finish(
+                    TaskStatus.ABORTED,
+                    "模型没有给出任何内容，也没有调用工具。请换个说法重试，或检查模型配置。",
+                    "empty_reply",
+                )
+                self.bus.final_answer(state.final_answer, turn=turn)
+                self.bus.task_end("aborted", state.final_answer, state.end_reason)
+            return "stop"
+
+        # ---- 证据闸门（C3）------------------------------------------
+        if not state.has_enough_evidence() and state.budgets.min_evidence > 0:
+            # 模型急着答，但还没观测过环境 → 不采纳，提示它先看
+            self.bus.error(
+                "insufficient_evidence",
+                f"模型在没有任何观测的情况下试图作答，已驳回（需至少 {state.budgets.min_evidence} 条证据）",
+                fatal=False,
+                turn=turn,
+            )
+            self._history.append(Message.assistant(reply.content, reasoning=reply.reasoning))
+            self._history.append(
+                Message.user(
+                    "[系统] 你还没有实际查看过任何内容，不能直接下结论。"
+                    "请先调用工具观测工作区，再给出结论。"
+                )
+            )
+            return "continue"
+
+        # ---- FINAL --------------------------------------------------
+        # ★ 完成验证闸门：模型说"完事了"不算数，先看最后一次执行过没过。
+        gate, detail = await self._verification_gate(state)
+        if gate == "reject":
+            self.bus.error("unverified_completion", detail, fatal=False, turn=turn)
+            self._history.append(Message.assistant(reply.content, reasoning=reply.reasoning))
+            self._history.append(Message.user(detail))
+            return "continue"
+        if gate == "fail":
+            answer = self._stamp_unverified(answer, detail)
+            state.finish(TaskStatus.ABORTED, answer, "verification_failed")
+            self.bus.final_answer(answer, turn=turn)
+            self.bus.task_end("aborted", answer, "verification_failed")
+            return "stop"
+
+        answer = self._note_incomplete_steps(state, answer)
+        answer = self._note_verification(state, answer, TaskStatus.DONE)
+        # M1：最终答复也进入历史（任务结束 → 持久化历史完整）
+        self._history.append(Message.assistant(answer))
+        state.finish(TaskStatus.DONE, answer, "agent_done")
+        self.bus.final_answer(answer, turn=turn)
+        self.bus.task_end("done", answer, "agent_done")
+        return "stop"
 
     async def _call_model(self, msgs: list[Message], *, turn: int, allow_tools: bool):
         """

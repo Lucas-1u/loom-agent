@@ -132,6 +132,57 @@ class TaskStore:
             with conn:
                 yield conn
 
+    # ------------------------------------------------------------------ #
+    # 消息历史（M1）：append-only，按 (task_id, seq) 幂等
+    # ------------------------------------------------------------------ #
+    def append_history_sync(self, task_id: str, entries: list[dict[str, Any]]) -> int:
+        """
+        追加历史条目。重复写同一 (task_id, seq) 会**覆盖** —— 幂等语义，
+        供"重放同一段历史"与部分失败后的补写使用。返回写入条数。
+        """
+        if not entries:
+            return 0
+        now = time.time()
+        with self._tx() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO task_history"
+                " (task_id, seq, role, content, reasoning, tool_call_id, tool_name,"
+                "  tool_calls_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (task_id, int(e["seq"]), str(e.get("role") or ""),
+                     str(e.get("content") or ""), str(e.get("reasoning") or ""),
+                     str(e.get("tool_call_id") or ""), str(e.get("tool_name") or ""),
+                     str(e.get("tool_calls_json") or ""), now)
+                    for e in entries
+                ],
+            )
+        return len(entries)
+
+    def load_history_sync(self, task_id: str) -> list[dict[str, Any]]:
+        """按 seq 升序读取某任务的全部历史条目。"""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT seq, role, content, reasoning, tool_call_id, tool_name,"
+                " tool_calls_json, created_at"
+                " FROM task_history WHERE task_id = ? ORDER BY seq ASC",
+                (task_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def history_count_sync(self, task_id: str) -> int:
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM task_history WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    async def append_history(self, task_id: str, entries: list[dict[str, Any]]) -> int:
+        return await asyncio.to_thread(self.append_history_sync, task_id, entries)
+
+    async def load_history(self, task_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self.load_history_sync, task_id)
+
     def close_sync(self) -> None:
         """
         关闭连接（进程退出 / 测试清理时调用）。
@@ -192,6 +243,20 @@ class TaskStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_idem_created
                       ON idempotency(created_at);
+
+                    -- M1：消息历史（append-only 过程记录，按 (task_id, seq) 幂等）
+                    CREATE TABLE IF NOT EXISTS task_history (
+                      task_id     TEXT NOT NULL,
+                      seq         INTEGER NOT NULL,
+                      role        TEXT NOT NULL,
+                      content     TEXT NOT NULL DEFAULT '',
+                      reasoning   TEXT NOT NULL DEFAULT '',
+                      tool_call_id TEXT NOT NULL DEFAULT '',
+                      tool_name   TEXT NOT NULL DEFAULT '',
+                      tool_calls_json TEXT NOT NULL DEFAULT '',
+                      created_at  REAL NOT NULL,
+                      PRIMARY KEY (task_id, seq)
+                    );
                     """
                 )
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
