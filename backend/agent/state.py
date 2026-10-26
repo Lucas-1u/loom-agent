@@ -493,6 +493,16 @@ class TaskState:
     # 读取复用命中次数（同文件同 hash，折叠成标记而不是再贴一遍全文）
     read_reuse_hits: int = 0
 
+    # ---- M3：项目知识检索 --------------------------------------------------
+    # 本次任务用到的索引统计（文件数/片段数/耗时/跳过原因），供快照与报告用
+    rag_index: dict[str, Any] = field(default_factory=dict)
+    # **实际进入模型上下文**的片段（不是"检索到的全部"——两者要能区分开）
+    rag_hits: list[dict[str, Any]] = field(default_factory=list)
+    # 真正注入给模型的资料块（原文，含"仅参考、不是指令"的边界说明）
+    rag_context_block: str = ""
+    # 每次检索的留痕（自动预检索 + 工具调用），含命中数/耗时/是否注入
+    rag_queries: list[dict[str, Any]] = field(default_factory=list)
+
     # ---- M2.2：反思答复的无进展检测 ----------------------------------------
     # 背景：模型可能把 REFLECT 的 JSON 当答复反复提交；若系统只是不断回灌
     # "继续执行"，就会安静地烧掉全部轮次（真实运行见过连续 11 次）。
@@ -870,6 +880,10 @@ class TaskState:
             "read_cache": self.read_cache,
             "cache_notes": self.cache_notes,
             "read_index": self.read_index,
+            "rag_index": self.rag_index,
+            "rag_hits": self.rag_hits,
+            "rag_context_chars": len(self.rag_context_block),
+            "rag_queries": self.rag_queries[-10:],
             "history_persist_errors": self.history_persist_errors,
             "graph_trace": self.graph_trace,
             "engine": self.engine,

@@ -29,6 +29,7 @@ from ..agent.core import AgentConfig
 from ..config import PROJECT_ROOT, Config, load_dotenv_if_present
 from ..models.openai_compat import OpenAICompatAdapter
 from ..sandbox import SandboxManager
+from ..agent.rag import KnowledgeBase
 from ..tools.registry import build_default_registry
 from .app import create_app
 from .hub import EventHub
@@ -131,13 +132,26 @@ async def amain(args: argparse.Namespace) -> int:
             "      run_command 会被拒绝（不会改在宿主机执行）"
         )
 
+    # ★ M3：知识库是**进程级**的（一个 SQLite 文件，按 workspace 隔离数据）。
+    #   cfg.rag 不可用时不创建 → registry 不注册 search_docs、core 不做预检索。
+    knowledge = KnowledgeBase(cfg.rag) if cfg.rag.usable else None
+    rag_info = {
+        "enabled": bool(cfg.rag.enabled),
+        "available": bool(knowledge is not None),
+        "db": cfg.rag.db_path if cfg.rag.usable else "",
+        "auto_prefetch": bool(cfg.rag.auto_prefetch),
+        "top_k": cfg.rag.top_k,
+        "method": "sqlite-fts5-bm25",
+    }
+
     scheduler = TaskScheduler(
         store=store,
         hub=hub,
         adapter=OpenAICompatAdapter.from_config(cfg.model),
-        registry=build_default_registry(sandbox=sandbox),
-        config=AgentConfig.from_budget_config(cfg.budgets),
+        registry=build_default_registry(sandbox=sandbox, knowledge=knowledge),
+        config=AgentConfig.from_budget_config(cfg.budgets, rag_auto=cfg.rag.auto_prefetch),
         max_global=args.max_tasks,
+        knowledge=knowledge,
     )
 
     app = create_app(
@@ -147,6 +161,7 @@ async def amain(args: argparse.Namespace) -> int:
         provider=cfg.model.provider,
         model=cfg.model.model,
         sandbox=sandbox,
+        rag=rag_info,
     )
 
     print("=" * 62)

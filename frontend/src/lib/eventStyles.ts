@@ -55,6 +55,8 @@ export const EVENT_STYLES: Record<EventType, EventVisualStyle> = {
   error:               { label: "错误",     tone: "red",    icon: "✕", emphasis: true },
   "budget.exceeded":   { label: "预算耗尽", tone: "red",    icon: "⊘", emphasis: true },
   "context.compacted": { label: "上下文压缩", tone: "violet", icon: "⤓" },
+  "rag.retrieve":      { label: "检索资料", tone: "violet", icon: "⌕" },
+  "rag.result":        { label: "检索结果", tone: "cyan",   icon: "◈" },
   "state.snapshot":    { label: "状态快照", tone: "slate",  icon: "▤" },
 };
 

@@ -321,6 +321,60 @@ class SandboxConfig:
 
 
 # --------------------------------------------------------------------------- #
+# 项目知识检索（M3）
+# --------------------------------------------------------------------------- #
+def default_index_path() -> str:
+    """索引库默认位置：`sandbox/index/knowledge.db`（运行期产物，不进版本库）。"""
+    return str(PROJECT_ROOT / "sandbox" / "index" / "knowledge.db")
+
+
+@dataclass
+class RagConfig:
+    """
+    检索配置。
+
+    ★ enabled 与 db_path 是两件事：
+      · enabled=False       → 整个能力关闭（不建库、不注册工具、不预检索）
+      · db_path=""          → 视为不可用（多为测试/只读场景显式关掉）
+    这两条都要能被环境变量控制，否则"临时关掉检索"就得改代码。
+
+    ★ auto_prefetch 控制"任务开始时是否自动检索用户目标"：
+      关掉后只剩 search_docs 工具（由模型按需调用）——这是 A/B 对比的开关。
+    """
+
+    enabled: bool = True
+    db_path: str = field(default_factory=default_index_path)
+    auto_prefetch: bool = True
+    top_k: int = 4
+    max_chars_per_hit: int = 700
+    max_context_chars: int = 2_600
+    chunk_chars: int = 1_200
+    max_chunks_per_file: int = 60
+    max_file_bytes: int = 262_144
+    max_files: int = 400
+
+    @property
+    def usable(self) -> bool:
+        """是否真的可用：既要启用，也要有库路径（空路径视为关闭）。"""
+        return self.enabled and bool(self.db_path)
+
+    @classmethod
+    def from_env(cls) -> "RagConfig":
+        return cls(
+            enabled=_env("LOOM_RAG", "1").lower() not in ("0", "false", "off", "no"),
+            db_path=_env("LOOM_RAG_DB", default_index_path()),
+            auto_prefetch=_env("LOOM_RAG_AUTO", "1").lower() not in ("0", "false", "off", "no"),
+            top_k=max(1, _env_int("LOOM_RAG_TOP_K", 4)),
+            max_chars_per_hit=max(120, _env_int("LOOM_RAG_HIT_CHARS", 700)),
+            max_context_chars=max(300, _env_int("LOOM_RAG_CONTEXT_CHARS", 2_600)),
+            chunk_chars=max(300, _env_int("LOOM_RAG_CHUNK_CHARS", 1_200)),
+            max_chunks_per_file=max(1, _env_int("LOOM_RAG_CHUNKS_PER_FILE", 60)),
+            max_file_bytes=max(4096, _env_int("LOOM_RAG_MAX_FILE_KB", 256) * 1024),
+            max_files=max(1, _env_int("LOOM_RAG_MAX_FILES", 400)),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # 总配置
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -329,6 +383,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig.from_env)
     budgets: BudgetConfig = field(default_factory=BudgetConfig.from_env)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig.from_env)
+    rag: RagConfig = field(default_factory=RagConfig.from_env)
     log_level: str = "INFO"
 
     @classmethod
@@ -339,6 +394,7 @@ class Config:
             model=ModelConfig.from_env(provider),
             budgets=BudgetConfig.from_env(),
             sandbox=SandboxConfig.from_env(),
+            rag=RagConfig.from_env(),
             log_level=_env("LOOM_LOG_LEVEL", "INFO"),
         )
 

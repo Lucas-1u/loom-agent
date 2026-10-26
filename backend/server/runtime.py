@@ -58,6 +58,7 @@ class TaskRuntime:
         config: AgentConfig,
         hub: EventHub,
         store: TaskStore,
+        knowledge: object | None = None,
         allowed_paths: list[str] | None = None,
         forbidden_paths: list[str] | None = None,
     ) -> None:
@@ -81,6 +82,8 @@ class TaskRuntime:
             adapter, registry, config=config, bus=self.bus, approvals=self.approvals,
             # M1：消息历史随任务持久化（store.task_history）
             history_sink=StoreHistorySink(self._store),
+            # M3：项目知识检索（不传则无 RAG）
+            knowledge=knowledge,
         )
 
         # ---- 服务层状态 ----

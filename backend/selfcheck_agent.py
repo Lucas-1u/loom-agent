@@ -1762,6 +1762,133 @@ async def test_plan_truth(sb: Sandbox) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [V2] 修复意图的"零工作"门禁（M3 收尾）
+# --------------------------------------------------------------------------- #
+async def test_repair_zero_work_gate(sb: Sandbox) -> None:
+    """
+    [V2] 意图是 repair 时，"停下"不等于"修好"。
+
+    ★ 这条规则来自一次真实运行：模型空回复、零改动、零命令，
+      状态却是 done/no_more_actions，GUI 显示"完成"，答复自称"未修复"。
+    本组覆盖：
+      · 只观测后直接作答（零改动零命令）→ 不能 done
+      · 有观测 + 空回复（真实形态）→ 不能 done
+      · 零改动但有成功命令（证明问题不存在）→ 允许 done（不机械要求改动）
+      · 非修复任务 → 不受这条规则影响
+      · Graph 与 Legacy 行为一致
+    """
+    print("\n[V2] 修复意图的零工作门禁")
+
+    # ---- V2.1 只读 + 文本答复：零改动零命令 → 不能 done ----
+    stub1 = StubRunTool([0])
+    ad1 = FakeAdapter([
+        ModelReply(tool_calls=[tc("z1", "list_files", {"path": "."})]),
+        ModelReply(content="我看了一下，应该没问题。"),
+        ModelReply(content="确实没问题。"),
+    ])
+    bus1 = EventBus()
+    ev1 = collect(bus1)
+    core1 = AgentCore(
+        ad1, _gate_registry(stub1),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=bus1,
+    )
+    st1 = await core1.run("修好 app.py 里的 bug", workspace=sb.dir)
+    await bus1.drain()
+    check(st1.intent == "repair", f"意图识别为 repair（{st1.intent}）")
+    check(st1.status is TaskStatus.ABORTED,
+          f"★ 零改动零命令 → aborted 而不是 done（{st1.status.value}）")
+    check(st1.end_reason == "verification_failed",
+          f"★ 结束原因是 verification_failed（{st1.end_reason}）")
+    check("没有文件改动" in st1.final_answer and "验证命令" in st1.final_answer,
+          "答复写明了判据（零改动 + 零命令）")
+    check(any(e.type == EventType.ERROR and e.data.get("kind") == "unverified_completion"
+              for e in ev1), "发出了 unverified_completion 事件")
+    check(stub1.calls == 0, "确实没有执行过命令")
+
+    # ---- V2.2 有观测 + 空回复（真实踩到的形态）→ 不能 done ----
+    stub2 = StubRunTool([0])
+    ad2 = FakeAdapter([
+        ModelReply(tool_calls=[tc("y1", "list_files", {"path": "."})]),
+        ModelReply(content=""),
+        ModelReply(content=""),
+    ])
+    bus2 = EventBus()
+    ev2 = collect(bus2)
+    core2 = AgentCore(
+        ad2, _gate_registry(stub2),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=bus2,
+    )
+    st2 = await core2.run("修复 app.py 里的 bug", workspace=sb.dir)
+    await bus2.drain()
+    check(st2.status is TaskStatus.ABORTED,
+          f"★ 空回复 + 零改动 → aborted（{st2.status.value}）")
+    check(st2.end_reason == "verification_failed",
+          f"★ 原因不是 no_more_actions/agent_done（{st2.end_reason}）")
+    check(any(e.type == EventType.ERROR and e.data.get("kind") == "empty_reply" for e in ev2),
+          "仍然记录了 empty_reply（保留原始现象）")
+
+    # ---- V2.3 零改动 + 成功命令 → 允许 done（逃生口）----
+    stub3 = StubRunTool([0])
+    ad3 = FakeAdapter([
+        ModelReply(tool_calls=[tc("x1", "run_command", {"command": "pytest -q"})]),
+        ModelReply(content="跑了测试，本来就是通过的，不需要改动。"),
+    ])
+    bus3 = EventBus()
+    core3 = AgentCore(
+        ad3, _gate_registry(stub3),
+        config=AgentConfig(max_turns=6, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=bus3,
+    )
+    st3 = await core3.run("修好 app.py 里的 bug", workspace=sb.dir)
+    await bus3.drain()
+    check(stub3.calls == 1, f"命令执行了 1 次（{stub3.calls}）")
+    check(st3.status is TaskStatus.DONE,
+          f"★ 有验证命令时不机械要求改动（{st3.status.value}）")
+
+    # ---- V2.4 非修复任务不受影响 ----
+    stub4 = StubRunTool([0])
+    ad4 = FakeAdapter([
+        ModelReply(tool_calls=[tc("w1", "list_files", {"path": "."})]),
+        ModelReply(content="目录里有 main.py 和 README.md。"),
+    ])
+    bus4 = EventBus()
+    core4 = AgentCore(
+        ad4, _gate_registry(stub4),
+        config=AgentConfig(max_turns=5, min_evidence=1, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=bus4,
+    )
+    st4 = await core4.run("看一下这个项目里有什么", workspace=sb.dir)
+    await bus4.drain()
+    check(st4.intent != "repair", f"非修复意图（{st4.intent}）")
+    check(st4.status is TaskStatus.DONE, f"★ 非修复任务照常 done（{st4.status.value}）")
+
+    # ---- V2.5 Graph 同源：空回复 + 零改动 也是 aborted ----
+    stub5 = StubRunTool([0])
+    ad5 = FakeAdapter([
+        ModelReply(tool_calls=[tc("v1", "list_files", {"path": "."})]),
+        ModelReply(content=""),
+        ModelReply(content=""),
+    ])
+    core5 = AgentCore(
+        ad5, _gate_registry(stub5),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1,
+                           orchestrator="graph"),
+        bus=EventBus(),
+    )
+    st5 = await core5.run("修复 app.py 里的 bug", workspace=sb.dir)
+    check(st5.engine == "graph", f"引擎标注（{st5.engine}）")
+    check(st5.status is TaskStatus.ABORTED and st5.end_reason == "verification_failed",
+          f"★ graph 与 legacy 一致（{st5.status.value}/{st5.end_reason}）")
+
+
+# --------------------------------------------------------------------------- #
 # [S] 改动范围审计
 # --------------------------------------------------------------------------- #
 class _StubWriter(Tool):
@@ -1967,6 +2094,7 @@ async def main() -> int:
         await test_termination(sb)
         await test_robustness(sb)
         await test_verification_gate(sb)
+        await test_repair_zero_work_gate(sb)
         await test_plan_truth(sb)
         await test_scope_audit(sb)
         await test_intent(sb)
@@ -2883,6 +3011,10 @@ async def test_compaction(sb: Sandbox) -> None:
     check(need2, f"★ 达到阈值触发压缩（{reason2}）")
 
     # ---- 4. 端到端：压缩真的发生在 Agent Loop 里 ----
+    # ★ M3 收尾：这里必须**订阅事件总线**，否则 context.compacted 发没发都测不出来
+    #   （旧实现只断言 compaction_log，把 bus.context_compacted(...) 整行删掉也全绿）。
+    bus4 = EventBus()
+    ev4 = collect(bus4)
     core = _SummaryCore(
         FakeAdapter([
             ModelReply(content='{"steps":[{"title":"a"}],"note":""}'),
@@ -2894,9 +3026,29 @@ async def test_compaction(sb: Sandbox) -> None:
         build_default_registry(),
         config=AgentConfig(max_turns=8, min_evidence=0, use_reflect_phase=False,
                            compact_max_chars=400, compact_keep_turns=1),
-        bus=EventBus(),
+        bus=bus4,
     )
     st2 = await core.run("读一下 main.py", workspace=sb.dir)
+    await bus4.drain()
+    compact_events = [e for e in ev4 if e.type == EventType.CONTEXT_COMPACTED.value]
+    # ★ 断言的锚点是"成功压缩几次就该发几个事件"，而不是硬编码 1：
+    #   历史一旦反复超阈值，压缩会在后续每次构建时再次发生（本例 3 次）。
+    triggered_in_log = [c for c in st2.compaction_log if c.get("triggered")]
+    check(len(compact_events) == len(triggered_in_log) and compact_events,
+          f"★ 每次成功压缩都发出 1 个事件（事件 {len(compact_events)} / 成功压缩 {len(triggered_in_log)}）")
+    if compact_events:
+        payload = compact_events[0].data
+        required = {"triggered", "reason", "before", "after", "kept_turns",
+                    "summarized_turns", "degraded"}
+        check(required <= set(payload),
+              f"★ 事件载荷含契约字段（缺 {sorted(required - set(payload)) or '无'}）")
+        check(payload.get("triggered") is True, "载荷标明 triggered=true")
+        check(payload["after"]["chars"] < payload["before"]["chars"],
+              f"载荷里的前后规模正确（{payload['before']['chars']} → {payload['after']['chars']}）")
+    else:
+        check(False, "★ 事件载荷含契约字段（事件缺失）")
+        check(False, "载荷标明 triggered=true（事件缺失）")
+        check(False, "载荷里的前后规模正确（事件缺失）")
     check(bool(st2.compaction_log), "★ 压缩在真实运行中发生过")
     rec = st2.compaction_log[-1]
     check(rec["triggered"], "★ 压缩被触发")
@@ -2986,13 +3138,20 @@ async def test_budget_and_read_index(sb: Sandbox) -> None:
     reg = ToolRegistry()
     reg.register(build_default_registry().get("read_file"), group="readonly")
     reg.register(build_default_registry().get("list_files"), group="readonly")
+    # ★ M3 收尾：这个用例的目标是"续期后能完成"，但目标是 repair。
+    #   新门禁要求 repair 必须有改动或验证命令才算完成，所以这里补上
+    #   真实的 edit + 成功命令（断言没有放宽，反而更接近真实修复闭环）。
+    reg.register(StubEditTool(), group="mutating")
+    reg.register(StubRunTool([0]), group="exec")
     core = AgentCore(
         FakeAdapter([
             ModelReply(content='{"steps":[{"title":"修","check":"change"}],"note":""}'),
             ModelReply(tool_calls=[tc("b1", "read_file", {"path": "main.py"})]),
             ModelReply(tool_calls=[tc("b2", "read_file", {"path": "README.md"})]),
             ModelReply(tool_calls=[tc("b3", "read_file", {"path": "requirements.txt"})]),
-            ModelReply(content="读完了，main.py 内容是 hello。"),
+            ModelReply(tool_calls=[tc("b4", "edit_file", {"path": "main.py"})]),
+            ModelReply(tool_calls=[tc("b5", "run_command", {"command": "pytest -q"})]),
+            ModelReply(content="读完了，修好并跑过测试。"),
         ]),
         reg,
         config=AgentConfig(max_turns=3, min_evidence=0, use_reflect_phase=False,

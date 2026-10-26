@@ -23,6 +23,8 @@ venv/
 .loom_last_workspace
 
 # ---- 沙箱 / 真实模型跑批的输出 ----
+# ---- M3：项目知识索引（运行期产物，别进版本库）----
+sandbox/index/
 sandbox/live/
 sandbox/*.bin
 sandbox/*.log

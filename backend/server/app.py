@@ -126,6 +126,7 @@ def create_app(
     provider: str = "",
     model: str = "",
     sandbox: Any = None,
+    rag: dict[str, Any] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Loom Agent Server", version="0.1.0")
 
@@ -156,7 +157,8 @@ def create_app(
         return {
             "ok": True,
             "version": "0.1.0",
-            "phase": "3b",
+            # 开发阶段标识（M3 收尾时校准；前端不用它做分支判断）
+            "phase": "M3",
             "provider": provider,
             "model": model,
             "time": time.time(),
@@ -165,6 +167,8 @@ def create_app(
             # 命令沙箱状态：available=false 时 run_command 会被明确拒绝
             # （不会降级到宿主机执行）。null 表示当前进程没有装配沙箱。
             "sandbox": _sandbox_info(sandbox),
+            # M3：项目知识检索（enabled/available/db/method）—— 前端据此提示"检索不可用"
+            "rag": rag,
         }
 
     # ===================================================================== #

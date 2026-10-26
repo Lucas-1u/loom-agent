@@ -305,6 +305,78 @@ function EventBody({
         </p>
       );
 
+    case "rag.retrieve": {
+      const index = (d.index as Record<string, unknown>) ?? {};
+      return (
+        <div className="space-y-1.5">
+          <p className="selectable text-[13px] leading-relaxed text-slate-200">
+            查询：<span className="font-mono text-tone-cyan">{String(d.query ?? "")}</span>
+          </p>
+          <div className="flex flex-wrap gap-x-4 gap-y-0.5">
+            <Meta
+              k="模式"
+              v={d.mode === "auto" ? "任务开始自动检索" : "Agent 主动检索"}
+            />
+            <Meta k="返回上限" v={String(d.k ?? "")} />
+          </div>
+          {index.files !== undefined && (
+            <Meta
+              k="索引"
+              v={`${String(index.files ?? 0)} 文件 / ${String(index.chunks ?? 0)} 片段`}
+              mono
+            />
+          )}
+        </div>
+      );
+    }
+
+    case "rag.result": {
+      const hits = (d.hits as Array<Record<string, unknown>>) ?? [];
+      const count = Number(d.count ?? hits.length);
+      const injected = Boolean(d.injected);
+      const reason = String(d.reason ?? "");
+      const error = String(d.error ?? "");
+      return (
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-center gap-2 text-[12.5px] text-slate-300">
+            <span>{count > 0 ? `命中 ${count} 条资料` : "没有命中资料"}</span>
+            <span className="font-mono text-[10.5px] text-slate-500">
+              {String(d.elapsed_ms ?? 0)}ms
+            </span>
+            {/* ★ 三个层次要分清：检索到（count）/ 提供给了模型（injected）/ 最终引用（在答复里）*/}
+            <span
+              className={`rounded px-1 py-px text-[10px] ${
+                injected
+                  ? "bg-tone-green/15 text-tone-green"
+                  : "bg-ink-800 text-slate-500"
+              }`}
+            >
+              {injected ? "已进入模型上下文" : "未进入上下文"}
+            </span>
+          </div>
+          {error && <p className="text-[11.5px] text-tone-red">检索失败：{error}</p>}
+          {!error && count === 0 && reason && (
+            <p className="text-[11px] text-slate-500">
+              原因：{reason === "no_hit" ? "索引里没有匹配的词" : reason}
+            </p>
+          )}
+          {hits.length > 0 && (
+            <ul className="space-y-0.5">
+              {hits.map((h, i) => (
+                <li key={i} className="flex items-baseline gap-2 text-[11.5px]">
+                  <span className="shrink-0 font-mono text-slate-600">[{i + 1}]</span>
+                  <span className="selectable break-all font-mono text-tone-cyan">
+                    {String(h.locator ?? h.path ?? "")}
+                  </span>
+                  <span className="truncate text-slate-500">{String(h.title ?? "")}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+    }
+
     default:
       return (
         <pre className="selectable overflow-x-auto font-mono text-[11px] text-slate-500">

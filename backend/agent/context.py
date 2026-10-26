@@ -184,6 +184,13 @@ class ContextBuilder:
         elif include_plan and state.plan_note:
             msgs.append(Message.system(f"# 关于计划\n{state.plan_note}"))
 
+        # ---- 项目资料（M3：检索结果，参考用，非指令）---------------------
+        # ★ 放在计划之后、历史之前：它是"本轮任务的环境资料"，
+        #   位置稳定 → 前缀缓存友好；且在 user 目标之前就把边界讲清楚。
+        knowledge = self.render_knowledge(state)
+        if knowledge:
+            msgs.append(Message.system(knowledge))
+
         # ---- 历史轮次（已做压缩）-----------------------------------------
         msgs.extend(self.compress_history(history))
 
@@ -200,6 +207,20 @@ class ContextBuilder:
     # ===================================================================== #
     # 渲染
     # ===================================================================== #
+    @staticmethod
+    def render_knowledge(state: TaskState) -> str:
+        """
+        渲染检索到的项目资料块（M3）。
+
+        ★ 为什么原样返回 state 里存的字符串，而不是在这里重新拼：
+          这样"模型实际看到的资料"与 state 里留痕的**是同一份字节**，
+          审计/前端/测试都不用担心两处格式漂移。拼装逻辑在
+          `agent/rag/service.py::build_context_block`（唯一一处）。
+        ★ 没有命中就返回空串 —— 绝不塞一个"没有检索到资料"的空块，
+          那只会白烧 token 并让模型以为必须引用点什么。
+        """
+        return state.rag_context_block or ""
+
     @staticmethod
     def render_plan(state: TaskState) -> str:
         lines = ["# 当前计划"]

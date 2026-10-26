@@ -59,6 +59,7 @@ class TaskScheduler:
         registry: ToolRegistry,
         config: AgentConfig,
         max_global: int = DEFAULT_MAX_GLOBAL,
+        knowledge: object | None = None,
     ) -> None:
         self._store = store
         self._hub = hub
@@ -66,6 +67,8 @@ class TaskScheduler:
         self._registry = registry
         self._config = config
         self._max_global = max_global
+        # M3：项目知识库（同一进程内被所有任务共享；按 workspace 隔离数据）
+        self._knowledge = knowledge
 
         self._runtimes: dict[str, TaskRuntime] = {}
         self._session_of: dict[str, str] = {}
@@ -197,6 +200,7 @@ class TaskScheduler:
             config=self._config,
             hub=self._hub,
             store=self._store,
+            knowledge=self._knowledge,
         )
         self._runtimes[task_id] = rt
 

@@ -87,6 +87,13 @@ class EventType(str, Enum):
     # ---- 上下文管理 ---------------------------------------------------------
     CONTEXT_COMPACTED = "context.compacted"  # 上下文被压缩（前后规模、降级情况）
 
+    # ---- 项目知识检索（M3）-------------------------------------------------
+    # ★ 两个事件成对出现：retrieve=开始（查询/模式/索引状态），result=结束（命中/耗时/是否注入）
+    #   分开的理由：检索可能很慢（首次建索引），前端要先看到"在检索"，
+    #   而不是干等一个 result。injected 字段回答"这批命中到底进没进模型上下文"。
+    RAG_RETRIEVE = "rag.retrieve"      # 开始检索
+    RAG_RESULT = "rag.result"          # 检索结束（含无结果/失败）
+
     # ---- 前端可用的辅助信号 -------------------------------------------------
     STATE_SNAPSHOT = "state.snapshot"  # 全量状态快照（重连/初始化时同步用）
 
@@ -368,6 +375,14 @@ class EventBus:
         return self.emit(
             Event.make(EventType.CONTEXT_COMPACTED, payload, turn=turn)
         )
+
+    def rag_retrieve(self, payload: dict[str, Any], turn: int = 0) -> Event:
+        """检索开始（查询、模式 auto|tool、索引统计）。"""
+        return self.emit(Event.make(EventType.RAG_RETRIEVE, payload, turn=turn))
+
+    def rag_result(self, payload: dict[str, Any], turn: int = 0) -> Event:
+        """检索结束（命中数、路径、耗时、是否注入、无结果原因）。"""
+        return self.emit(Event.make(EventType.RAG_RESULT, payload, turn=turn))
 
     def budget_exceeded(self, kind: str, limit: Any, used: Any, turn: int = 0) -> Event:
         return self.emit(

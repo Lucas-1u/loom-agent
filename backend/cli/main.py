@@ -103,6 +103,7 @@ async def run_one(
     cfg,
     args,
     index: int = 0,
+    knowledge=None,
 ) -> int:
     """
     跑一个任务。返回退出码。
@@ -141,7 +142,9 @@ async def run_one(
         stream=not args.no_stream,
     )
 
-    core = AgentCore(adapter, registry, config=agent_cfg, bus=bus, approvals=approvals)
+    agent_cfg.rag_auto = bool(getattr(cfg.rag, "auto_prefetch", True)) and knowledge is not None
+    core = AgentCore(adapter, registry, config=agent_cfg, bus=bus, approvals=approvals,
+                     knowledge=knowledge)
 
     # 审批输入与 Agent 并行运行
     attend_task = asyncio.create_task(approver.attend())
@@ -218,7 +221,12 @@ async def amain(args) -> int:
         return 3
 
     # ---- 工具 ----------------------------------------------------------
-    registry = build_default_registry(include_mutating=not args.readonly)
+    # M3：CLI 也走同一套知识库（不可用则 registry 里没有 search_docs）
+    from backend.agent.rag import KnowledgeBase
+    from backend.config import Config as _Cfg
+    _rag_cfg = _Cfg.load(args.model if getattr(args, "model", "") else "").rag
+    knowledge = KnowledgeBase(_rag_cfg) if _rag_cfg.usable else None
+    registry = build_default_registry(include_mutating=not args.readonly, knowledge=knowledge)
     if args.readonly:
         # 保险：即使 build 里有 bug，也强制剔除写工具
         for name in list(registry.names):
@@ -261,7 +269,8 @@ async def amain(args) -> int:
     # ---- 单次任务 ------------------------------------------------------
     if args.goal.strip():
         return await run_one(
-            args.goal.strip(), workspace=root, adapter=adapter, registry=registry, cfg=cfg, args=args
+            args.goal.strip(), workspace=root, adapter=adapter, registry=registry, cfg=cfg, args=args,
+            knowledge=knowledge,
         )
 
     # ---- 交互模式 ------------------------------------------------------
@@ -309,7 +318,8 @@ async def amain(args) -> int:
         idx += 1
         print()
         last_code = await run_one(
-            goal, workspace=root, adapter=adapter, registry=registry, cfg=cfg, args=args, index=idx
+            goal, workspace=root, adapter=adapter, registry=registry, cfg=cfg, args=args, index=idx,
+            knowledge=knowledge,
         )
         print()
 

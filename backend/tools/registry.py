@@ -156,17 +156,20 @@ def build_default_registry(
     *,
     include_mutating: bool = True,
     sandbox: "SandboxManager | None" = None,
+    knowledge: "KnowledgeBase | None" = None,
 ) -> ToolRegistry:
     """
     构建默认工具集。
 
-        readonly : list_files, read_file       （自动执行）
+        readonly : list_files, read_file (+ search_docs 仅在注入知识库时可用)
         mutating : write_file, edit_file       （需审批）
         exec     : run_command                 （需审批 + Docker 沙箱）
 
     参数 include_mutating 允许「只读模式」：实验时可一键关掉所有写/执行能力。
     sandbox 允许外部注入 SandboxManager（服务端统一管理容器生命周期；
     不传则工具自己建一个）。
+    knowledge 允许注入项目知识库（M3）：**不传就不注册 search_docs** ——
+    这样离线演示、单测、没开 RAG 的部署里，工具清单与以前完全一致。
     """
     from .readonly.list_files import make as make_list
     from .readonly.read_file import make as make_read
@@ -174,6 +177,9 @@ def build_default_registry(
     reg = ToolRegistry()
     reg.register(make_list(), group="readonly")
     reg.register(make_read(), group="readonly")
+    if knowledge is not None and getattr(knowledge, "usable", False):
+        from .readonly.search_docs import make as make_search
+        reg.register(make_search(knowledge), group="readonly")
 
     if include_mutating:
         from .exec.run_command import make as make_run

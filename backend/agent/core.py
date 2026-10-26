@@ -117,6 +117,12 @@ _STEP_CHECKS = ("observation", "change", "command_ok")
 _REFLECT_STREAK_RECOVER = 2
 _REFLECT_MAX_RECOVERIES = 1
 
+# 哪些意图算"必须拿出修复证据"的任务（M3 收尾）。
+# ★ 只放 repair：implementation / test_authoring 没有"可复现的原始失败"，
+#   机械要求改动会误伤（例如"帮我实现一个空函数"本来就可能不需要验证命令）。
+#   这也是第四批 §③ 证据关口只对 repair 生效的同一条理由。
+_REPAIR_INTENTS = ("repair",)
+
 _REFLECT_RECOVERY_PROMPT = (
     "[系统] 你刚刚又提交了一份进展汇报，而且自上一份以来**没有任何工具执行、"
     "没有新证据、计划也没有推进** —— 这不构成进展。\n"
@@ -159,6 +165,9 @@ class AgentConfig:
         budget_extend_enabled: bool = True,
         # ---- 编排引擎（M1）：legacy 默认；graph 未实现，配置层会拒绝 ----
         orchestrator: str = "legacy",
+        # ---- 项目知识检索（M3）：任务开始时是否自动检索用户目标 ----------
+        # 关掉后只剩 search_docs 工具（模型按需调用），用于 A/B 对比。
+        rag_auto: bool = True,
     ) -> None:
         self.max_turns = max_turns
         self.max_seconds = max_seconds
@@ -179,6 +188,7 @@ class AgentConfig:
         self.budget_extend_turns = budget_extend_turns
         self.budget_extend_enabled = budget_extend_enabled
         self.orchestrator = orchestrator
+        self.rag_auto = rag_auto
 
     @classmethod
     def from_budget_config(cls, b: Any, **overrides: Any) -> "AgentConfig":
@@ -342,6 +352,7 @@ class AgentCore:
         approvals: ApprovalManager | None = None,
         allowed_tools: set[str] | None = None,
         extra_rules: str = "",
+        knowledge: "KnowledgeBase | None" = None,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -353,6 +364,8 @@ class AgentCore:
         self.extra_rules = extra_rules
         # M1：历史落盘的抽象出口（runtime 传 StoreHistorySink；单测不传 → 不持久化）
         self.history_sink = history_sink
+        # M3：项目知识库（不传 = 没有 RAG；两条引擎共用同一份实现）
+        self.knowledge = knowledge
 
         # 运行期状态（每次 run 重置）
         self._state: TaskState | None = None
@@ -513,6 +526,7 @@ class AgentCore:
             workspace=root,
             tool_lines=tool_lines,
             extra_rules=self.extra_rules,
+            rag=self.knowledge is not None,
         )
 
         # ---- 开始 -------------------------------------------------------
@@ -523,6 +537,9 @@ class AgentCore:
         self.bus.task_start(state.goal, root, state.model)
         log.info("任务开始 %s：%s（工作区 %s，基线文件 %d 个）",
                  state.task_id, state.goal[:60], root, len(state.baseline_files))
+
+        # ---- M3：项目知识预检索（索引 + 一次检索，失败不影响任务）----------
+        await self._prefetch_knowledge(state)
 
         try:
             if self.config.orchestrator == "graph":
@@ -956,9 +973,20 @@ class AgentCore:
             )
 
         # ---- 执行 -------------------------------------------------------
+        # ★ M3：search_docs 的检索事件在这里发（工具的"开始/结束"与其它工具一致），
+        #   工具本身不持有 bus，事件形状由 core 统一保证。
+        is_rag = tc.name == "search_docs"
+        if is_rag:
+            self.bus.rag_retrieve(
+                {"query": str(tc.arguments.get("query") or ""), "mode": "tool",
+                 "k": tc.arguments.get("k") or 0, "index": state.rag_index},
+                turn=state.turn,
+            )
         t0 = time.time()
         res = await execute(self.registry, tc.name, tc.arguments, ctx)
         duration_ms = int((time.time() - t0) * 1000)
+        if is_rag:
+            self._note_rag_tool_result(state, tc, res, duration_ms)
 
         # ---- 留痕 -------------------------------------------------------
         state.record_tool_call(
@@ -1341,6 +1369,19 @@ class AgentCore:
             # 模型给了空回复 → 用记账兜底，但不假装它是完整结论
             answer = self._fallback_answer(state, reason, complete=True)
 
+        # ---- 完成门禁（M3 收尾）----------------------------------------
+        # ★ 为什么收尾阶段也要过闸门：
+        #   空回复路径（no_more_actions）以前**完全绕过**闸门，于是
+        #   "repair + 零改动 + 零命令" 会以 done 结束（2026-10-26 真实运行踩到）。
+        #   这里已经没有再跑一轮模型的余地，所以 reject/fail 一律按
+        #   未通过验证收尾：宁可显示"未通过验证"，也不谎报完成。
+        if status is TaskStatus.DONE:
+            gate, detail = await self._verification_gate(state)
+            if gate != "ok":
+                status = TaskStatus.ABORTED
+                reason = "verification_failed"
+                note = detail
+
         if status is not TaskStatus.DONE and note:
             # 未通过验证的收尾：把机器判据摆在模型自述前面，两者都保留
             answer = self._stamp_unverified(answer, note)
@@ -1453,6 +1494,119 @@ class AgentCore:
             "safe_to_resume": safe,
             "reasons": reasons,
         }
+
+    # ===================================================================== #
+    # 项目知识检索（M3）
+    # ===================================================================== #
+    async def _prefetch_knowledge(self, state: TaskState) -> None:
+        """
+        任务开始时：增量更新索引 + 用用户目标检索一次，命中就注入上下文。
+
+        ★ 为什么自动检索放在"任务开始"而不是每轮：
+          每轮都检索会 (a) 反复烧查询时间 (b) 把上下文越塞越乱。
+          开始一次覆盖"用户这句话问的是什么"；后续需要更多资料由模型
+          自己调 search_docs —— 两种入口共用同一个 KnowledgeBase。
+        ★ 失败处理：检索是**增强**，不是前置条件。索引建不起来就记事件、
+          把原因留在 state.rag_index，然后照常跑任务（不阻断）。
+        ★ 事件先 retrieve 后 result：前端能看到"正在检索"，而不是干等。
+        """
+        kb = self.knowledge
+        if kb is None or not getattr(kb, "usable", False) or not self.config.rag_auto:
+            return
+        goal = (state.goal or "").strip()
+        if not goal:
+            return
+
+        try:
+            stats = await asyncio.to_thread(kb.ensure_indexed, state.workspace)
+            state.rag_index = stats.to_dict()
+        except Exception as exc:  # noqa: BLE001 —— 索引失败不能拖垮任务
+            state.rag_index = {"error": f"{type(exc).__name__}: {exc}"}
+            self.bus.rag_result(
+                {"query": goal, "mode": "auto", "count": 0, "found": 0, "chars": 0,
+                 "elapsed_ms": 0, "reason": "index_error", "injected": False,
+                 "error": state.rag_index["error"], "hits": []},
+                turn=state.turn,
+            )
+            log.warning("任务 %s 建立索引失败：%s", state.task_id, exc)
+            return
+
+        await self._retrieve_and_inject(state, goal, mode="auto", k=kb.config.top_k)
+
+    async def _retrieve_and_inject(
+        self, state: TaskState, query: str, *, mode: str, k: int
+    ) -> None:
+        """检索一次并把结果写进 state（含事件留痕）。自动路径用。"""
+        kb = self.knowledge
+        if kb is None:
+            return
+        self.bus.rag_retrieve(
+            {"query": query, "mode": mode, "k": k, "index": state.rag_index},
+            turn=state.turn,
+        )
+        try:
+            outcome = await asyncio.to_thread(kb.retrieve, state.workspace, query, k=k)
+        except Exception as exc:  # noqa: BLE001
+            self.bus.rag_result(
+                {"query": query, "mode": mode, "count": 0, "found": 0, "chars": 0,
+                 "elapsed_ms": 0, "reason": "error", "injected": False,
+                 "error": f"{type(exc).__name__}: {exc}", "hits": []},
+                turn=state.turn,
+            )
+            return
+
+        injected = bool(outcome.hits)
+        payload = outcome.to_event()
+        payload.update(mode=mode, injected=injected)
+        self.bus.rag_result(payload, turn=state.turn)
+        state.rag_queries.append({
+            "query": query, "mode": mode, "count": len(outcome.hits),
+            "found": outcome.found, "chars": outcome.chars,
+            "elapsed_ms": outcome.elapsed_ms, "injected": injected,
+            "reason": outcome.reason,
+        })
+        if injected:
+            # ★ 只有"真的进了上下文"才记 rag_hits —— 与"检索到但没注入"区分开
+            state.rag_hits = [{**h.to_dict(), "text": h.text} for h in outcome.hits]
+            state.rag_context_block = kb.build_context_block(outcome)
+            log.info("任务 %s 预检索命中 %d 条（%d 字符），已注入上下文",
+                     state.task_id, len(outcome.hits), len(state.rag_context_block))
+
+    def _note_rag_tool_result(
+        self, state: TaskState, tc: ToolCall, res: ToolResult, duration_ms: int
+    ) -> None:
+        """
+        模型主动调用 search_docs 之后补一对 RAG 事件。
+
+        ★ 为什么在这里补，而不是让工具自己发事件：
+          工具是"无全局状态的纯组件"，不该持有 bus；事件统一由 core 发，
+          这样两种引擎、两条调用路径（自动/工具）的事件形状必然一致。
+        """
+        data = res.data if isinstance(res.data, dict) else {}
+        hits = data.get("hits") or []
+        payload = {
+            "query": data.get("query") or str(tc.arguments.get("query") or ""),
+            "mode": "tool",
+            "count": len(hits),
+            "found": data.get("found", len(hits)),
+            "chars": sum(len(str(h.get("text") or "")) for h in hits),
+            "elapsed_ms": data.get("elapsed_ms", duration_ms),
+            "reason": "" if hits else (data.get("reason") or "no_hit"),
+            "injected": bool(res.ok and hits),
+            "hits": [
+                {k: v for k, v in h.items() if k != "text"} for h in hits
+            ],
+        }
+        if not res.ok:
+            payload["reason"] = "error"
+            payload["error"] = (res.error or {}).get("message", res.summary)[:300]
+        self.bus.rag_result(payload, turn=state.turn)
+        state.rag_queries.append({
+            "query": payload["query"], "mode": "tool", "count": payload["count"],
+            "found": payload["found"], "chars": payload["chars"],
+            "elapsed_ms": payload["elapsed_ms"], "injected": payload["injected"],
+            "reason": payload["reason"],
+        })
 
     # ===================================================================== #
     # 上下文压缩接线（第五批）
@@ -2146,6 +2300,32 @@ class AgentCore:
                     "· 如果这是你要修复的问题 —— 请修复后用 run_command 重新验证；\n"
                     "· 如果这个失败本身无法修复、或正是用户要你报告的结果 —— "
                     "在答复里明确写清楚失败原因、已尝试的方案和现状，不要写成已修复。"
+                )
+            return "fail", detail
+
+        # ---- ②b 修复意图 + 零改动 + 零命令 = 未验证（M3 收尾）------------
+        # ★ 真实运行证据：意图 repair、模型空回复、没有改任何文件、没有跑任何命令，
+        #   最终却以 done 结束（GUI 显示"完成"，而答复自称"未修复"）。
+        #   原来的注释假设"没动过文件 = 观测/汇报型任务"，但 repair 不是观测任务：
+        #   停下不等于修好。所以这里先拦一次。
+        # ★ 为什么不机械要求"必须改文件"：如果任务本来就不需要改（问题不存在、
+        #   或已被别处修好），agent 应该**跑一条命令给出证据**（例如跑测试）。
+        #   命令一旦存在就不走这条分支，交给下面的证据/风险关口判断。
+        if (state.intent in _REPAIR_INTENTS
+                and not state.change_records
+                and not state.command_history):
+            detail = (
+                "意图是「修复」，但既没有文件改动，也没有任何验证命令 —— 无法证明问题已修复。"
+            )
+            if state.verification_retries < self.config.max_verification_retries:
+                state.verification_retries += 1
+                return "reject", (
+                    "[系统] 你停下来了，但系统没有看到任何文件改动，也没有看到验证命令。\n"
+                    "修复类任务不能只凭「我停下了」判定完成。二选一：\n"
+                    "· 真的去改：用 edit_file / write_file 修改目标文件，"
+                    "再用 run_command 跑能复现原始问题的命令；\n"
+                    "· 如果问题本来就不存在（或已被别处修好）：跑一条命令给出证据"
+                    "（例如测试命令与退出码），并在答复里说明为什么不需要改动。"
                 )
             return "fail", detail
 

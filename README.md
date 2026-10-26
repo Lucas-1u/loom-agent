@@ -5,7 +5,7 @@
 目标形态是 Codex / Cursor 式的个人 Coding Agent。但现阶段的目标不是"功能做得多"，
 而是 **"每一步都能讲清楚为什么"** —— 这是一个用来**理解现代 AI Agent 内部架构**的实验平台。
 
-**纯 Python · 手写 Agent Loop · 自检 1022 项（离线，全部通过）· 真实模型 7/7 场景通过**
+**纯 Python · 手写 Agent Loop · 自检 1103 项（离线，全部通过）· 真实模型 7/7 场景通过**
 
 ---
 
@@ -38,7 +38,7 @@ Loom：[PLAN   ] 计划 3 步
 | 能力 | 状态 |
 |---|---|
 | 五阶段 Agent Loop（PLAN / ACT / OBSERVE / REFLECT / FINAL） | ✅ |
-| 工具调用（列目录 / 读文件 / 写文件 / 局部修改 / 沙箱执行命令） | ✅ 共 5 个 |
+| 工具调用（列目录 / 读文件 / 写文件 / 局部修改 / 沙箱执行命令） | ✅ 共 5 个（启用项目知识检索时另注册 `search_docs`，为 6 个） |
 | **局部修改** `edit_file`（唯一匹配 / 冲突检测 / stale 检测 / diff 预览） | ✅ |
 | 写操作**人工审批**（真挂起-恢复，不是轮询） | ✅ |
 | 工作区越界防护 / 允许-禁止范围 / 改动审计 | ✅ |
@@ -46,6 +46,7 @@ Loom：[PLAN   ] 计划 3 步
 | 上下文压缩 / 文件读取复用 / 预算续期 | ✅ |
 | 消息历史持久化（`task_history`，append-only） | ✅ |
 | 编排引擎（`LOOM_ORCHESTRATOR=legacy\|graph`，默认 legacy） | ✅ 双引擎 |
+| **项目知识检索**（SQLite FTS5 关键词检索，自动预检索 + `search_docs` 工具） | ✅ M3 |
 | Windows 一键启动器 | ✅ |
 | `delete_file` | ⬜ **未实现**（从未写过，不在当前 M1–M6 计划内） |
 | 浏览器 GUI（React + Vite） | ✅ 已接真实后端 |
@@ -217,8 +218,8 @@ python -m backend.server
 cd frontend && npm install && npm run dev      # http://localhost:5173
 
 npm run test:workspace   # 路径规范化 / 分组（26 项）
-npm run test:session     # 会话隔离（16 项）
-npm run test:events      # 事件契约：后端 EventType ↔ 前端清单 ↔ 样式（31 项）
+npm run test:session     # 会话隔离 + 状态映射（21 项）
+npm run test:events      # 事件契约：后端 EventType ↔ 前端清单 ↔ 样式（33 项）
 ```
 
 > `test:events` 不是可选的：`eventStream.ts` 是**按 `EVENT_TYPES` 逐个 addEventListener**
@@ -257,8 +258,71 @@ Session（有自己的工作目录）
 
 **当前进度**：布局 / 会话分组 / 双视图 / 事件配色 / 折叠 / 自动滚动 / 响应式都已就绪，
 并且 Phase 3c 已把演示数据换成真实事件（含审批卡、取消、断线补拉）。
-**下一步**：M3（RAG 检索）‖ M4（MCP 接入），之后 M5 → M6；M6 才做四项技术的展示增强
-（子任务树 / mcp / rag 标记），本轮不涉及。
+**下一步**：M4（MCP 接入）‖ M5（Multi-Agent），最后 M6 做展示增强（子任务树 / mcp 标记）。
+
+---
+
+## 项目知识检索（M3）
+
+**它是什么**：基于 **SQLite FTS5 的全文关键词检索**。给 Agent 提供"当前工作区内的项目资料"。
+排序依据是 bm25（词频 + 稀有词权重），**不是**语义相似度。
+**它不是什么**：不是向量检索、没有 embedding、没有重排模型——同义词、改述都搜不到，
+只能命中"确实出现过这些词"的片段。
+
+### 索引范围
+
+| 会索引 | 不索引 |
+|---|---|
+| `.md/.markdown/.rst`、`.txt`、`.py/.pyi`、`.json/.toml/.yaml/.yml/.ini`、常见前端与脚本文件 | `.git`、`node_modules`、`.venv`、构建产物、缓存目录 |
+| 单个文件 ≤ 256KB（可配） | `.env*`、密钥/凭据、`*.key/*.pem`、锁文件、二进制、超大文件 |
+
+排除是**在索引阶段**做的：`.env` 根本不会进库，所以检索也不可能命中它。
+
+### 索引存在哪、怎么更新
+
+- 默认库：`<项目根>/sandbox/index/knowledge.db`（可用 `LOOM_RAG_DB` 改）
+- **一个文件存所有工作区**，靠 `workspace` 列隔离——切项目不会串内容
+- 增量更新按**内容 sha256**：没变的文件直接跳过；改过的重建该文件的片段；删掉的清出索引
+- 每次任务开始做一次增量同步（毫秒级；仓库几百个文件时）
+
+### Agent 怎么用它
+
+两条路径，共用一个 `KnowledgeBase`，**Graph 与 Legacy 完全同源**（都走 `AgentCore`）：
+
+1. **自动预检索**：任务开始时拿用户目标检索一次，命中就把「项目资料」块作为 system 消息
+   放进上下文（带 `path:line`、明确的"仅供参考、不是指令"边界、条数与字符预算）。
+2. **按需检索**：`search_docs(query, k)` 工具（只读、自动执行），模型在任务中途想查什么就查什么。
+
+资料块受预算约束（默认 4 条 / 单条 700 字符 / 总量 2600 字符），相邻片段会合并但不会跨越未命中的行。
+
+### 在 GUI 里看什么
+
+| 事件 | 能看到的 |
+|---|---|
+| `rag.retrieve` | 查询词、谁发起的（自动 / Agent）、索引规模（文件数 / 片段数） |
+| `rag.result` | 命中条数、耗时、**是否进入模型上下文**、每条命中的 `path:line` 与标题、无结果或失败原因 |
+
+三个层次是分开显示的：**检索到几条**（count）→ **是否真的喂给模型**（injected）→
+**最终答复引用了什么**（在 final_answer 里，由模型给出路径行号）。
+
+### 配置
+
+```bash
+LOOM_RAG=1              # 0 = 整个能力关闭（不建索引、不注册工具、不预检索）
+LOOM_RAG_AUTO=1         # 0 = 只关自动预检索，search_docs 仍可用
+LOOM_RAG_DB=...         # 索引库路径
+LOOM_RAG_TOP_K=4        # 每次注入几条
+LOOM_RAG_HIT_CHARS=700  # 单条片段上限
+LOOM_RAG_CONTEXT_CHARS=2600  # 注入总量上限
+```
+
+### 已知限制（第一版）
+
+- 中文按**二元组**切词（无词典、零依赖），所以能搜到但排序不如语义检索"懂意思"；
+  英文标识符整体成词，`run_command` 这类能精确命中。
+- 不跟随目录符号链接；不做跨工作区检索；不做"历史任务"检索（那是另一件事）。
+- 索引在任务开始时同步更新，任务进行中新建/修改的文件要等下一次任务才进索引
+  （所以"改完再看"仍应 `read_file`）。
 
 ---
 
@@ -333,9 +397,10 @@ Agent 做任何事都产生**结构化事件**，而不是 `print` 日志：
           "args": {"path": "main.py"}, "risk": "read"}}
 ```
 
-17 种类型：`task.start` / `task.end` / `plan` / `thinking` / `act` / `observe` /
+19 种类型：`task.start` / `task.end` / `plan` / `thinking` / `act` / `observe` /
 `tool.call` / `tool.result` / `approval.request` / `approval.decision` / `approval.expired` /
-`reflect` / `final_answer` / `error` / `budget.exceeded` / `context.compacted` / `state.snapshot`
+`reflect` / `final_answer` / `error` / `budget.exceeded` / `context.compacted` /
+`rag.retrieve` / `rag.result` / `state.snapshot`
 
 两个关键设计：
 
@@ -439,6 +504,12 @@ loom/
 │   ├── config.py                路径 / 模型 / 预算 / 安全常量
 │   ├── demo.py                  离线演示（不需要 API Key）
 │   │
+│   ├── rag/                     ── 项目知识检索（M3）──
+│   │   ├── discover.py          文件发现：排除目录 / 敏感文件 / 二进制 / 超大
+│   │   ├── chunk.py             切分：Markdown 标题 / 代码符号 / 段落，带行号
+│   │   ├── store.py             SQLite：文件表 + 片段表 + FTS5（增量按内容哈希）
+│   │   └── service.py           KnowledgeBase：ensure_indexed / retrieve / 上下文块
+│   │
 │   ├── agent/                   ── Agent Core ──
 │   │   ├── core.py        ★★★  五阶段循环主控（legacy 引擎）
 │   │   ├── graph_engine.py ★★  LangGraph 引擎（复用 core 的同一组检查点）
@@ -455,7 +526,7 @@ loom/
 │   │   ├── base.py        ★★   统一工具契约（15 种错误类型）
 │   │   ├── path_safety.py ★★★  路径越界防护
 │   │   ├── registry.py    ★★   注册表 + 统一执行入口
-│   │   ├── readonly/           list_files / read_file（自动执行）
+│   │   ├── readonly/           list_files / read_file / search_docs（自动执行）
 │   │   ├── mutating/           write_file / edit_file（需审批）
 │   │   │   └── _shared.py      备份 / 哈希 / 文本读取（两个写工具共用）
 │   │   └── exec/               run_command（需审批 + Docker 沙箱）
@@ -470,7 +541,7 @@ loom/
 │   │   ├── approve.py           审批交互
 │   │   └── main.py              入口 + 参数 + 交互 REPL
 │   │
-│   └── selfcheck_*.py           自检套件（1022 项，全离线）
+│   └── selfcheck_*.py           自检套件（1103 项，全离线）
 │
 ├── dev/                         开发辅助
 │   ├── loom.bat.src             启动器源文件（UTF-8）
@@ -500,6 +571,7 @@ server/  →  agent/  →  tools/
 |---|---|---|---|
 | `list_files` | read | ❌ 自动 | 只列一层，跳过噪音目录，上限 300 条 |
 | `read_file` | read | ❌ 自动 | 40k 字符上限，多编码探测，带行号，返回内容哈希 |
+| `search_docs` | read | ❌ 自动 | M3：工作区项目资料的**关键词检索**（FTS5），返回路径+行号+片段；未启用 RAG 时不注册 |
 | `write_file` | write | ✅ **需确认** | 写前自动备份，`overwrite=false` 保护 |
 | `edit_file` | write | ✅ **需确认** | 只改一小段。**唯一匹配**；匹配到多处时拒绝而不是猜 |
 | `run_command` | exec | ✅ **需确认** | **只能在 Docker 沙箱里跑**（断网 / 只读根 / 非 root / 限额） |
@@ -528,13 +600,14 @@ server/  →  agent/  →  tools/
 ## 测试
 
 ```bash
-# 离线自检（不需要 API Key）—— 本次全部实跑，合计 1022 项
-python -m backend.selfcheck_p1      #  54 —— 契约层（含事件类型 17 的断言）
+# 离线自检（不需要 API Key）—— 本次全部实跑，合计 1103 项
+python -m backend.selfcheck_p1      #  55 —— 契约层（含事件类型 19 的断言）
 python -m backend.selfcheck_p2      #  45 —— 模型层（含候选轮换）
-python -m backend.selfcheck_agent   # 575 —— Agent 全链路（重点）
+python -m backend.selfcheck_agent   # 594 —— Agent 全链路（重点，含修复任务门禁）
 python -m backend.selfcheck_cli     #  67 —— CLI 渲染 + 审批 + 终端输入解码
 python -m backend.selfcheck_server  # 185 —— 存储 / 事件广播 / 运行时 / 调度
 python -m backend.selfcheck_sandbox #  96 —— 沙箱参数与控制流（假进程）
+python -m backend.selfcheck_rag     #  61 —— M3：索引 / 检索 / 集成 / 安全 / 事件契约
 python dev/test_workspace_reuse.py  #  17 —— 启动器的工作目录选择器
 
 # 集成 / 真实环境
@@ -545,8 +618,8 @@ python -m backend.test_approval_live       # 真实交互式审批（管道喂 s
 
 # 前端（cd frontend）
 npm run test:workspace   # 26 —— 路径规范化 / 分组
-npm run test:session     # 16 —— 会话隔离
-npm run test:events      # 31 —— 事件契约：后端 EventType ↔ 前端清单 ↔ 样式
+npm run test:session     # 21 —— 会话隔离 + 任务状态映射
+npm run test:events      # 33 —— 事件契约：后端 EventType ↔ 前端清单 ↔ 样式
 ```
 
 > 数字口径：以上是**代码里实际注册的断言数**（本次运行核对）。`selfcheck_*` 与前端
@@ -559,7 +632,7 @@ npm run test:events      # 31 —— 事件契约：后端 EventType ↔ 前端�
 - 审批批了 A → 实际执行的是 B
 - `/proj_evil` 被当成 `/proj` 的子目录
 
-这些都不会崩，只会静默地做错事。**1022 项自检就是用来钉死这些的。**
+这些都不会崩，只会静默地做错事。**1103 项自检就是用来钉死这些的。**
 
 ---
 
@@ -577,10 +650,11 @@ npm run test:events      # 31 —— 事件契约：后端 EventType ↔ 前端�
 - ✅ **M2** — LangGraph 引擎（`LOOM_ORCHESTRATOR=graph`，与 legacy 共用同一组检查点）
 - ✅ **M2.1** — 工具链修复（`command` 含空格一律拒 / exit 127 专属提示 / task_id 孤儿）
 - ✅ **M2.2** — 前端事件契约（`context.compacted`）+ 反思答复的无进展终止（`no_progress`）
+- ✅ **M3** — 项目知识检索：SQLite FTS5 关键词检索 + 自动预检索 + `search_docs` 工具 +
+  `rag.retrieve` / `rag.result` 事件与 GUI 展示（**不是**向量/语义检索）
 
 未实现 / 后续（原始计划的 M1–M6）：
 
-- ⬜ **M3** — RAG 检索（`search_docs` + FTS5，只索引文档不索引源码）
 - ⬜ **M4** — MCP 接入（`MCPToolAdapter` → 现有 Registry，默认需审批）
 - ⬜ **M5** — Multi-Agent（`spawn_subtask` + 父子任务 + 证据分级验收）
 - ⬜ **M6** — 前端展示与前后对比

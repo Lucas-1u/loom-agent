@@ -121,5 +121,30 @@ s = reducer(s, { type: "APPEND_STREAM_EVENT", sseId: 9, event: finalEvent("t_gho
 ok(s.events.t_ghost === undefined, "★ 归属不明的任务事件被丢弃，不会落到当前会话");
 eq(s.events, beforeUnknown, "丢弃时不产生新引用");
 
+// ------------------------------------------- 后端说"未通过验证"，前端不能显示成功
+// ★ 对应 M3 收尾的门禁修复：repair 任务零改动零命令时后端发
+//   task.end(status=aborted, reason=verification_failed)。
+//   这里验证前端只按事件如实映射，不会把"循环结束"当成"任务成功"。
+function taskEndEvent(tid, status, reason, answer) {
+  return { seq: 999, ts: now + 9, task_id: tid, turn: 3, type: "task.end",
+           data: { status, reason, answer } };
+}
+const aborted = reducer(s, {
+  type: "APPEND_STREAM_EVENT",
+  sseId: 11,
+  event: taskEndEvent("tA", "aborted", "verification_failed", "⚠ 未通过验证：没有文件改动"),
+});
+eq(aborted.tasks.tA.status, "aborted", "★ aborted 不被显示成 done");
+eq(aborted.tasks.tA.end_reason, "verification_failed", "★ 原因码原样保留");
+ok((aborted.tasks.tA.result || "").includes("未通过验证"), "答复里的机器标注被保留");
+
+const finished = reducer(aborted, {
+  type: "APPEND_STREAM_EVENT",
+  sseId: 12,
+  event: taskEndEvent("tB", "done", "agent_done", "已完成并通过测试"),
+});
+eq(finished.tasks.tB.status, "done", "正常完成仍是 done");
+eq(finished.tasks.tB.end_reason, "agent_done", "正常原因码保留");
+
 console.log(`\n结果：${pass}/${pass + fail} 通过`);
 if (fail > 0) process.exitCode = 1;

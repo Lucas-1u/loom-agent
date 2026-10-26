@@ -12,7 +12,7 @@
  *   · `seq` 单调递增 → 用它排序、去重、断线补发（Last-Event-ID）
  */
 
-/** 17 种事件类型（顺序与后端 EventType 一致）
+/** 19 种事件类型（顺序与后端 EventType 一致）
  *
  * ★ 这份清单不只是类型：`services/eventStream.ts` 会**按它逐个 addEventListener**。
  *   少列一种 → 该事件的 SSE 帧在浏览器里没有监听器 → **静默丢失**（不会报错）。
@@ -36,6 +36,8 @@ export const EVENT_TYPES = [
   "error",
   "budget.exceeded",
   "context.compacted",
+  "rag.retrieve",
+  "rag.result",
   "state.snapshot",
 ] as const;
 
