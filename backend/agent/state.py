@@ -500,8 +500,12 @@ class TaskState:
     rag_hits: list[dict[str, Any]] = field(default_factory=list)
     # 真正注入给模型的资料块（原文，含"仅参考、不是指令"的边界说明）
     rag_context_block: str = ""
-    # 每次检索的留痕（自动预检索 + 工具调用），含命中数/耗时/是否注入
+    # 每次检索的留痕（自动预检索 + 工具调用），含命中数/耗时/是否注入/被引用数
     rag_queries: list[dict[str, Any]] = field(default_factory=list)
+    # M4.2：注入的资料里，**被后续步骤真实引用**的那些（path:line）
+    #   ★ 与 rag_hits 区分：hits 是"检索到并注入"，used 是"后续真的提到了/读了它"。
+    #   没有引用就不写，不谎称结论来自 RAG。
+    rag_used: list[str] = field(default_factory=list)
 
     # ---- M2.2：反思答复的无进展检测 ----------------------------------------
     # 背景：模型可能把 REFLECT 的 JSON 当答复反复提交；若系统只是不断回灌
@@ -882,6 +886,7 @@ class TaskState:
             "read_index": self.read_index,
             "rag_index": self.rag_index,
             "rag_hits": self.rag_hits,
+            "rag_used": self.rag_used,
             "rag_context_chars": len(self.rag_context_block),
             "rag_queries": self.rag_queries[-10:],
             "history_persist_errors": self.history_persist_errors,

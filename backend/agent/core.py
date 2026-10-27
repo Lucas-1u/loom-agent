@@ -83,6 +83,7 @@ from .approval import ApprovalManager, Decision, args_fingerprint, build_pending
 from .context import ContextBuilder, TurnBuilder, phase_hint
 from .policy import Policy, make_context
 from .compaction import ContextCompactor, ContextStats, measure
+from .rag.query import build_query
 from .history_log import (HistorySink, StoreHistorySink, dump_entries,
                           entries_to_messages, find_tool_call_gaps,
                           messages_to_entries)
@@ -736,6 +737,8 @@ class AgentCore:
                 )
             state.set_plan(steps, note=str(obj.get("note") or ""))
             self.bus.plan([s.to_dict() for s in steps], state.plan_note, turn=state.turn)
+            # M4.2：有了步骤标题 → 再检索一次（有界，见 _plan_knowledge）
+            await self._plan_knowledge(state, [s.title for s in steps])
         else:
             # 模型没按格式输出 → 降级：不设计划，继续跑（不因此失败）
             state.set_plan([], note="模型未给出结构化计划，直接开始执行")
@@ -1393,6 +1396,7 @@ class AgentCore:
         answer = self._note_incomplete_steps(state, answer)
         # 意图 / 证据等级 / 验证风险：把"做完"和"验证过"分开说
         answer = self._note_verification(state, answer, status)
+        answer = self._note_rag_sources(state, answer)
 
         state.finish(status, answer, reason)
         self.bus.final_answer(answer, turn=state.turn)
@@ -1501,6 +1505,53 @@ class AgentCore:
     # ===================================================================== #
     # 项目知识检索（M3）
     # ===================================================================== #
+    def _mark_rag_usage(self, state: TaskState) -> list[str]:
+        """
+        判断注入的资料里，哪些**被后续步骤真实引用**。
+
+        ★ 判据只看可观测事实，不看模型的自述：
+          · 后续工具调用读过这个路径（read_file path == hit.path）；
+          · 最终答复里出现了这个路径或 `path:line`。
+          命中就记进 `state.rag_used`，一条都没有就留空 —— 不谎称"结论来自 RAG"。
+        """
+        if not state.rag_hits:
+            state.rag_used = []
+            return []
+        answer_text = state.final_answer or ""
+        touched = {str((e.args or {}).get("path") or "") for e in state.tool_events}
+        used: list[str] = []
+        for hit in state.rag_hits:
+            path = str(hit.get("path") or "")
+            locator = str(hit.get("locator") or "")
+            if not path:
+                continue
+            if path in touched or path in answer_text or (locator and locator in answer_text):
+                used.append(locator or path)
+        state.rag_used = used
+        for q in state.rag_queries:
+            if q.get("injected"):
+                q["used"] = len(used)
+        return used
+
+    def _note_rag_sources(self, state: TaskState, answer: str) -> str:
+        """
+        在最终答复里补一句**机器判定**的检索依据（只在确有引用时）。
+
+        ★ 为什么放在答复里而不是新开事件：引用关系是**任务收尾时**才算得出来，
+          而 rag.result 在检索那一刻就发了。为了不新增事件类型（会动契约），
+          把它写进最终答复的机器判定段 —— 位置与"证据等级"一致，语义也一致。
+        """
+        used = self._mark_rag_usage(state)
+        if not used or not state.rag_hits:
+            return answer
+        shown = "、".join(used[:4]) + ("…" if len(used) > 4 else "")
+        block = (
+            f"- 检索依据：注入的 {len(state.rag_hits)} 条资料中，"
+            f"有 {len(used)} 条被后续步骤引用（{shown}）；"
+            "其余资料未被引用，不作为结论依据。"
+        )
+        return answer.rstrip() + "\n\n" + block
+
     async def _prefetch_knowledge(self, state: TaskState) -> None:
         """
         任务开始时：增量更新索引 + 用用户目标检索一次，命中就注入上下文。
@@ -1534,17 +1585,44 @@ class AgentCore:
             log.warning("任务 %s 建立索引失败：%s", state.task_id, exc)
             return
 
-        await self._retrieve_and_inject(state, goal, mode="auto", k=kb.config.top_k)
+        query, source = build_query(goal)
+        await self._retrieve_and_inject(state, query, mode="auto", k=kb.config.top_k,
+                                       query_source=source)
+
+    async def _plan_knowledge(self, state: TaskState, titles: list[str]) -> None:
+        """
+        M4.2：计划出来之后，用「目标 + 前几个步骤标题」再检索一次。
+
+        ★ 为什么需要第二次：任务开始时只能按整句话查；计划出来后才知道
+          真正要做的是"读约定 / 改 average / 跑 pytest"这类具体动作。
+          步骤标题比整段目标更接近检索词。
+        ★ 边界：每个任务**自动检索最多 2 次**（任务开始 + 计划后），
+          且不会重复用同样的查询 —— 不为了"看起来用了 RAG"而反复检索。
+        """
+        kb = self.knowledge
+        if kb is None or not getattr(kb, "usable", False) or not self.config.rag_auto:
+            return
+        auto_done = sum(1 for q in state.rag_queries
+                        if str(q.get("mode", "")).startswith("auto"))
+        if auto_done >= 2 or not titles:
+            return
+        query, source = build_query(state.goal, plan_steps=list(titles))
+        if any(q.get("query") == query for q in state.rag_queries):
+            return
+        await self._retrieve_and_inject(state, query, mode="auto-plan",
+                                        k=kb.config.top_k, query_source=source)
 
     async def _retrieve_and_inject(
-        self, state: TaskState, query: str, *, mode: str, k: int
+        self, state: TaskState, query: str, *, mode: str, k: int,
+        query_source: str = "goal",
     ) -> None:
         """检索一次并把结果写进 state（含事件留痕）。自动路径用。"""
         kb = self.knowledge
         if kb is None:
             return
         self.bus.rag_retrieve(
-            {"query": query, "mode": mode, "k": k, "index": state.rag_index},
+            {"query": query, "mode": mode, "k": k, "index": state.rag_index,
+             "query_source": query_source},
             turn=state.turn,
         )
         try:
@@ -1560,13 +1638,13 @@ class AgentCore:
 
         injected = bool(outcome.hits)
         payload = outcome.to_event()
-        payload.update(mode=mode, injected=injected)
+        payload.update(mode=mode, injected=injected, query_source=query_source)
         self.bus.rag_result(payload, turn=state.turn)
         state.rag_queries.append({
             "query": query, "mode": mode, "count": len(outcome.hits),
             "found": outcome.found, "chars": outcome.chars,
             "elapsed_ms": outcome.elapsed_ms, "injected": injected,
-            "reason": outcome.reason,
+            "reason": outcome.reason, "query_source": query_source, "used": 0,
         })
         if injected:
             # ★ 只有"真的进了上下文"才记 rag_hits —— 与"检索到但没注入"区分开
@@ -1851,6 +1929,7 @@ class AgentCore:
 
         answer = self._note_incomplete_steps(state, answer)
         answer = self._note_verification(state, answer, TaskStatus.DONE)
+        answer = self._note_rag_sources(state, answer)
         # M1：最终答复也进入历史（任务结束 → 持久化历史完整）
         self._history.append(Message.assistant(answer))
         state.finish(TaskStatus.DONE, answer, "agent_done")
