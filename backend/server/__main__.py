@@ -144,11 +144,21 @@ async def amain(args: argparse.Namespace) -> int:
         "method": "sqlite-fts5-bm25",
     }
 
+    # ★ M4.1：MCP Server 在**服务启动时**连接一次（不是每轮推理启动），
+    #   发现到的工具注册进同一个 ToolRegistry；退出时统一关闭子进程。
+    mcp_manager = None
+    mcp_info: dict = {"enabled": False, "servers": [], "tools": 0}
+    if cfg.mcp is not None:
+        from ..mcp.client import McpManager
+        mcp_manager = McpManager(cfg.mcp)
+        await mcp_manager.start()
+        mcp_info = {**mcp_manager.status(), "enabled": True}
+
     scheduler = TaskScheduler(
         store=store,
         hub=hub,
         adapter=OpenAICompatAdapter.from_config(cfg.model),
-        registry=build_default_registry(sandbox=sandbox, knowledge=knowledge),
+        registry=build_default_registry(sandbox=sandbox, knowledge=knowledge, mcp=mcp_manager),
         config=AgentConfig.from_budget_config(cfg.budgets, rag_auto=cfg.rag.auto_prefetch),
         max_global=args.max_tasks,
         knowledge=knowledge,
@@ -162,6 +172,7 @@ async def amain(args: argparse.Namespace) -> int:
         model=cfg.model.model,
         sandbox=sandbox,
         rag=rag_info,
+        mcp=mcp_info,
     )
 
     print("=" * 62)
@@ -173,6 +184,12 @@ async def amain(args: argparse.Namespace) -> int:
     print(f"  数据库    {db_path}")
     print(f"  并发上限  {args.max_tasks}")
     print(f"  命令沙箱  {sb_line}")
+    if mcp_manager is not None:
+        ready = [x for x in mcp_info.get("servers", []) if x.get("state") == "ready"]
+        print(f"  MCP       {len(ready)}/{len(mcp_info.get('servers', []))} 个 Server 就绪，"
+              f"{mcp_info.get('tools', 0)} 个工具")
+    else:
+        print("  MCP       未启用（LOOM_MCP=0）")
     print(f"  健康检查  http://{host}:{port}/api/health")
     print("=" * 62)
     if sb_warn:
@@ -195,6 +212,13 @@ async def amain(args: argparse.Namespace) -> int:
         # 退出前尽力收尾：取消在跑的任务并落盘
         print("\n正在关闭…")
         await scheduler.shutdown(timeout=5.0)
+        # MCP：先关 Client Session 与子进程，再关沙箱/数据库
+        if mcp_manager is not None:
+            try:
+                await mcp_manager.close()
+                print("  已关闭 MCP 连接")
+            except Exception:  # noqa: BLE001
+                log.exception("关闭 MCP 连接失败")
         # 杀掉可能还活着的沙箱容器（--rm 只管正常退出）
         try:
             killed = await sandbox.close()

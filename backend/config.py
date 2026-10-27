@@ -374,6 +374,13 @@ class RagConfig:
         )
 
 
+def _load_mcp_config():
+    """懒加载 MCP 配置（LOOM_MCP=0 时返回 None，不读文件）。"""
+    from .mcp.config import McpConfig
+    cfg = McpConfig.from_env()
+    return cfg if cfg.enabled else None
+
+
 # --------------------------------------------------------------------------- #
 # 总配置
 # --------------------------------------------------------------------------- #
@@ -384,6 +391,9 @@ class Config:
     budgets: BudgetConfig = field(default_factory=BudgetConfig.from_env)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig.from_env)
     rag: RagConfig = field(default_factory=RagConfig.from_env)
+    # MCP（M4.1）：类型是 backend.mcp.config.McpConfig；这里用 Any + 懒加载，
+    # 避免 backend.config ↔ backend.mcp.config 的循环导入。
+    mcp: Any = None
     log_level: str = "INFO"
 
     @classmethod
@@ -395,6 +405,7 @@ class Config:
             budgets=BudgetConfig.from_env(),
             sandbox=SandboxConfig.from_env(),
             rag=RagConfig.from_env(),
+            mcp=_load_mcp_config(),
             log_level=_env("LOOM_LOG_LEVEL", "INFO"),
         )
 

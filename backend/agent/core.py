@@ -922,7 +922,10 @@ class AgentCore:
         """处理单个工具调用：ACT 事件 → Policy → 审批 → 执行 → OBSERVE 事件。"""
         # ---- ACT 事件（宣告要做什么）------------------------------------
         self.bus.act(f"调用 {tc.name}", tool=tc.name, turn=state.turn)
-        self.bus.tool_call(tc.id, tc.name, tc.arguments, turn=state.turn)
+        # M4.1：MCP 工具带 source（server/tool），内置工具没有这个字段
+        tool_obj = self.registry.get(tc.name)
+        self.bus.tool_call(tc.id, tc.name, tc.arguments, turn=state.turn,
+                           source=getattr(tool_obj, "source", None))
 
         # ---- Policy 校验 -------------------------------------------------
         ctx = make_context(state)

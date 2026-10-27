@@ -22,3 +22,8 @@ certifi
 
 # ---- Graph 编排引擎（M2，可选：legacy 模式不需要） ----
 langgraph>=0.2,<0.7
+
+# ---- MCP Client（M4.1，可选：LOOM_MCP=0 时不加载）----
+# 官方 Python SDK；已验证 mcp 2.3.0 在 Python 3.13 上可用（stdio transport）
+# 它会带来 mcp-types / jsonschema / cryptography / pyjwt / sse-starlette / python-multipart 等间接依赖
+mcp>=2.3,<3

@@ -127,6 +127,7 @@ def create_app(
     model: str = "",
     sandbox: Any = None,
     rag: dict[str, Any] | None = None,
+    mcp: dict[str, Any] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Loom Agent Server", version="0.1.0")
 
@@ -169,6 +170,8 @@ def create_app(
             "sandbox": _sandbox_info(sandbox),
             # M3：项目知识检索（enabled/available/db/method）—— 前端据此提示"检索不可用"
             "rag": rag,
+            # M4.1：MCP Server 状态（id/state/tools/error）—— 不含 env 值
+            "mcp": mcp,
         }
 
     # ===================================================================== #

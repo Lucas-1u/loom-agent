@@ -1,0 +1,22 @@
+{
+  "_说明": "MCP Server 配置示例。复制为 mcp_servers.json 并在 .env 里设 LOOM_MCP=1 + LOOM_MCP_CONFIG=<绝对路径> 才会生效。",
+  "_安全提醒": [
+    "command 与 args 分开传，不经过 shell；command 里出现 &&、|、> 等控制符会被拒绝。",
+    "子进程只继承 PATH/SYSTEMROOT/TEMP 等少数环境变量；名字像 KEY/TOKEN/SECRET 的默认剔除。",
+    "trust 缺省是 prompt：所有 MCP 工具调用都要人工审批；只有显式配置才能当成只读。",
+    "MCP Server 是本机普通进程，拥有你的操作系统权限；Loom 不对它做沙箱隔离。"
+  ],
+  "servers": [
+    {
+      "id": "demo",
+      "command": "D:/Loom_agent/loom/.venv/Scripts/python.exe",
+      "args": ["-B", "D:/Loom_agent/loom/backend/mcp/testing/server.py"],
+      "env": { "MCP_TEST_DIR": "C:/tmp/loom-mcp-notes" },
+      "cwd": "",
+      "enabled": true,
+      "trust": "prompt",
+      "read_tools": ["read_note"],
+      "timeout_s": 30
+    }
+  ]
+}

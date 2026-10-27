@@ -318,10 +318,17 @@ class EventBus:
     def act(self, intent: str, tool: str = "", turn: int = 0) -> Event:
         return self.emit(Event.make(EventType.ACT, {"intent": intent, "tool": tool}, turn=turn))
 
-    def tool_call(self, call_id: str, tool: str, args: dict[str, Any], turn: int = 0) -> Event:
-        return self.emit(
-            Event.make(EventType.TOOL_CALL, {"call_id": call_id, "tool": tool, "args": args}, turn=turn)
-        )
+    def tool_call(self, call_id: str, tool: str, args: dict[str, Any], turn: int = 0,
+                  source: dict[str, Any] | None = None) -> Event:
+        """工具调用开始。source 非空时标明来源（M4.1：MCP 工具带 server/tool 元数据）。
+
+        ★ 为什么用附加字段而不是新事件类型：调用开始/结果/审批的语义没变，
+          变的只是"这个工具从哪来"。加一种事件会让时间线多一条没有信息量的记录。
+        """
+        payload: dict[str, Any] = {"call_id": call_id, "tool": tool, "args": args}
+        if source:
+            payload["source"] = source
+        return self.emit(Event.make(EventType.TOOL_CALL, payload, turn=turn))
 
     def tool_result(
         self,

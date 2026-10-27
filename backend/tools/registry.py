@@ -157,6 +157,7 @@ def build_default_registry(
     include_mutating: bool = True,
     sandbox: "SandboxManager | None" = None,
     knowledge: "KnowledgeBase | None" = None,
+    mcp: "McpManager | None" = None,
 ) -> ToolRegistry:
     """
     构建默认工具集。
@@ -170,6 +171,7 @@ def build_default_registry(
     不传则工具自己建一个）。
     knowledge 允许注入项目知识库（M3）：**不传就不注册 search_docs** ——
     这样离线演示、单测、没开 RAG 的部署里，工具清单与以前完全一致。
+    mcp 允许注入 MCP 管理器（M4.1）：**不传就不注册任何 MCP 工具**。
     """
     from .readonly.list_files import make as make_list
     from .readonly.read_file import make as make_read
@@ -180,6 +182,16 @@ def build_default_registry(
     if knowledge is not None and getattr(knowledge, "usable", False):
         from .readonly.search_docs import make as make_search
         reg.register(make_search(knowledge), group="readonly")
+
+    if mcp is not None:
+        # MCP 工具走同一套注册表；风险等级由配置决定（默认 WRITE=需审批）。
+        # 注册失败/重名不会抛出来拖垮启动，而是记在报告里（启动日志可见）。
+        from ..mcp.tool import register_mcp_tools
+        report = register_mcp_tools(reg, mcp)
+        if report["skipped"]:
+            import logging
+            logging.getLogger("loom.mcp").warning("跳过 %d 个 MCP 工具：%s",
+                                                  len(report["skipped"]), report["skipped"])
 
     if include_mutating:
         from .exec.run_command import make as make_run

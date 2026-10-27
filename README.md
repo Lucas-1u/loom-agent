@@ -38,15 +38,16 @@ Loom：[PLAN   ] 计划 3 步
 | 能力 | 状态 |
 |---|---|
 | 五阶段 Agent Loop（PLAN / ACT / OBSERVE / REFLECT / FINAL） | ✅ |
-| 工具调用（列目录 / 读文件 / 写文件 / 局部修改 / 沙箱执行命令） | ✅ 共 5 个（启用项目知识检索时另注册 `search_docs`，为 6 个） |
+| 工具调用（列目录 / 读文件 / 写文件 / 局部修改 / 沙箱执行命令） | ✅ 内置 5 个（可选：`search_docs`，MCP 工具按需注册） |
 | **局部修改** `edit_file`（唯一匹配 / 冲突检测 / stale 检测 / diff 预览） | ✅ |
 | 写操作**人工审批**（真挂起-恢复，不是轮询） | ✅ |
 | 工作区越界防护 / 允许-禁止范围 / 改动审计 | ✅ |
-| 结构化事件流（**17** 种事件类型） | ✅ |
+| 结构化事件流（**19** 种事件类型） | ✅ |
 | 上下文压缩 / 文件读取复用 / 预算续期 | ✅ |
 | 消息历史持久化（`task_history`，append-only） | ✅ |
 | 编排引擎（`LOOM_ORCHESTRATOR=legacy\|graph`，默认 legacy） | ✅ 双引擎 |
 | **项目知识检索**（SQLite FTS5 关键词检索，自动预检索 + `search_docs` 工具） | ✅ M3 |
+| **外部工具 MCP Client**（本地 stdio Server，工具进统一注册表 + 审批） | ✅ M4.1 |
 | Windows 一键启动器 | ✅ |
 | `delete_file` | ⬜ **未实现**（从未写过，不在当前 M1–M6 计划内） |
 | 浏览器 GUI（React + Vite） | ✅ 已接真实后端 |
@@ -295,16 +296,6 @@ Session（有自己的工作目录）
 
 资料块受预算约束（默认 4 条 / 单条 700 字符 / 总量 2600 字符），相邻片段会合并但不会跨越未命中的行。
 
-### 在 GUI 里看什么
-
-| 事件 | 能看到的 |
-|---|---|
-| `rag.retrieve` | 查询词、谁发起的（自动 / Agent）、索引规模（文件数 / 片段数） |
-| `rag.result` | 命中条数、耗时、**是否进入模型上下文**、每条命中的 `path:line` 与标题、无结果或失败原因 |
-
-三个层次是分开显示的：**检索到几条**（count）→ **是否真的喂给模型**（injected）→
-**最终答复引用了什么**（在 final_answer 里，由模型给出路径行号）。
-
 ### 配置
 
 ```bash
@@ -323,6 +314,60 @@ LOOM_RAG_CONTEXT_CHARS=2600  # 注入总量上限
 - 不跟随目录符号链接；不做跨工作区检索；不做"历史任务"检索（那是另一件事）。
 - 索引在任务开始时同步更新，任务进行中新建/修改的文件要等下一次任务才进索引
   （所以"改完再看"仍应 `read_file`）。
+
+---
+
+## 外部工具：MCP Client（M4.1）
+
+**第一版只支持本地 `stdio` Server**，用官方 Python SDK（`mcp`，实测 2.3.0 / Python 3.13）。
+远程传输、OAuth、多租户、连接池都不在本版内（`McpManager` 换成别的 transport 只需替换 Worker 里的一段）。
+
+### 怎么配
+
+```json
+{ "servers": [
+    { "id": "demo",
+      "command": "D:/.../.venv/Scripts/python.exe",
+      "args": ["-B", "D:/.../server.py"],
+      "env": { "MCP_TEST_DIR": "C:/tmp/notes" },
+      "enabled": true,
+      "trust": "prompt",
+      "read_tools": ["read_note"] } ] }
+```
+
+开启：`LOOM_MCP=1` + `LOOM_MCP_CONFIG=<该文件绝对路径>`（默认关闭）。示例见 `mcp_servers.example.json`。
+
+### 安全边界（默认不信任）
+
+| 规则 | 说明 |
+|---|---|
+| 命令与参数分开 | `command` + `args` 直接给 subprocess，不经 shell；`command` 含 `&&`/`\|`/`>` 等控制符直接拒绝启动 |
+| 环境变量白名单 | 子进程只继承 PATH/SYSTEMROOT/TEMP 等少数键；名字像 KEY/TOKEN/SECRET/PASSWORD 的默认剔除；主进程的模型 API Key 永远不给 |
+| **默认要审批** | `trust` 缺省 `prompt` → 所有 MCP 工具都是 `risk=write`，必须走现有审批流程；只有配置里显式 `trust:"read"` 或列进 `read_tools` 才当只读 |
+| Server 自述不可信 | 工具的 description / inputSchema / annotations 都不参与风险判定 |
+| 审批可见来源 | 审批卡片写清 Server、原始工具名、参数（像密钥的键打码）与"本机进程、无沙箱"的影响说明 |
+| 无沙箱声明 | MCP Server 是本机普通进程，拥有你自己的操作系统权限；Loom 不提供隔离 |
+
+### 命名与来源
+
+`mcp__<server_id>__<tool_name>`，例如 `mcp__demo__read_note`。
+来源追踪**不靠解析名字**：每个工具实例带 `source = {"kind":"mcp","server":...,"tool":...}`，
+`tool.call` 事件会带上它，前端时间线在工具名旁显示 `MCP · <server>` 徽标。
+
+### 生命周期
+
+- **服务启动时**连接一次并发现工具，注册进同一 `ToolRegistry`（不是每轮推理启动进程）；
+- 每个 Server 由一个常驻任务持有 SDK 的异步上下文（`__aenter__`/`__aexit__` 必须同 task），
+  调用方直接用 `session.call_tool`；
+- 单次调用超时（默认 30s）后该 Server 标记 failed，**不自动重启、不盲目重试**；
+- 服务关闭时统一 `close()`（幂等），退出顺序在沙箱与数据库之前。
+
+### 已知限制（第一版）
+
+- 只有 stdio；没有远程传输、没有连接池、没有自动重连（需要时显式 `restart()`，会重新发现工具与 schema）。
+- **取消**：任务取消时 SDK 侧的 in-flight 调用没有安全取消接口；Loom 侧靠"调用超时 + 标记不可用 + 关闭时强制收尾"兜底，
+  不会无限阻塞，但**正在 Server 里跑的那次调用无法被中断**（Server 进程本身不受 Loom 控制）。
+- Server 进程健康度没有持续探测（只在调用失败/超时时转为 failed）。
 
 ---
 
@@ -600,7 +645,7 @@ server/  →  agent/  →  tools/
 ## 测试
 
 ```bash
-# 离线自检（不需要 API Key）—— 本次全部实跑，合计 1103 项
+# 离线自检（不需要 API Key）—— 本次全部实跑，合计 1166 项
 python -m backend.selfcheck_p1      #  55 —— 契约层（含事件类型 19 的断言）
 python -m backend.selfcheck_p2      #  45 —— 模型层（含候选轮换）
 python -m backend.selfcheck_agent   # 594 —— Agent 全链路（重点，含修复任务门禁）
@@ -608,6 +653,7 @@ python -m backend.selfcheck_cli     #  67 —— CLI 渲染 + 审批 + 终端输
 python -m backend.selfcheck_server  # 185 —— 存储 / 事件广播 / 运行时 / 调度
 python -m backend.selfcheck_sandbox #  96 —— 沙箱参数与控制流（假进程）
 python -m backend.selfcheck_rag     #  61 —— M3：索引 / 检索 / 集成 / 安全 / 事件契约
+python -m backend.selfcheck_mcp     #  63 —— M4.1：真实 stdio 子进程，连接/发现/注册/审批/取消/超时/关闭
 python dev/test_workspace_reuse.py  #  17 —— 启动器的工作目录选择器
 
 # 集成 / 真实环境
@@ -632,7 +678,7 @@ npm run test:events      # 33 —— 事件契约：后端 EventType ↔ 前端�
 - 审批批了 A → 实际执行的是 B
 - `/proj_evil` 被当成 `/proj` 的子目录
 
-这些都不会崩，只会静默地做错事。**1103 项自检就是用来钉死这些的。**
+这些都不会崩，只会静默地做错事。**1166 项自检就是用来钉死这些的。**
 
 ---
 

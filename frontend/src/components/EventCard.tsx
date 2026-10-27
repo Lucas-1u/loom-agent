@@ -146,12 +146,22 @@ function EventBody({
     case "tool.call": {
       const args = (d.args as Record<string, unknown>) ?? {};
       const keyCount = Object.keys(args).length;
+      // M4.1：MCP 工具的来源由事件里的 source 元数据给出（不靠解析工具名前缀）
+      const src = (d.source as Record<string, unknown> | undefined) ?? undefined;
       return (
         <div className="space-y-1.5">
           <div className="flex items-center gap-2">
             <span className="rounded bg-tone-cyan/10 px-1.5 py-0.5 font-mono text-[11.5px] text-tone-cyan">
               {String(d.tool ?? "")}
             </span>
+            {src?.kind === "mcp" && (
+              <span
+                className="rounded bg-tone-violet/15 px-1.5 py-0.5 text-[10px] text-tone-violet"
+                title="来自外部 MCP Server 的工具"
+              >
+                MCP · {String(src.server ?? "")}
+              </span>
+            )}
             <span className="font-mono text-[10px] text-slate-600">{String(d.call_id ?? "")}</span>
           </div>
           <ArgSummary args={args} />
