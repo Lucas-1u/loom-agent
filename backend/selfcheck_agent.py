@@ -3282,7 +3282,22 @@ async def test_m1_orchestrator_and_history(sb: Sandbox) -> None:
     check(validate_orchestrator("graph") == "graph", "★ graph 配置合法（M2 已实现）")
 
     cfg = AgentConfig(max_turns=4)
-    check(cfg.orchestrator == "legacy", "★ 默认 legacy（未配置时行为不变）")
+    check(cfg.orchestrator == "graph", f"★ 默认 graph（M4.3 起；实际 {cfg.orchestrator}）")
+
+    # ---- 1b. M4.3：默认引擎真的走 graph，显式 legacy 仍可用 ----
+    # 只看配置字段不够 —— 要看**实际执行路径**（state.engine / graph_trace）。
+    core_d = AgentCore(FakeAdapter([ModelReply(content="完成。")]), build_default_registry(),
+                       config=AgentConfig(max_turns=4, min_evidence=0), bus=EventBus())
+    st_d = await core_d.run("读一下 main.py", workspace=sb.dir)
+    check(st_d.engine == "graph" and bool(st_d.graph_trace),
+          f"★ 未配置时实际执行路径是 graph（{st_d.engine}, trace={st_d.graph_trace[:3]}）")
+    core_l = AgentCore(FakeAdapter([ModelReply(content="完成。")]), build_default_registry(),
+                       config=AgentConfig(max_turns=4, min_evidence=0, orchestrator="legacy"),
+                       bus=EventBus())
+    st_l = await core_l.run("读一下 main.py", workspace=sb.dir)
+    check(st_l.engine == "legacy" and st_l.graph_trace == [],
+          f"★ 显式 legacy 兜底路径仍可用（{st_l.engine}, trace={st_l.graph_trace}）")
+    check(st_l.status is TaskStatus.DONE, "★ legacy 路径照常完成")
 
     # ---- 2. run() 的编排器守卫 ----
     # M2：graph 已实现 → run() 正常走 graph 引擎
@@ -3559,7 +3574,7 @@ async def test_graph_engine(sb: Sandbox) -> None:
     finally:
         ge.GraphTaskEngine.node_budget = orig
 
-    # ---- 8. legacy 回归：默认引擎行为不变 ----
+    # ---- 8. legacy 回归：显式切换到 legacy 时行为不变（M4.3 起默认已是 graph）----
     core8 = AgentCore(
         FakeAdapter([
             ModelReply(content='{"steps":[{"title":"读"}],"note":""}'),
@@ -3568,12 +3583,12 @@ async def test_graph_engine(sb: Sandbox) -> None:
             ModelReply(content="g1.py 定义了 hello 变量。"),
         ]),
         reg,
-        config=AgentConfig(max_turns=6, min_evidence=0),
+        config=AgentConfig(max_turns=6, min_evidence=0, orchestrator="legacy"),
         bus=EventBus(),
     )
     st8 = await core8.run("读 g1.py", workspace=sb.dir)
     check(st8.engine == "legacy" and st8.graph_trace == [],
-          f"★ 默认 legacy：无节点轨迹（{st8.engine}, {st8.graph_trace}）")
+          f"★ 显式 legacy：无节点轨迹（{st8.engine}, {st8.graph_trace}）")
     check(st8.status is TaskStatus.DONE, "★ legacy 路径照常完成")
 
     # ---- 9. 历史持久化在 graph 模式下工作 ----

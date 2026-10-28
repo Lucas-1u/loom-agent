@@ -154,14 +154,36 @@ async def amain(args: argparse.Namespace) -> int:
         await mcp_manager.start()
         mcp_info = {**mcp_manager.status(), "enabled": True}
 
+    # ★ M5：子任务派生器。先建注册表（子任务**复用同一套工具**），再装配 spawner，
+    #   最后把 spawn_subtask 注册进去 —— 这样父子任务共用 Policy/审批/闸门，不存在旁路。
+    adapter = OpenAICompatAdapter.from_config(cfg.model)
+    agent_cfg = AgentConfig.from_budget_config(cfg.budgets, rag_auto=cfg.rag.auto_prefetch)
+    registry = build_default_registry(sandbox=sandbox, knowledge=knowledge, mcp=mcp_manager)
+
+    from ..agent.subtask import SubtaskSpawner
+    from ..tools.mutating.spawn_subtask import make as make_spawn
+
+    spawner = SubtaskSpawner(
+        store=store, hub=hub, adapter=adapter, registry=registry, config=agent_cfg,
+        max_depth=cfg.multiagent.max_depth,
+        max_children=cfg.multiagent.max_children,
+        child_max_turns=cfg.multiagent.child_max_turns,
+        child_max_seconds=cfg.multiagent.child_max_seconds,
+        child_max_tool_calls=cfg.multiagent.child_max_tool_calls,
+        approval_timeout_s=cfg.multiagent.approval_timeout_s,
+        timeout_s=cfg.multiagent.timeout_s,
+    )
+    registry.register(make_spawn(spawner), group="subagent")
+
     scheduler = TaskScheduler(
         store=store,
         hub=hub,
-        adapter=OpenAICompatAdapter.from_config(cfg.model),
-        registry=build_default_registry(sandbox=sandbox, knowledge=knowledge, mcp=mcp_manager),
-        config=AgentConfig.from_budget_config(cfg.budgets, rag_auto=cfg.rag.auto_prefetch),
+        adapter=adapter,
+        registry=registry,
+        config=agent_cfg,
         max_global=args.max_tasks,
         knowledge=knowledge,
+        spawner=spawner,
     )
 
     app = create_app(

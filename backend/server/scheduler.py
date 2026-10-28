@@ -60,6 +60,7 @@ class TaskScheduler:
         config: AgentConfig,
         max_global: int = DEFAULT_MAX_GLOBAL,
         knowledge: object | None = None,
+        spawner: object | None = None,
     ) -> None:
         self._store = store
         self._hub = hub
@@ -69,6 +70,8 @@ class TaskScheduler:
         self._max_global = max_global
         # M3：项目知识库（同一进程内被所有任务共享；按 workspace 隔离数据）
         self._knowledge = knowledge
+        # M5：子任务派生器
+        self._spawner = spawner
 
         self._runtimes: dict[str, TaskRuntime] = {}
         self._session_of: dict[str, str] = {}
@@ -201,6 +204,7 @@ class TaskScheduler:
             hub=self._hub,
             store=self._store,
             knowledge=self._knowledge,
+            spawner=self._spawner,
         )
         self._runtimes[task_id] = rt
 

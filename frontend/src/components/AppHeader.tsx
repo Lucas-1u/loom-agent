@@ -1,8 +1,22 @@
 import type { ConnectionState, ViewMode } from "../types/chat";
 import { ViewSwitcher } from "./ViewSwitcher";
 
-/** 可选的模型（Phase 3 接后端后会从 /api/health 拿真实列表） */
-const MODELS = ["qwen3.7-plus", "qwen3.7-max", "deepseek-chat"];
+/**
+ * 已知但**未接入**的模型（仅作占位展示）。
+ *
+ * ★ M5 之后修过一次"假装能切模型"的问题：
+ *   原来这里是一份写死的候选列表，跟后端 `.env` 里真正在跑的模型毫无关系 ——
+ *   `/api/health` 返回 `spark-x2.6`，但 `<select>` 的 options 里没有它，
+ *   浏览器只能把显示回落到列表第一项，于是界面永远显示一个"老模型"。
+ *   更糟的是 `onModelChange` 只改前端 state，后端 scheduler 用的是启动时
+ *   按 `cfg.model` 建好的 adapter —— 选了也不生效。
+ *
+ * 现在的约定：
+ *   · 第一项永远是 `/api/health` 返回的**真实模型**，标注「后端配置」；
+ *   · 其余候选保持 disabled，明确是"未接入"，不给"能切换"的错觉；
+ *   · 等后端支持按任务指定模型后，再把 disabled 去掉（见 docs 的后续事项）。
+ */
+const KNOWN_MODELS = ["qwen3.7-plus", "qwen3.7-max", "deepseek-chat"];
 
 export function AppHeader({
   viewMode,
@@ -19,6 +33,10 @@ export function AppHeader({
   connection: ConnectionState;
   demo: boolean;
 }) {
+  // 真实模型可能为空（演示 / 未连接），此时不伪造一个模型名
+  const active = (model || "").trim();
+  const hasReal = active !== "" && active !== "—" && active !== "演示";
+  const placeholders = KNOWN_MODELS.filter((m) => m !== active);
   return (
     <header className="flex h-14 shrink-0 items-center gap-4 border-b border-ink-700 bg-ink-900 px-4">
       {/* ---- 左：品牌 ---- */}
@@ -42,13 +60,20 @@ export function AppHeader({
         <label className="flex items-center gap-1.5 text-[11px] text-slate-500">
           <span className="hidden xl:inline">模型</span>
           <select
-            value={model}
+            value={active}
             onChange={(e) => onModelChange(e.target.value)}
+            title="当前模型由后端配置（.env 的 provider/model）决定；灰色项尚未接入，选中也不会改变实际调用。"
             className="cursor-pointer rounded-md border border-ink-700 bg-ink-850 px-2 py-1 text-[12px] text-slate-200 outline-none transition-colors hover:border-ink-600 focus:border-tone-cyan/50"
           >
-            {MODELS.map((m) => (
-              <option key={m} value={m}>
-                {m}
+            {hasReal ? (
+              <option value={active}>{active}（后端配置）</option>
+            ) : (
+              // 演示 / 离线时不伪造模型名，如实显示当前状态
+              <option value={active}>{active || "未连接"}</option>
+            )}
+            {placeholders.map((m) => (
+              <option key={m} value={m} disabled>
+                {m}（未接入）
               </option>
             ))}
           </select>

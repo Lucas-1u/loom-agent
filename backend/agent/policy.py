@@ -305,7 +305,19 @@ class Policy:
                     )
 
         # ---- ⑥ 审批 -----------------------------------------------------
-        if tool.needs_approval:
+        # ★ M6：工具可以按**本次参数**给出更精确的风险等级（terminal 的只读白名单用）。
+        #   默认仍用工具级 risk；risk_for 的判定逻辑写死在工具里，
+        #   模型无法通过参数给自己"声明安全"。
+        risk_now = getattr(tool, "risk", RiskLevel.READ)
+        risk_for = getattr(tool, "risk_for", None)
+        if callable(risk_for):
+            try:
+                risk_now = risk_for(args)
+            except Exception:  # noqa: BLE001 —— 判定失败就退回工具级默认（保守）
+                risk_now = getattr(tool, "risk", RiskLevel.WRITE)
+        need_approval = risk_now != RiskLevel.READ
+
+        if need_approval:
             if already_approved:
                 # 已授权 → 放行，但要把授权凭据带下去（工具自身还会再检查一次）
                 return PolicyDecision.permit(
@@ -314,10 +326,10 @@ class Policy:
 
             info = tool.describe_action(args, ctx)
             return PolicyDecision.require_approval(
-                reason=f"{tool_name} 有副作用（risk={tool.risk.value}），需用户批准",
+                reason=f"{tool_name} 有副作用（risk={risk_now.value}），需用户批准",
                 meta={
                     "tool": tool_name,
-                    "risk": tool.risk.value,
+                    "risk": risk_now.value,
                     "action": info.get("action", ""),
                     "target": info.get("target", ""),
                     "impact": info.get("impact", ""),
@@ -454,6 +466,9 @@ def make_context(
         approval_id=approval_id,
         authorized=authorized,
         cancel_event=cancel_event,
+        # M5：子任务要继承父任务的安全约束（不是子任务自己说了算）
+        allowed_paths=list(state.allowed_paths) if state.allowed_paths else None,
+        forbidden_paths=list(state.forbidden_paths) if state.forbidden_paths else None,
         max_read_chars=MAX_READ_CHARS,
         ignored_dir_names=frozenset(IGNORED_DIR_NAMES),
         sensitive_names=frozenset(SENSITIVE_NAMES),

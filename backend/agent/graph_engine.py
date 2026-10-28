@@ -22,6 +22,7 @@ Graph 编排引擎（M2）：用 LangGraph StateGraph 驱动 AgentCore 的阶段
     reflect 节点  ≙  _reflect_phase（可能内部收尾 → END）
     finalize节点  ≙  _finalize_text_reply（分支 B：文本答复的三道关口）
 每轮的节点序列：budget → plan(仅首轮) → act → (tools → reflect | finalize) → budget → …
+M4.3 起 graph 是**默认引擎**；legacy 仍可通过 LOOM_ORCHESTRATOR=legacy 显式启用（兜底，暂不删除）。
 
 ★ 图状态为什么这么小
 ----------------
@@ -100,7 +101,14 @@ def build_task_graph(core, engine):
         "budget", engine.route_budget,
         {"plan": "plan", "act": "act", "END": END},
     )
-    g.add_edge("plan", "budget")                                # 规划后回到预算检查
+    # ★ M4.3：plan 必须是**条件边**。以前这里是无条件边 add_edge("plan","budget")，
+    #   于是 node_plan 返回的 route="END"（例如模型认证失败、任务已收尾）被静默吞掉，
+    #   任务会一直 plan→budget→plan 空转直到轮次耗尽（实测：model_error 变成 budget_turns）。
+    #   这与上面 budget/act/reflect/finalize 的 path_map 教训是同一类坑。
+    g.add_conditional_edges(
+        "plan", engine.route_plan,
+        {"budget": "budget", "END": END},
+    )
     g.add_conditional_edges(
         "act", engine.route_act,
         {"tools": "tools", "finalize": "finalize", "END": END},
@@ -234,6 +242,10 @@ class GraphTaskEngine:
     # ------------------------------------------------------------------ #
     # 条件路由
     # ------------------------------------------------------------------ #
+    def route_plan(self, state: GraphState) -> str:
+        """plan 出口：正常回预算检查；节点判定已收尾则直接 END。"""
+        return "END" if state.get("route") == "END" else "budget"
+
     def route_budget(self, state: GraphState) -> str:
         return state.get("route", "act")
 

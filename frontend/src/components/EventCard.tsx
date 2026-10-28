@@ -187,6 +187,14 @@ function EventBody({
         | undefined;
       const data = d.data;
       const ms = Number(d.duration_ms ?? 0);
+      // M6：terminal 工具的结果信封（kind=terminal）单独渲染成"命令 + 输出"
+      const term =
+        data && typeof data === "object" && (data as Record<string, unknown>).kind === "terminal"
+          ? (data as Record<string, unknown>)
+          : null;
+      const exitCode = term ? Number(term.exit_code ?? 0) : 0;
+      const stdout = term ? String(term.stdout ?? "") : "";
+      const stderr = term ? String(term.stderr ?? "") : "";
 
       return (
         <div className="space-y-1.5">
@@ -215,6 +223,40 @@ function EventBody({
               {err.hint && (
                 <p className="mt-1 text-[11px] leading-relaxed text-slate-400">建议：{err.hint}</p>
               )}
+            </div>
+          )}
+
+          {term && (
+            <div className="space-y-1.5 rounded border border-ink-700 bg-ink-900/60 px-2 py-1.5">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10.5px] text-slate-500">
+                <span className="rounded bg-tone-cyan/10 px-1.5 py-0.5 text-tone-cyan">
+                  {String(term.shell_label ?? term.shell ?? "shell")}
+                </span>
+                <span className={exitCode === 0 ? "text-tone-green" : "text-tone-red"}>
+                  exit {String(term.exit_code ?? "?")}
+                </span>
+                <span className="truncate">cwd: {String(term.cwd ?? "")}</span>
+                {term.timed_out ? <span className="text-tone-amber">超时</span> : null}
+                {term.cancelled ? <span className="text-tone-amber">已取消</span> : null}
+                {term.truncated ? <span className="text-tone-amber">输出已截断</span> : null}
+                {Number(term.redacted ?? 0) > 0 ? (
+                  <span className="text-tone-amber">已打码 {String(term.redacted)} 处密钥</span>
+                ) : null}
+              </div>
+              <div className="selectable break-all font-mono text-[11.5px] text-slate-300">
+                <span className="text-slate-500">$ </span>
+                {String(term.command ?? "")}
+              </div>
+              {stdout ? (
+                <pre className="max-h-[200px] overflow-auto whitespace-pre-wrap break-all rounded bg-ink-950/60 p-1.5 font-mono text-[11px] leading-relaxed text-slate-300">
+                  {stdout}
+                </pre>
+              ) : null}
+              {stderr ? (
+                <pre className="max-h-[160px] overflow-auto whitespace-pre-wrap break-all rounded bg-tone-red/5 p-1.5 font-mono text-[11px] leading-relaxed text-tone-red/90">
+                  {stderr}
+                </pre>
+              ) : null}
             </div>
           )}
 

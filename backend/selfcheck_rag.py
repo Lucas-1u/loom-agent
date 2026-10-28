@@ -582,6 +582,116 @@ async def suite_pipeline() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [G] M6：混合检索（关键词 + 向量 + RRF）
+# --------------------------------------------------------------------------- #
+class FakeEmbedder:
+    """
+    确定性替身 embedder（不加载真模型，测试才可重复）。
+
+    语义映射是硬编码的 3 维向量：
+      自监督/无监督/表征 → [1,0,0]；contrastive → [0.2,1,0]；其它 → [0,0,1]
+    """
+
+    name = "fake"
+    model = "fake-v1"
+    _dim = 3
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def encode(self, texts, *, is_query=False):
+        out = []
+        for t in texts:
+            low = (t or "").lower()
+            if "自监督" in low or "无监督" in low or "表征" in low:
+                out.append([1.0, 0.0, 0.0])
+            elif "contrastive" in low:
+                out.append([0.2, 1.0, 0.0])
+            else:
+                out.append([0.0, 0.0, 1.0])
+        return out
+
+
+async def suite_hybrid() -> None:
+    print("\n[G] 混合检索：mode / 融合 / 降级 / 增量")
+
+    from unittest import mock
+    import backend.agent.rag.service as rag_service
+
+    root = new_ws()
+    write(root, "docs/selfsup.md", "# 自监督表征学习\n\n用 InfoNCE 做自监督预训练。\n")
+    write(root, "docs/vision.md", "# Contrastive learning\n\nPretrain with contrastive loss.\n")
+    write(root, "docs/release.md", "# 发布流程\n\n发布窗口固定在每周三。\n")
+
+    kb = kb_for(root, top_k=3)
+    kb.config.embed = "fake"          # 触发 vectors_enabled
+    fake = FakeEmbedder()
+    with mock.patch.object(rag_service, "get_embedder", lambda **kw: fake):
+        st = kb.ensure_indexed(root)
+        check(st.embedded == st.chunks and st.vectors == st.chunks,
+              f"★ 索引时为每个片段算了向量（embedded={st.embedded}, vectors={st.vectors}）")
+
+        st2 = kb.ensure_indexed(root)
+        check(st2.embedded == 0 and st2.vectors == st.chunks,
+              f"★ 增量：第二次不再重算（embedded={st2.embedded}）")
+
+        # ---- keyword ----
+        out_kw = kb.retrieve(root, "自监督 预训练", k=3, mode="keyword")
+        check(out_kw.retrieval == "keyword", f"keyword 模式不走向量（{out_kw.retrieval}）")
+        check(all(h.matched_by == "bm25" for h in out_kw.hits), "命中标记为 bm25")
+
+        # ---- semantic（查询词与文档没有字面重合）----
+        out_vec = kb.retrieve(root, "无监督表征方法", k=3, mode="semantic")
+        check(out_vec.retrieval == "semantic", f"semantic 模式（{out_vec.retrieval}）")
+        check(out_vec.hits and out_vec.hits[0].path == "docs/selfsup.md",
+              f"★ 语义命中首选 selfsup（{out_vec.hits[0].path if out_vec.hits else '无'}）")
+        check(all(h.matched_by == "vector" for h in out_vec.hits), "命中标记为 vector")
+        check(out_vec.hits[0].score > 0.9, f"余弦分数合理（{out_vec.hits[0].score:.3f}）")
+
+        # ---- hybrid：两路都命中的片段标记 both ----
+        out_hy = kb.retrieve(root, "自监督 表征", k=3, mode="hybrid")
+        check(out_hy.retrieval == "hybrid", f"hybrid 模式（{out_hy.retrieval}）")
+        marks = {h.path: h.matched_by for h in out_hy.hits}
+        check(marks.get("docs/selfsup.md") == "both",
+              f"★ 两路都命中 → both（{marks}）")
+        check(any(v == "vector" for v in marks.values()) or len(marks) >= 2,
+              f"融合结果里保留了向量独有命中（{marks}）")
+
+        # ---- RRF 稳定性 ----
+        a = [h.locator for h in kb.retrieve(root, "自监督", k=3, mode="hybrid").hits]
+        b = [h.locator for h in kb.retrieve(root, "自监督", k=3, mode="hybrid").hits]
+        check(a == b, "同一查询两次结果顺序一致")
+
+        # ---- 工具层：mode 透传 + data 字段 ----
+        from backend.tools.base import ToolContext
+        from backend.tools.readonly.search_docs import make as make_search
+        tool = make_search(kb)
+        ctx = ToolContext(workspace=root)
+        r = await tool.run({"query": "无监督表征方法", "mode": "semantic", "k": 2}, ctx)
+        check(r.ok and (r.data or {}).get("retrieval") == "semantic",
+              f"search_docs 透传 mode（{(r.data or {}).get('retrieval')}）")
+        check(all("matched_by" in h for h in (r.data or {}).get("hits", [])),
+              "工具返回的每条命中都带 matched_by")
+        r2 = await tool.run({"query": "无监督表征方法", "mode": "bogus"}, ctx)
+        check(r2.ok and (r2.data or {}).get("retrieval") in ("hybrid", "keyword", "semantic"),
+              "非法 mode 回落到默认，不报错")
+
+    # ---- 未启用向量：语义请求自动降级并标注（复用同一个已建索引的库）----
+    kb.config.embed = "off"
+    out_deg = kb.retrieve(root, "无监督表征方法", k=3, mode="semantic")
+    check(out_deg.retrieval == "keyword", f"★ 降级成 keyword（{out_deg.retrieval}）")
+    check(out_deg.degraded.startswith("no_embedder"), f"★ 降级原因被标注（{out_deg.degraded}）")
+    check(len(out_deg.hits) >= 1, f"降级后仍返回关键词结果（{len(out_deg.hits)} 条）")
+
+    shutil.rmtree(root, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # [E] 事件契约
 # --------------------------------------------------------------------------- #
 def suite_events() -> None:
@@ -618,6 +728,7 @@ async def amain() -> int:
     await suite_agent()
     await suite_security()
     await suite_pipeline()
+    await suite_hybrid()
     suite_events()
 
     passed = sum(1 for ok, _ in _results if ok)

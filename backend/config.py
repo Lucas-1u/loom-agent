@@ -200,15 +200,16 @@ class BudgetConfig:
     compact_max_chars: int = 60_000
     compact_keep_turns: int = 3
 
-    # ---- 编排引擎（M1）--------------------------------------------------
-    # legacy = 现有 _loop 主循环（默认，行为不变）；graph = LangGraph 引擎（尚未实现）。
+    # ---- 编排引擎（M1 / M4.3）-----------------------------------------
+    # graph = LangGraph 引擎（M2 已实现，M4.3 起为**默认**）；
+    # legacy = 原有 _loop 主循环，保留为可显式切换的兜底路径（暂不删除）。
     # ★ 未知值必须报错，绝不静默切到别的引擎。
-    orchestrator: str = "legacy"
+    orchestrator: str = "graph"
 
     @classmethod
     def from_env(cls) -> "BudgetConfig":
         return cls(
-            orchestrator=validate_orchestrator(_env("LOOM_ORCHESTRATOR", "legacy")),
+            orchestrator=validate_orchestrator(_env("LOOM_ORCHESTRATOR", "graph")),
             compact_max_chars=_env_int("LOOM_COMPACT_CHARS", 60_000),
             compact_keep_turns=_env_int("LOOM_COMPACT_KEEP_TURNS", 3),
             max_turns=_env_int("LOOM_MAX_TURNS", 20),
@@ -353,6 +354,21 @@ class RagConfig:
     max_file_bytes: int = 262_144
     max_files: int = 400
 
+    # ---- 混合检索（M6）--------------------------------------------------
+    # embed: off = 只用 FTS5 关键词；onnx = 本地 fastembed（需装 fastembed）
+    # retrieval: 默认检索模式（keyword | hybrid | semantic），工具可覆盖
+    embed: str = "off"
+    embed_model: str = "BAAI/bge-small-zh-v1.5"
+    embed_cache: str = ""
+    embed_batch: int = 32
+    retrieval: str = "hybrid"
+    hybrid_candidates: int = 20      # 每一路各取多少条候选再融合
+    rrf_k: int = 60                  # RRF 的平滑常数（业界常用 60）
+
+    @property
+    def vectors_enabled(self) -> bool:
+        return self.embed not in ("", "off", "none", "0", "false")
+
     @property
     def usable(self) -> bool:
         """是否真的可用：既要启用，也要有库路径（空路径视为关闭）。"""
@@ -371,6 +387,45 @@ class RagConfig:
             max_chunks_per_file=max(1, _env_int("LOOM_RAG_CHUNKS_PER_FILE", 60)),
             max_file_bytes=max(4096, _env_int("LOOM_RAG_MAX_FILE_KB", 256) * 1024),
             max_files=max(1, _env_int("LOOM_RAG_MAX_FILES", 400)),
+            embed=_env("LOOM_RAG_EMBED", "off").strip().lower(),
+            embed_model=_env("LOOM_RAG_EMBED_MODEL", "BAAI/bge-small-zh-v1.5"),
+            embed_cache=_env("LOOM_RAG_EMBED_CACHE", ""),
+            embed_batch=max(1, _env_int("LOOM_RAG_EMBED_BATCH", 32)),
+            retrieval=_env("LOOM_RAG_MODE", "hybrid").strip().lower(),
+            hybrid_candidates=max(4, _env_int("LOOM_RAG_CANDIDATES", 20)),
+            rrf_k=max(1, _env_int("LOOM_RAG_RRF_K", 60)),
+        )
+
+
+@dataclass
+class MultiAgentConfig:
+    """
+    父子任务（M5）配置。
+
+    ★ 为什么要单独收口：层级、数量、子任务预算、超时都是**安全边界**，
+      散落在代码里迟早会有的地方忘检查。集中在这里，测试只需盯一处。
+    """
+
+    enabled: bool = True
+    max_depth: int = 2              # 允许派生的层级（父=0，子=1；子任务再派生需 depth<max_depth）
+    max_children: int = 3           # 每个父任务最多派生几个子任务
+    child_max_turns: int = 8
+    child_max_seconds: float = 120.0
+    child_max_tool_calls: int = 12
+    approval_timeout_s: float = 60.0    # 子任务里等待人工审批的超时（超时=拒绝）
+    timeout_s: float = 180.0            # 单次派生的总超时（父任务不会被无限拖住）
+
+    @classmethod
+    def from_env(cls) -> "MultiAgentConfig":
+        return cls(
+            enabled=_env("LOOM_AGENTS", "1").lower() not in ("0", "false", "off", "no"),
+            max_depth=max(1, _env_int("LOOM_AGENT_MAX_DEPTH", 2)),
+            max_children=max(1, _env_int("LOOM_AGENT_MAX_CHILDREN", 3)),
+            child_max_turns=max(1, _env_int("LOOM_AGENT_CHILD_TURNS", 8)),
+            child_max_seconds=_env_float("LOOM_AGENT_CHILD_SECONDS", 180.0),
+            child_max_tool_calls=max(1, _env_int("LOOM_AGENT_CHILD_TOOLS", 12)),
+            approval_timeout_s=_env_float("LOOM_AGENT_APPROVAL_TIMEOUT", 60.0),
+            timeout_s=_env_float("LOOM_AGENT_TIMEOUT", 240.0),
         )
 
 
@@ -394,6 +449,8 @@ class Config:
     # MCP（M4.1）：类型是 backend.mcp.config.McpConfig；这里用 Any + 懒加载，
     # 避免 backend.config ↔ backend.mcp.config 的循环导入。
     mcp: Any = None
+    # M5：父子任务边界（层级/数量/子任务预算/超时）
+    multiagent: MultiAgentConfig = field(default_factory=MultiAgentConfig.from_env)
     log_level: str = "INFO"
 
     @classmethod
@@ -406,6 +463,7 @@ class Config:
             sandbox=SandboxConfig.from_env(),
             rag=RagConfig.from_env(),
             mcp=_load_mcp_config(),
+            multiagent=MultiAgentConfig.from_env(),
             log_level=_env("LOOM_LOG_LEVEL", "INFO"),
         )
 
@@ -447,7 +505,8 @@ def validate_orchestrator(value: str) -> str:
 
     ★ 为什么 graph 也要在这里拦：M1 只交付"切换入口 + 历史持久化"，
       graph 引擎尚未实现。如果在这里放行，服务会"假装切换成功"——
-      那正是 M1-A 明确禁止的。graph 就绪后从 ORCHESTRATORS 里启用即可。
+      那正是 M1-A 明确禁止的。graph 已随 M2 实现，M4.3 起成为默认引擎；
+      legacy 仍可用（显式设置 LOOM_ORCHESTRATOR=legacy）。
     """
     v = (value or "").strip().lower()
     if v not in ORCHESTRATORS:

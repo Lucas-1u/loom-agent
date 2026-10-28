@@ -54,7 +54,8 @@ from typing import Any, Iterator
 IDEM_TTL_S = 24 * 3600
 IDEM_MAX_ROWS = 1000
 
-SCHEMA_VERSION = 1
+# M5：tasks 增加 parent_task_id（子任务指向父任务；根任务为 NULL）
+SCHEMA_VERSION = 2
 
 # --------------------------------------------------------------------------- #
 # 进程级数据库锁
@@ -221,6 +222,7 @@ class TaskStore:
                     CREATE TABLE IF NOT EXISTS tasks (
                       task_id    TEXT PRIMARY KEY,
                       session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                      parent_task_id TEXT,          -- M5：NULL = 根任务；否则指向父任务
                       goal       TEXT NOT NULL,
                       status     TEXT NOT NULL,
                       model      TEXT NOT NULL DEFAULT '',
@@ -267,6 +269,18 @@ class TaskStore:
                     f"数据库 schema 版本 {ver} 高于代码支持的 {SCHEMA_VERSION} —— "
                     f"可能是用新版 Loom 建的库。请升级代码，或换个 LOOM_DB 路径。"
                 )
+            # ---- M5 迁移：给旧库补 parent_task_id（就地 ALTER，不重建库）----
+            if ver < 2:
+                cols = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+                }
+                if "parent_task_id" not in cols:
+                    conn.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)"
+                )
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             # ver == SCHEMA_VERSION：已是最新
 
     async def init(self) -> None:
@@ -360,13 +374,14 @@ class TaskStore:
             conn.execute(
                 """
                 INSERT INTO tasks
-                  (task_id, session_id, goal, status, model, workspace,
+                  (task_id, session_id, parent_task_id, goal, status, model, workspace,
                    created_at, started_at, ended_at, end_reason, result, turn, state_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '', '', 0, '')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', '', 0, '')
                 """,
                 (
                     task["task_id"],
                     task["session_id"],
+                    task.get("parent_task_id") or None,   # M5：None = 根任务
                     task["goal"],
                     task.get("status", "created"),
                     task.get("model", ""),
@@ -473,6 +488,31 @@ class TaskStore:
 
     async def list_tasks(self, session_id: str | None = None) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.list_tasks_sync, session_id)
+
+    # ===================================================================== #
+    # M5：父子任务
+    # ===================================================================== #
+    def count_children_sync(self, parent_task_id: str) -> int:
+        """某个父任务已经派生了多少子任务（用于数量上限）。"""
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE parent_task_id = ?",
+                (parent_task_id,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
+
+    async def count_children(self, parent_task_id: str) -> int:
+        return await asyncio.to_thread(self.count_children_sync, parent_task_id)
+
+    def parent_of_sync(self, task_id: str) -> str | None:
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT parent_task_id FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return (row["parent_task_id"] if row else None) or None
+
+    async def parent_of(self, task_id: str) -> str | None:
+        return await asyncio.to_thread(self.parent_of_sync, task_id)
 
     # ===================================================================== #
     # 重启恢复
@@ -588,6 +628,8 @@ def _task_row_to_dict(row: sqlite3.Row, *, with_state: bool = True) -> dict[str,
         "end_reason": row["end_reason"],
         "result": row["result"],
         "turn": row["turn"],
+        # M5：父子关系（根任务为 None）
+        "parent_task_id": row["parent_task_id"] if "parent_task_id" in row.keys() else None,
     }
     if with_state:
         d["state"] = _loads(row["state_json"])

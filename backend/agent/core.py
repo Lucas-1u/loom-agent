@@ -164,8 +164,8 @@ class AgentConfig:
         # 有界续期：只续一次，幅度固定。出现循环/停滞/冲突时绝不续。
         budget_extend_turns: int = 10,
         budget_extend_enabled: bool = True,
-        # ---- 编排引擎（M1）：legacy 默认；graph 未实现，配置层会拒绝 ----
-        orchestrator: str = "legacy",
+        # ---- 编排引擎（M1 / M4.3）：graph 默认；legacy 为显式兜底 ----
+        orchestrator: str = "graph",
         # ---- 项目知识检索（M3）：任务开始时是否自动检索用户目标 ----------
         # 关掉后只剩 search_docs 工具（模型按需调用），用于 A/B 对比。
         rag_auto: bool = True,
@@ -194,7 +194,7 @@ class AgentConfig:
     @classmethod
     def from_budget_config(cls, b: Any, **overrides: Any) -> "AgentConfig":
         cfg = cls(
-            orchestrator=getattr(b, "orchestrator", "legacy"),
+            orchestrator=getattr(b, "orchestrator", "graph"),
             compact_max_chars=getattr(b, "compact_max_chars", 60_000),
             compact_keep_turns=getattr(b, "compact_keep_turns", 3),
             max_turns=b.max_turns,
@@ -354,6 +354,7 @@ class AgentCore:
         allowed_tools: set[str] | None = None,
         extra_rules: str = "",
         knowledge: "KnowledgeBase | None" = None,
+        spawner: Any = None,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -367,6 +368,8 @@ class AgentCore:
         self.history_sink = history_sink
         # M3：项目知识库（不传 = 没有 RAG；两条引擎共用同一份实现）
         self.knowledge = knowledge
+        # M5：子任务派生器（不传 = 不能派生子任务；由 TaskRuntime 注入）
+        self.spawner = spawner
 
         # 运行期状态（每次 run 重置）
         self._state: TaskState | None = None
@@ -415,13 +418,14 @@ class AgentCore:
           · forbidden 会在 Policy 层**直接拦下**写入；allowed 只在事后审计里标记
 
         编排引擎由 <code>self.config.orchestrator</code> 决定（M1）：
-          · legacy（默认）= 现有 _loop；graph 尚未实现，进入即报可诊断错误
+          · graph（默认，M4.3 起）= LangGraph 引擎，节点与下列 AgentCore 阶段方法一一对应；
+          · legacy = 原有 _loop 主循环，需显式设置 LOOM_ORCHESTRATOR=legacy（保留为兜底）
         """
         # ---- 编排引擎选择（M1/M2）----------------------------------------
         # ★ 合法值校验在配置层（validate_orchestrator）；这里只分派。
         # ★ graph 引擎异常直接向上抛 → 由下方顶层 except 收尾为 failed，
         #   绝不静默切回 legacy 重跑（工具副作用可能已经发生）。
-        orch = getattr(self.config, "orchestrator", "legacy")
+        orch = getattr(self.config, "orchestrator", "graph")
         if orch not in ("legacy", "graph"):
             raise ValueError(
                 f"未知的编排器配置：{orch!r}（合法值：legacy | graph）"
@@ -932,6 +936,7 @@ class AgentCore:
 
         # ---- Policy 校验 -------------------------------------------------
         ctx = make_context(state)
+        ctx.spawner = self.spawner      # M5：子任务能力随上下文下发（工具不持有全局状态）
         decision = self.policy.check(
             tc.name,
             tc.arguments,
@@ -1638,13 +1643,15 @@ class AgentCore:
 
         injected = bool(outcome.hits)
         payload = outcome.to_event()
-        payload.update(mode=mode, injected=injected, query_source=query_source)
+        payload.update(mode=mode, injected=injected, query_source=query_source,
+                       retrieval=outcome.retrieval, degraded=outcome.degraded)
         self.bus.rag_result(payload, turn=state.turn)
         state.rag_queries.append({
             "query": query, "mode": mode, "count": len(outcome.hits),
             "found": outcome.found, "chars": outcome.chars,
             "elapsed_ms": outcome.elapsed_ms, "injected": injected,
             "reason": outcome.reason, "query_source": query_source, "used": 0,
+            "retrieval": outcome.retrieval, "degraded": outcome.degraded,
         })
         if injected:
             # ★ 只有"真的进了上下文"才记 rag_hits —— 与"检索到但没注入"区分开

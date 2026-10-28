@@ -49,6 +49,14 @@ class SearchDocsTool(Tool):
                 "type": "string",
                 "description": "检索关键词（中文或英文均可）。用具体名词/术语，不要写整段问题。",
             },
+            "mode": {
+                "type": "string",
+                "enum": ["auto", "keyword", "semantic", "hybrid"],
+                "description": (
+                    "检索方式：keyword=关键词(BM25)；semantic=语义向量；hybrid=两路融合；"
+                    "auto=用服务端默认配置。向量不可用时会自动降级为 keyword 并在结果里标注。"
+                ),
+            },
             "k": {
                 "type": "integer",
                 "description": "最多返回几条片段，默认 4，上限 10。",
@@ -80,6 +88,9 @@ class SearchDocsTool(Tool):
             except (TypeError, ValueError):
                 k = self.knowledge.config.top_k
             k = max(1, min(self.MAX_K, k))
+            mode = str(args.get("mode") or "auto").strip().lower()
+            if mode not in ("auto", "keyword", "semantic", "hybrid"):
+                mode = "auto"
 
             if not self.knowledge.usable:
                 return ToolResult.failure(
@@ -90,7 +101,8 @@ class SearchDocsTool(Tool):
                 )
 
             outcome = await asyncio.to_thread(
-                self.knowledge.retrieve, ctx.workspace, query, k=k
+                self.knowledge.retrieve, ctx.workspace, query, k=k,
+                mode="" if mode == "auto" else mode
             )
             if outcome.error:
                 return ToolResult.failure(
@@ -106,6 +118,7 @@ class SearchDocsTool(Tool):
                     self.name,
                     f"没有检索到与「{query}」匹配的项目资料（索引 {outcome.stats.chunks if outcome.stats else 0} 个片段）",
                     data={"query": query, "hits": [], "reason": outcome.reason or "no_hit",
+                          "retrieval": outcome.retrieval, "degraded": outcome.degraded,
                           "elapsed_ms": outcome.elapsed_ms},
                     duration_ms=t.ms,
                 )
@@ -116,6 +129,8 @@ class SearchDocsTool(Tool):
                 f"检索到 {len(outcome.hits)} 条资料（{paths}）",
                 data={
                     "query": query,
+                    "retrieval": outcome.retrieval,
+                    "degraded": outcome.degraded,
                     "found": outcome.found,
                     "hits": [
                         {**h.to_dict(), "text": h.text} for h in outcome.hits

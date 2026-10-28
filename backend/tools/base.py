@@ -249,6 +249,11 @@ class ToolContext:
     # ★ 任务取消信号（AgentCore 的 cancel_event）。长耗时工具（run_command）
     #   必须在它被 set 时立刻收手，否则"用户点了停止"要等命令自己超时。
     cancel_event: Any = None
+    # M5：子任务派生器（由服务端装配注入；为 None 表示当前不允许派生子任务）
+    spawner: Any = None
+    # M5：子任务要继承的安全约束（来自父任务 TaskState）
+    allowed_paths: list[str] | None = None
+    forbidden_paths: list[str] | None = None
 
     # 可注入的配置（避免工具直接 import config，保证可测试）
     max_read_chars: int = 40_000

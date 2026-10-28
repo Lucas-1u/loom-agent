@@ -157,9 +157,15 @@ def classify_intent(goal: str, *, forbidden_paths: list[str] | None = None) -> I
         return out
 
     # ---- 3. 关键词 ----
+    # ★ M5：先把**否定式约束**从句摘掉再打分。
+    #   真实事故：子任务目标里写着"读取并汇报，不要修改任何文件"，
+    #   结果命中 repair 的关键词「修改」→ 判定成修复意图 →
+    #   M3 的"零改动零验证"闸门把它判成未通过（verification_failed）。
+    #   "不要修改"是**约束**，不是**意图** —— 不能让它把任务变成修复任务。
+    keywords_text = _NEGATIVE_CLAUSE_RE.sub(" ", text)
     scores: dict[str, list[str]] = {}
     for intent, words in _INTENT_KEYWORDS.items():
-        hits = [w for w in words if w in text]
+        hits = [w for w in words if w in keywords_text]
         if hits:
             scores[intent] = hits
     if not scores:
@@ -181,6 +187,12 @@ def classify_intent(goal: str, *, forbidden_paths: list[str] | None = None) -> I
     out.reasons.append(f"命中 {best[0]} 关键词：{best[1]}")
     return out
 
+
+# 否定式约束从句："不要修改…" / "请勿删除…" / "禁止改动…" 等
+_NEGATIVE_CLAUSE_RE = re.compile(
+    r"(?:不要|请勿|别|不能|不得|禁止|无需|不需要)[^。；\n]{0,20}?"
+    r"(?:修改|改动|改写|删除|移除|改变|写入|新增|添加|创建|提交|推送)[^。；\n]*"
+)
 
 _BAN_RE = re.compile(
     r"(不要修改|不许修改|禁止修改|不准修改|不要改|不许改|禁止改|别改|不要动|不要写入)"

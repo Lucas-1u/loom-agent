@@ -480,8 +480,8 @@ class TaskState:
     history_persist_errors: int = 0
     # Graph 引擎的节点轨迹（验收"确实经过节点和边"用）
     graph_trace: list[str] = field(default_factory=list)
-    # 实际使用的编排引擎标识（legacy | graph）
-    engine: str = "legacy"
+    # 实际使用的编排引擎标识（graph | legacy）；run() 会按配置写入
+    engine: str = "graph"
     # 压缩记录（最多留最近 10 次）
     compaction_log: list[dict[str, Any]] = field(default_factory=list)
     # ---- 第六批：预算续期与耗尽原因分类 ----

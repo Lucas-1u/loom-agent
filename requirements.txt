@@ -27,3 +27,8 @@ langgraph>=0.2,<0.7
 # 官方 Python SDK；已验证 mcp 2.3.0 在 Python 3.13 上可用（stdio transport）
 # 它会带来 mcp-types / jsonschema / cryptography / pyjwt / sse-starlette / python-multipart 等间接依赖
 mcp>=2.3,<3
+
+# ---- 混合检索（M6，可选：LOOM_RAG_EMBED=onnx 才用）----
+# 本地 ONNX embedding（fastembed 自带 onnxruntime + tokenizers）
+# 模型权重默认缓存在 sandbox/models（已 gitignore），首次启用需下载 ~90MB
+fastembed>=0.4,<1

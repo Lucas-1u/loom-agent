@@ -45,9 +45,11 @@ Loom：[PLAN   ] 计划 3 步
 | 结构化事件流（**19** 种事件类型） | ✅ |
 | 上下文压缩 / 文件读取复用 / 预算续期 | ✅ |
 | 消息历史持久化（`task_history`，append-only） | ✅ |
-| 编排引擎（`LOOM_ORCHESTRATOR=legacy\|graph`，默认 legacy） | ✅ 双引擎 |
+| 编排引擎（`LOOM_ORCHESTRATOR=graph\|legacy`，**默认 graph**；legacy 保留为显式兜底） | ✅ 双引擎 |
 | **项目知识检索**（SQLite FTS5 关键词检索，自动预检索 + `search_docs` 工具） | ✅ M3 |
 | **外部工具 MCP Client**（本地 stdio Server，工具进统一注册表 + 审批） | ✅ M4.1 |
+| **父子任务 Multi-Agent**（`spawn_subtask`，串行，子任务继承约束与引擎） | ✅ M5 |
+| **宿主机终端**（`terminal`：PowerShell / CMD / Git Bash，审批 + 工作区边界 + 超时） | ✅ 新增 |
 | Windows 一键启动器 | ✅ |
 | `delete_file` | ⬜ **未实现**（从未写过，不在当前 M1–M6 计划内） |
 | 浏览器 GUI（React + Vite） | ✅ 已接真实后端 |
@@ -303,6 +305,24 @@ Session（有自己的工作目录）
 
 资料块受预算约束（默认 4 条 / 单条 700 字符 / 总量 2600 字符），相邻片段会合并但不会跨越未命中的行。
 
+### 检索方式：关键词 / 向量 / 融合（M6）
+
+`search_docs` 多了 `mode` 参数：
+
+| mode | 含义 |
+|---|---|
+| `keyword` | 只用 FTS5 + bm25（老行为） |
+| `semantic` | 只用向量余弦（本地 fastembed，ONNX） |
+| `hybrid` | 两路各取候选，RRF 按名次融合（默认） |
+| `auto` | 用服务端配置（`LOOM_RAG_MODE`，默认 hybrid） |
+
+- 向量**默认关闭**（`LOOM_RAG_EMBED=off`）：不下载模型、不占内存，纯关键词；
+  打开后模型缓存在 `sandbox/models/fastembed`（已 gitignore，~90MB）。
+- 向量不可用（没装 fastembed / 模型没下载 / 编码失败）时，`semantic`/`hybrid` 会**降级成关键词**，
+  并在结果与事件里标 `degraded`（例如 `no_embedder:off`）——**不会**静默返回空。
+- 每条命中带 `matched_by`（`bm25` / `vector` / `both`），便于判断"这条是靠词面还是语义找到的"。
+- 索引是增量的：只有新增/改动的片段会重算向量；换模型时按 `model` 字段隔离，旧向量不参与新模型的检索。
+
 ### 来源追溯（M4.2）
 
 三个层次分开记，**不混为一谈**：
@@ -402,6 +422,77 @@ LOOM_RAG_CONTEXT_CHARS=2600  # 注入总量上限
 - **取消**：任务取消时 SDK 侧的 in-flight 调用没有安全取消接口；Loom 侧靠"调用超时 + 标记不可用 + 关闭时强制收尾"兜底，
   不会无限阻塞，但**正在 Server 里跑的那次调用无法被中断**（Server 进程本身不受 Loom 控制）。
 - Server 进程健康度没有持续探测（只在调用失败/超时时转为 failed）。
+
+---
+
+## 父子任务（M5，首版串行）
+
+`spawn_subtask` 让父 Agent 把一件可独立验收的事派给**子任务**，并**等它结束**：
+
+```
+父 Agent → spawn_subtask(goal) → 审批（risk=write）→ 子任务（自己的 task_id/事件/预算）
+                                                    → 子 AgentCore 跑完 → 结果信封回父
+```
+
+结果信封：`task_id / status / end_reason / summary / evidence / tools / commands / changes` ——
+父任务依据**证据**决定是否采纳，而不是因为子任务说"已完成"。
+
+安全边界（都经过测试）：
+
+| 约束 | 默认 | 说明 |
+|---|---|---|
+| 派生层级 | 2 | 子任务再派生会被拒绝（`rejected`） |
+| 每父任务子任务数 | 3 | 超限拒绝，不会无限派生 |
+| 子任务预算 | 8 轮 / 180s / 12 次工具 | 比父任务小，**不是**白拿一份新预算 |
+| 单次派生总超时 | 240s | 父任务不会被子任务无限拖住 |
+| 审批 | 派生本身需审批 | 拒绝 = 子任务根本不会被创建 |
+| 引擎 | 继承父任务 | M4.3 起默认 graph；显式 legacy 时子任务也是 legacy |
+
+子任务**共用同一套 ToolRegistry / Policy / 审批 / 闸门 / 审计**，没有旁路；
+子任务默认不再自己规划/反思（父任务已做过拆解），省下的轮次留给工具与验证。
+
+首版不做：并行调度、角色体系、前端任务树（任务树属于 M6）。
+
+---
+
+## 终端执行（`terminal`）
+
+**两个执行工具，安全模型完全不同，别混着理解：**
+
+| 工具 | 在哪跑 | 隔离 | 用来做什么 |
+|---|---|---|---|
+| `run_command` | Docker 容器 | 断网 / 只读根 / 非 root / 限额 | 想要"干净环境"时跑测试、构建 |
+| `terminal` | **你的机器**（PowerShell / CMD / Git Bash） | **没有沙箱** | 需要真实本机环境：git、本地路径、已安装工具 |
+
+`terminal` 的安全边界 = **审批 + 工作目录 + 超时 + 输出限制**，不是容器。
+
+### 参数
+
+```json
+{"command": "git status --short", "cwd": ".", "shell": "auto", "timeout": 60}
+```
+
+- `shell`：`auto`（优先 PowerShell 7 → Windows PowerShell → CMD）/ `powershell` / `cmd` / `bash`（只认 Git Bash，System32 下的 WSL 启动器会被排除）；
+- `cwd`：相对工作区，**不允许跳出工作区**（`..`、绝对路径都会被拒）；
+- `timeout`：默认 60s，上限 300s；超时/取消会 `taskkill /T` 杀掉整棵进程树。
+
+### 什么要审批
+
+- 默认**每条都要批**（`risk=exec`）；
+- 只有命中只读白名单（`git status`、`dir`、`echo`、`python --version`…）**且不含任何 shell 元字符**时才免审批；
+- 含 `;` `&&` `|` `>` `$(` 之类的一律按 exec 处理 —— 白名单只是"少打扰"，不是安全边界。
+
+### 输出与凭据
+
+- stdout / stderr **分开**返回，退出码非零就是失败（不会伪装成功）；
+- 单条流最多 6000 字符，超出保留首尾并标注"输出被截断"；
+- 名字像 KEY/TOKEN/SECRET/PASSWORD 的环境变量**不传给子进程**；输出里若出现这些值，会被替换成 `***` 并记录打码次数。
+
+### 已知限制
+
+- **没有操作系统级沙箱**：命令以你的用户身份运行，能访问你的文件和网络。审批卡片里写明了这一点。
+- 复杂引号在 CMD 下会被拆坏（例如 `python -c "print(1)"`）。这是 cmd 的引号规则，不是工具行为；需要复杂引号请用 `shell="powershell"` 或写成脚本文件。
+- 前端展示的是命令 + 输出文本，不是交互式 PTY（没有持续输入/光标控制）。
 
 ---
 
@@ -679,15 +770,17 @@ server/  →  agent/  →  tools/
 ## 测试
 
 ```bash
-# 离线自检（不需要 API Key）—— 本次全部实跑，合计 1196 项
+# 离线自检（不需要 API Key）—— 本次全部实跑，合计 1308 项
 python -m backend.selfcheck_p1      #  55 —— 契约层（含事件类型 19 的断言）
 python -m backend.selfcheck_p2      #  45 —— 模型层（含候选轮换）
 python -m backend.selfcheck_agent   # 594 —— Agent 全链路（重点，含修复任务门禁）
 python -m backend.selfcheck_cli     #  67 —— CLI 渲染 + 审批 + 终端输入解码
 python -m backend.selfcheck_server  # 185 —— 存储 / 事件广播 / 运行时 / 调度
 python -m backend.selfcheck_sandbox #  96 —— 沙箱参数与控制流（假进程）
-python -m backend.selfcheck_rag     #  91 —— M3/M4.2：索引 / 检索 / 集成 / 安全 / 闭环 / 事件契约
+python -m backend.selfcheck_rag     # 109 —— M3/M4.2/M6：索引 / 检索 / 集成 / 安全 / 闭环 / 混合 / 事件契约
 python -m backend.selfcheck_mcp     #  63 —— M4.1：真实 stdio 子进程，连接/发现/注册/审批/取消/超时/关闭
+python -m backend.selfcheck_subtask  #  32 —— M5：父子任务关联/迁移/派生/审批/上限/超时/取消
+python -m backend.selfcheck_terminal #  59 —— 终端：探测/真跑/退出码/stdout-stderr/超时/取消/越界/审批/双引擎
 python dev/test_workspace_reuse.py  #  17 —— 启动器的工作目录选择器
 
 # 集成 / 真实环境
@@ -712,7 +805,7 @@ npm run test:events      # 33 —— 事件契约：后端 EventType ↔ 前端�
 - 审批批了 A → 实际执行的是 B
 - `/proj_evil` 被当成 `/proj` 的子目录
 
-这些都不会崩，只会静默地做错事。**1196 项自检就是用来钉死这些的。**
+这些都不会崩，只会静默地做错事。**1308 项自检就是用来钉死这些的。**
 
 ---
 

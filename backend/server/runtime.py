@@ -59,6 +59,7 @@ class TaskRuntime:
         hub: EventHub,
         store: TaskStore,
         knowledge: object | None = None,
+        spawner: object | None = None,
         allowed_paths: list[str] | None = None,
         forbidden_paths: list[str] | None = None,
     ) -> None:
@@ -84,6 +85,8 @@ class TaskRuntime:
             history_sink=StoreHistorySink(self._store),
             # M3：项目知识检索（不传则无 RAG）
             knowledge=knowledge,
+            # M5：子任务派生器（不传则 spawn_subtask 不可用）
+            spawner=spawner,
         )
 
         # ---- 服务层状态 ----

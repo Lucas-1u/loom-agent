@@ -158,6 +158,8 @@ def build_default_registry(
     sandbox: "SandboxManager | None" = None,
     knowledge: "KnowledgeBase | None" = None,
     mcp: "McpManager | None" = None,
+    spawner: Any = None,
+    terminal: bool | None = None,
 ) -> ToolRegistry:
     """
     构建默认工具集。
@@ -172,6 +174,7 @@ def build_default_registry(
     knowledge 允许注入项目知识库（M3）：**不传就不注册 search_docs** ——
     这样离线演示、单测、没开 RAG 的部署里，工具清单与以前完全一致。
     mcp 允许注入 MCP 管理器（M4.1）：**不传就不注册任何 MCP 工具**。
+    spawner 允许注入子任务派生器（M5）：**不传就不注册 spawn_subtask**。
     """
     from .readonly.list_files import make as make_list
     from .readonly.read_file import make as make_read
@@ -182,6 +185,11 @@ def build_default_registry(
     if knowledge is not None and getattr(knowledge, "usable", False):
         from .readonly.search_docs import make as make_search
         reg.register(make_search(knowledge), group="readonly")
+
+    if spawner is not None:
+        # M5：父子任务（不传 spawner 就没有这个工具，行为与 M4 完全一致）
+        from .mutating.spawn_subtask import make as make_spawn
+        reg.register(make_spawn(spawner), group="subagent")
 
     if mcp is not None:
         # MCP 工具走同一套注册表；风险等级由配置决定（默认 WRITE=需审批）。
@@ -205,6 +213,16 @@ def build_default_registry(
         # ★ run_command 单独分组：它的风险不在"改文件"，而在"能执行任意程序"，
         #   安全边界是 Docker 容器（见 backend/sandbox/manager.py）。
         reg.register(make_run(sandbox), group="exec")
+
+        # ★ M6：宿主机终端（PowerShell / CMD / Git Bash）。默认开启，
+        #   LOOM_TERMINAL=0 可关闭。它不走 Docker：安全边界是审批 + 工作目录 + 超时。
+        import os as _os
+        _terminal_on = (terminal if terminal is not None
+                        else _os.environ.get("LOOM_TERMINAL", "1").lower()
+                        not in ("0", "false", "off", "no"))
+        if _terminal_on:
+            from .exec.terminal import make as make_terminal
+            reg.register(make_terminal(), group="exec")
 
     return reg
 

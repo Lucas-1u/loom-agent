@@ -107,6 +107,8 @@ class Hit:
     text: str
     score: float
     ord: int = 0
+    # M6：这条命中是关键词、向量还是两路都命中（便于排障与前端展示）
+    matched_by: str = ""
 
     @property
     def locator(self) -> str:
@@ -121,6 +123,7 @@ class Hit:
             "locator": self.locator,
             "score": round(self.score, 4),
             "chars": len(self.text),
+            "matched_by": self.matched_by,
         }
 
 
@@ -138,6 +141,10 @@ class IndexStats:
     skipped: dict[str, int] = field(default_factory=dict)
     errors: list[dict[str, str]] = field(default_factory=list)
     truncated: bool = False
+    # M6：本轮新算的向量数 / 库里已有的向量总数 / 本次是否降级
+    embedded: int = 0
+    vectors: int = 0
+    degraded: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -153,6 +160,9 @@ class IndexStats:
             "skipped": dict(self.skipped),
             "errors": self.errors[:10],
             "truncated": self.truncated,
+            "embedded": self.embedded,
+            "vectors": self.vectors,
+            "degraded": self.degraded,
         }
 
 
@@ -181,6 +191,18 @@ CREATE TABLE IF NOT EXISTS rag_chunks (
 CREATE INDEX IF NOT EXISTS idx_rag_chunks_ws ON rag_chunks(workspace, path);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS rag_fts USING fts5(tokens, tokenize='unicode61');
+
+-- M6：向量（float32 BLOB，已归一化 → 点积即余弦）
+-- model 记进主键的一部分：换模型/维度时必须整库重算，不能混用
+CREATE TABLE IF NOT EXISTS rag_vectors (
+  chunk_id   INTEGER PRIMARY KEY,
+  workspace  TEXT NOT NULL,
+  model      TEXT NOT NULL,
+  dim        INTEGER NOT NULL,
+  vec        BLOB NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rag_vectors_ws ON rag_vectors(workspace, model);
 """
 
 
@@ -306,12 +328,99 @@ class RagStore:
     def _delete_file(self, ws: str, path: str) -> None:
         ids = [r[0] for r in self._conn.execute(
             "SELECT id FROM rag_chunks WHERE workspace = ? AND path = ?", (ws, path))]
+        if ids:
+            self._conn.execute(
+                f"DELETE FROM rag_vectors WHERE chunk_id IN ({','.join('?' for _ in ids)})",
+                tuple(ids),
+            )
         for cid in ids:
             self._conn.execute("DELETE FROM rag_fts WHERE rowid = ?", (int(cid),))
         self._conn.execute("DELETE FROM rag_chunks WHERE workspace = ? AND path = ?", (ws, path))
         self._conn.execute("DELETE FROM rag_files WHERE workspace = ? AND path = ?", (ws, path))
 
     # ---- 检索 --------------------------------------------------------------
+    # ===================================================================== #
+    # M6：向量（暴力余弦；语料在几百~几千片段量级，够用且零额外依赖）
+    # ===================================================================== #
+    def pending_chunks(self, ws: str, model: str, *, limit: int = 512) -> list[tuple[int, str]]:
+        """还没有该模型向量的片段（按 id 升序，保证分批稳定）。"""
+        rows = self._conn.execute(
+            "SELECT c.id, c.text FROM rag_chunks c "
+            "LEFT JOIN rag_vectors v ON v.chunk_id = c.id AND v.model = ? "
+            "WHERE c.workspace = ? AND v.chunk_id IS NULL ORDER BY c.id LIMIT ?",
+            (model, ws, limit),
+        ).fetchall()
+        return [(int(cid), text or "") for cid, text in rows]
+
+    def save_vectors(self, ws: str, model: str, rows: list[tuple[int, list[float]]]) -> int:
+        """
+        写入向量（已归一化）。返回写入条数。
+
+        ★ 用 float32 + BLOB：512 维 ≈ 2KB/条，1000 条 ≈ 2MB。
+        """
+        if not rows:
+            return 0
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO rag_vectors"
+                "(chunk_id, workspace, model, dim, vec, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (cid, ws, model, len(vec), _pack(vec), now)
+                    for cid, vec in rows if vec
+                ],
+            )
+            self._conn.commit()
+        return len(rows)
+
+    def vector_count(self, ws: str, model: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM rag_vectors WHERE workspace = ? AND model = ?",
+            (ws, model),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def vector_search(self, ws: str, qvec: list[float], model: str, *,
+                      limit: int = 20) -> list[tuple[int, float]]:
+        """
+        暴力余弦：读出该工作区该模型的全部向量，点积排序。
+
+        ★ 为什么不做 ANN：几百~几千条的规模下，纯 Python 点积 <50ms，
+          引入 faiss/chroma 只是多一个依赖和一个需要同步的索引。
+        """
+        if not qvec:
+            return []
+        qn = _normalize(qvec)
+        rows = self._conn.execute(
+            "SELECT chunk_id, vec FROM rag_vectors WHERE workspace = ? AND model = ?",
+            (ws, model),
+        ).fetchall()
+        scored: list[tuple[int, float]] = []
+        for cid, blob in rows:
+            vec = _unpack(blob)
+            if not vec:
+                continue
+            scored.append((int(cid), _dot(qn, vec)))
+        scored.sort(key=lambda kv: kv[1], reverse=True)
+        return scored[:limit]
+
+    def chunks_by_ids(self, ws: str, ids: list[int]) -> list[tuple[int, Hit]]:
+        """按 id 取回片段（保持传入顺序）→ [(id, Hit)]；score 由调用方填。"""
+        if not ids:
+            return []
+        marks = ",".join("?" for _ in ids)
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT id, path, ord, title, start_line, end_line, text FROM rag_chunks "
+                f"WHERE workspace = ? AND id IN ({marks})", (ws, *ids),
+            )
+            found = {
+                int(cid): Hit(path=path, title=title, start_line=int(sl), end_line=int(el),
+                              text=text, score=0.0, ord=int(od))
+                for cid, path, od, title, sl, el, text in cur
+            }
+        return [(i, found[i]) for i in ids if i in found]
+
     def search(self, workspace: str, query: str, *, limit: int = 20) -> list[Hit]:
         """
         关键词检索（FTS5 MATCH + bm25）。
@@ -347,3 +456,37 @@ class RagStore:
                                 text=text, score=-order[int(cid)], ord=int(ordinal)))
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[:limit]
+
+
+# --------------------------------------------------------------------------- #
+# M6：向量编解码（float32 BLOB；归一化后点积 = 余弦）
+# --------------------------------------------------------------------------- #
+def _normalize(vec: list[float]) -> list[float]:
+    norm = 0.0
+    for v in vec:
+        norm += v * v
+    if norm <= 0:
+        return []
+    inv = 1.0 / (norm ** 0.5)
+    return [v * inv for v in vec]
+
+
+def _pack(vec: list[float]) -> bytes:
+    import struct
+
+    return struct.pack(f"<{len(vec)}f", *_normalize(vec))
+
+
+def _unpack(blob: bytes) -> list[float]:
+    import struct
+
+    n = len(blob) // 4
+    if n <= 0:
+        return []
+    return list(struct.unpack(f"<{n}f", blob))
+
+
+def _dot(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))
