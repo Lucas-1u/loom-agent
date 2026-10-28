@@ -1,136 +1,86 @@
 # Loom Agent
 
-> **把 Agent 的内部机制摊开给你看。**
+**一个跑在自己电脑上的 Coding Agent 运行时。**
+给它一句话，它会规划、查项目、调工具、改文件、跑命令、验证结果，最后给一份**带证据**的答案。
 
-目标形态是 Codex / Cursor 式的个人 Coding Agent。但现阶段的目标不是"功能做得多"，
-而是 **"每一步都能讲清楚为什么"** —— 这是一个用来**理解现代 AI Agent 内部架构**的实验平台。
+- 默认执行引擎 **Graph**（LangGraph），**Legacy** 保留为显式兜底
+- **1308** 项离线自检 · **19** 种事件 · **6** 个内置工具 + 可选 RAG / MCP / 子任务
+- 离线优先、审批前置：没有 API Key 也能跑演示，没有网络也不影响核心逻辑
 
-**纯 Python · 手写 Agent Loop · 自检 1103 项（离线，全部通过）· 真实模型 7/7 场景通过**
-
----
-
-## 这是什么
-
-Loom 是一个跑在本地的 Coding Agent：
-
-```
-你：分析一下这个项目的结构
-
-Loom：[PLAN   ] 计划 3 步
-       1. 列出根目录文件
-       2. 读取入口文件与配置
-       3. 归纳项目结构与关键发现
-      [TOOL   ] list_files(path=".")
-      [RESULT ] 12 个文件，3 个目录
-      [THINK  ] 有 main.py 和 requirements.txt，先读这两个
-      [TOOL   ] read_file(path="main.py")
-      ...
-      [ANSWER ] ## 关键发现
-                1. README 描述的结构与实际不符
-                2. main.py 引用了 services/，但该目录不存在
-```
-
-跟"调一个 API 让模型聊天"的区别在于：**Agent Loop、状态机、权限判定、事件流全部是手写的显式代码**，
-不藏在任何编排框架里。
-
-### 它现在能做什么（截至 M2.2）
-
-| 能力 | 状态 |
-|---|---|
-| 五阶段 Agent Loop（PLAN / ACT / OBSERVE / REFLECT / FINAL） | ✅ |
-| 工具调用（列目录 / 读文件 / 写文件 / 局部修改 / 沙箱执行命令） | ✅ 内置 5 个（可选：`search_docs`，MCP 工具按需注册） |
-| **局部修改** `edit_file`（唯一匹配 / 冲突检测 / stale 检测 / diff 预览） | ✅ |
-| 写操作**人工审批**（真挂起-恢复，不是轮询） | ✅ |
-| 工作区越界防护 / 允许-禁止范围 / 改动审计 | ✅ |
-| 结构化事件流（**19** 种事件类型） | ✅ |
-| 上下文压缩 / 文件读取复用 / 预算续期 | ✅ |
-| 消息历史持久化（`task_history`，append-only） | ✅ |
-| 编排引擎（`LOOM_ORCHESTRATOR=graph\|legacy`，**默认 graph**；legacy 保留为显式兜底） | ✅ 双引擎 |
-| **项目知识检索**（SQLite FTS5 关键词检索，自动预检索 + `search_docs` 工具） | ✅ M3 |
-| **外部工具 MCP Client**（本地 stdio Server，工具进统一注册表 + 审批） | ✅ M4.1 |
-| **父子任务 Multi-Agent**（`spawn_subtask`，串行，子任务继承约束与引擎） | ✅ M5 |
-| **宿主机终端**（`terminal`：PowerShell / CMD / Git Bash，审批 + 工作区边界 + 超时） | ✅ 新增 |
-| Windows 一键启动器 | ✅ |
-| `delete_file` | ⬜ **未实现**（从未写过，不在当前 M1–M6 计划内） |
-| 浏览器 GUI（React + Vite） | ✅ 已接真实后端 |
-| 桌面外壳（Tauri） | ⬜ 未实现（`frontend/src-tauri` 不存在） |
+> 这是**学习型项目**，不是产品：架构清晰 > 功能数量，可理解性 > 代码量。
+> 所以代码里有大量"为什么这么写、踩过什么坑"的注释，也有明确写着"这个不做"的边界。
 
 ---
 
-## 命令执行（`run_command` + Docker 沙箱）
+## 目录
 
-Agent 可以跑 Python 脚本、pytest、构建命令，但**只能在容器里跑**。
-审批与隔离是两层：批准只代表"这条命令可以执行"，**不会**放宽任何一条隔离限制。
-
-### 一次性准备镜像
-
-沙箱默认断网，所以依赖必须打进镜像（运行期 `pip install` 一定失败）：
-
-```bash
-docker build -f dev/Dockerfile.sandbox -t loom-sandbox:py312 .
-```
-
-需要更多依赖就改 `dev/Dockerfile.sandbox` 里的 `pip install` 再 build。
-镜像默认锁到 `python:3.12.7-slim`；要更严格可锁 digest（见该文件注释）。
-运行时带 `--pull never`，本地没有镜像时直接报错，**不会偷偷联网拉取**。
-
-### 每次执行的固定限制（写死在代码里，模型改不了）
-
-| 限制 | 值 |
-|---|---|
-| 网络 | `--network none`（要联网必须改代码） |
-| 用户 | `--user 1000:1000`（非 root） |
-| 根文件系统 | `--read-only`，只有 `/tmp` 是 tmpfs |
-| capabilities | `--cap-drop ALL` + `no-new-privileges` |
-| 资源 | 1 CPU / 512MB 内存（含 swap）/ 128 进程 / 默认 60s、上限 300s |
-| 挂载 | 只挂工作区到 `/workspace`（读写），不挂 docker.sock / 家目录 / 系统目录 |
-| 环境变量 | 只注入 `HOME` / `TMPDIR` / 三个 Python 变量，不透传宿主机 env |
-| 输出 | stdout / stderr 各 16KB，超出截断（不静默） |
-
-### Docker 不可用时
-
-`run_command` 返回 `sandbox_unavailable` 并说明原因，**不会退回到宿主机执行**。
-服务启动时会在横幅和 `/api/health` 的 `sandbox` 字段里显示状态。
-
-### 测试
-
-```bash
-python -m backend.selfcheck_sandbox        # 96 项，离线（不需要 Docker）
-python -m backend.test_sandbox_docker      # 25 项真实容器；没有 Docker 会 [SKIP]
-```
-
-离线用例验证的是**参数与控制流**，不能替代真实隔离验证。
-
-> ⚠️ 这不是"绝对安全"的沙箱：它与 Docker 守护进程同权限级别，
-> 容器逃逸/内核漏洞仍可能影响宿主机。它降低的是"Agent 跑错命令把系统搞坏"的风险，
-> 不是对抗恶意代码的强隔离。
+- [1. 这是什么](#1-这是什么)
+- [2. 现在能做什么](#2-现在能做什么)
+- [3. 快速开始](#3-快速开始)
+- [4. 架构](#4-架构)
+- [5. 一个任务的一生](#5-一个任务的一生)
+- [6. 核心机制](#6-核心机制)
+- [7. 工具与安全](#7-工具与安全)
+- [8. 检索：BM25 + 本地向量](#8-检索bm25--本地向量)
+- [9. 外部工具：MCP](#9-外部工具mcp)
+- [10. 父子任务](#10-父子任务)
+- [11. 数据与持久化](#11-数据与持久化)
+- [12. 前端](#12-前端)
+- [13. 测试](#13-测试)
+- [14. 配置](#14-配置)
+- [15. 已知限制](#15-已知限制)
+- [16. 路线图](#16-路线图)
+- [17. 目录结构](#17-目录结构)
+- [18. 文档索引](#18-文档索引)
 
 ---
 
-## 为什么又造一个 Agent
+## 1. 这是什么
 
-市面上的 Agent 框架很多，用起来很方便 —— 但**关键机制被封装起来了**，
-想看清"它到底怎么跑的"就很难。遇到问题时你只能猜：是模型没选对工具？
-是上下文拼错了？还是权限判定把请求拦了？
+Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批、可审计、可回放。
 
-Loom 反过来做：不用 LangChain 之类的编排层，核心机制全部手写，
-**每一处都留了注释说明"为什么这么设计""不这么做会怎样"**。
+| 维度 | 普通 Chatbot / 单轮 API | Loom |
+|---|---|---|
+| 输入 | 一句话 | 一句话 → 任务（可取消、可被审批阻塞） |
+| 输出 | 一段文本 | 一段**有证据**的文本 + 完整执行轨迹 |
+| 过程 | 无 | PLAN → ACT → TOOLS → REFLECT → FINAL，多轮自纠正 |
+| 副作用 | 无 | 读/写工作区、Docker 沙箱命令、宿主机终端、MCP 工具 |
+| 安全 | 无 | Policy 七道关卡 + 人工审批 + 预算熔断 + 验证闸门 |
+| 可观测 | 无 | 19 种事件经 SSE 推到时间线，可按 `task_id` 回放 |
+| 失败语义 | 编一段话 | 终态 + 原因码 + 证据等级，**绝不伪造成功** |
 
-代价是功能少、跑得慢。收益是 —— **打开任何一个文件都能读懂**。
-
-三条优先级铁律（冲突时按这个顺序让步）：
-
-1. **架构清晰 > 功能数量**
-2. **可理解性 > 代码量**
-3. **可扩展性 > 快速堆功能**
-
-界面美观度不是当前目标。
+一句话区分它和普通 Chatbot 的地方：**"说完成"不算完成，要过验证闸门**。
 
 ---
 
-## 快速开始
+## 2. 现在能做什么
 
-### 先看它跑（不需要 API Key）
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 多轮 Agent 执行 | ✅ | Graph 默认；Legacy 显式兜底 |
+| 文件读 / 列目录 | ✅ | 40k 字符截断、多编码、行号、hash |
+| 文件写 / 局部改 | ✅ | 覆盖前备份、唯一匹配、`expect_hash` 防 stale |
+| Docker 沙箱命令 | ✅ | 断网 / 只读根 / 非 root / 限额，无宿主机分支 |
+| **宿主机终端** | ✅ | pwsh / Windows PS / CMD / Git Bash；**无沙箱**，靠审批 + cwd + 超时 |
+| Policy + 人工审批 | ✅ | 七道关卡；`asyncio.Future` 真挂起，超时=拒绝 |
+| 预算 / 熔断 / 取消 | ✅ | 轮次·秒·工具数·重复·错误；取消在下一轮检查点生效 |
+| 验证闸门 + 证据分级 | ✅ | A/B/C 分级 + "零改动不得报 done" |
+| 项目知识检索 | ✅ | FTS5 + bm25；**可选**本地向量 + RRF 融合 |
+| MCP 工具接入 | ✅ | 仅本地 stdio；默认要审批；无自动重连 |
+| 父子任务 | 🟡 | 串行派生、结果信封、层级/数量/预算上限 |
+| 事件 + SSE 时间线 | ✅ | 19 种事件，`since` 补拉 + `stream.gap` 快照恢复 |
+| 任务持久化 | ✅ | SQLite：sessions / tasks / task_history |
+| 跨进程恢复 | ❌ | 无 checkpoint，重启不能续跑 |
+| 并行子任务 / 子任务树 | ❌ | 首版串行；前端树属于 M6 |
+| 桌面应用（Tauri） | ❌ | 只有 `.bat` 启动器 |
+| 向量检索 | 🟡 | 已实现，默认关（`LOOM_RAG_EMBED=off`） |
+| `delete_file` | ❌ | 从未实现 |
+
+---
+
+## 3. 快速开始
+
+### 3.1 先看它跑（不需要 API Key）
 
 ```bash
 git clone https://github.com/Lucas-1u/loom-agent.git
@@ -140,734 +90,512 @@ python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt      # Windows
 # source .venv/bin/activate && pip install -r requirements.txt   # macOS / Linux
 
-# 三个离线演示，各自暴露一条关键路径
 python -m backend.demo            # 正常：规划 → 观测 → 写文件（含审批）
-python -m backend.demo --reject   # 拒绝：写操作被拒后 Agent 如何收场
+python -m backend.demo --reject   # 拒绝：写操作被拒后如何收场
 python -m backend.demo --budget   # 熔断：重复调用 + 轮数耗尽
 ```
 
-`demo` 会自建临时工作区、跑完整套 Agent Loop，然后打印 **调试面板**（轮次 / 证据 /
-审批 / 文件变更 / 计划打勾）、**事件直方图**、**磁盘实际状态**。
-这是理解整套机制最快的入口 —— 两个终端并排跑一次，胜读十页文档。
+`demo` 会自建临时工作区、跑完整套 Agent Loop，打印**调试面板**（轮次/证据/审批/文件变更/计划打勾）、
+**事件直方图**、**磁盘实际状态**。理解机制最快的入口。
 
-### 接真实模型
+### 3.2 接真实模型（CLI）
 
 ```bash
 cp .env.example .env
-# 填入 BAILIAN_API_KEY（阿里云百炼）或 DEEPSEEK_API_KEY
-```
-
-两个供应商都走 OpenAI 兼容协议，**同一个 Adapter 实现**（`models/openai_compat.py`），
-换供应商只改一个配置项。
-
-```bash
+# 填 BAILIAN_API_KEY / DEEPSEEK_API_KEY / XFYUN_API_KEY 之一
 python -m backend.cli -w D:/some/project "分析这个项目的结构"
 ```
 
-常用参数：
+三家都走 OpenAI 兼容协议，同一个 Adapter（`backend/models/openai_compat.py`），换供应商只改配置。
+
+常用参数：`-m bailian|deepseek|xfyun`、`--model-name`、`--readonly`、`--no-plan` / `--no-reflect`、
+`--yes` / `--no`（自动批准/拒绝）、`--dry-run`。交互模式里 `:t` 看工具、`:s` 看预算、`:q` 退出。
+
+### 3.3 起服务 + GUI
 
 ```bash
--m deepseek               # 换供应商（bailian | deepseek）
---model-name qwen3.7-plus # 换具体模型
---readonly                # 只读模式：卸载所有写入工具，零副作用
---no-plan / --no-reflect  # 关掉阶段，做对比实验
---compact --no-think      # 精简输出
---dry-run                 # 只看环境信息，不跑任务
+python -m backend.server                      # 默认 127.0.0.1:8765
+cd frontend && npm install && npm run dev     # http://localhost:5173
 ```
 
-交互模式（不传任务描述）里：`:t` 看工具清单、`:s` 看预算、`:q` 退出。
+前端**真的在跟后端说话**：会话/任务来自 `GET /api/sessions`、`POST /api/tasks`，
+执行过程走 `GET /api/stream`（SSE，断线用 `?since=<lastId>` 补拉），
+审批走 `POST /api/approvals/{id}/decision`，取消走 `POST /api/tasks/{id}/cancel`。
+演示数据只在后端不可达时兜底（右上角显示 `DEMO` / `OFFLINE`，不假装连上）。
 
-### Windows 一键启动
+### 3.4 Windows 一键启动
 
-双击 `loom.bat` 即可，它替你处理了四件容易忘、忘了就报错的事：
+`loom.bat`（CLI）与 `loom-gui.bat`（GUI）：切到项目根、清代理、用 `.venv`、清掉 `PYTHONUTF8` ——
+四件事少做一件就会报错。GUI 版还会查端口、起 Vite、自动开浏览器。
+装到桌面：`python dev/install_desktop.py`。
 
-| 它做了什么 | 不做会怎样 |
-|---|---|
-| 切到项目根目录 | `python -m backend.cli` 找不到包 |
-| 清除系统代理 | 请求被本机代理拦住，卡在「正在调用模型…」直到超时 |
-| 用 `.venv` 里的 Python | 系统 Python 缺依赖，直接崩 |
-| 清掉 `PYTHONUTF8` / `PYTHONIOENCODING` | 输入中文任务时行为不可预测 |
-
-工作目录支持**拖文件夹进窗口**，也支持**直接回车复用上次的**（记忆在 `.loom_last_workspace`）。
-
-**想让 GUI 也能一键启动？**
-
-`loom.bat` 是命令行版。GUI 版是根目录的 `loom-gui.bat`（会装依赖、查端口、起 Vite、自动开浏览器）。
-
-如果不想每次都先进到项目目录，可以把启动器装到桌面：
+### 3.5 Docker 沙箱（`run_command` 用）
 
 ```bash
-python dev/install_desktop.py            # 装到桌面（生成 Loom.bat）
-python dev/install_desktop.py --where    # 只看会装到哪，不写文件
-python dev/install_desktop.py --remove   # 卸载
+docker build -f dev/Dockerfile.sandbox -t loom-sandbox:py312 .
 ```
 
-桌面上的 `Loom.bat` 只是**跳板**：切到项目目录后 `call loom-gui.bat`。
-真正的启动逻辑只在项目里维护一份，不会出现「桌面版和项目版行为不一致」。
-
-> 安装时会把 `__LOOM_HOME__` 占位符替换成当前项目路径 —— 不用手改。
-> 项目挪了位置，重跑一次安装脚本即可。
-
-### GUI 界面（Phase 3c 起已接真实后端）
-
-前端是**真的在跟后端说话**：会话/任务来自 `GET /api/sessions`、`POST /api/tasks`，
-执行过程走 `GET /api/stream`（SSE，断线用 `?since=<lastId>` 补拉），审批走
-`POST /api/approvals/{id}/decision`。演示数据只在后端不可达时兜底（右上角会显示 `DEMO` /
-`OFFLINE` 徽章，不会假装连上了）。
-
-```bash
-# 先起后端（默认 127.0.0.1:8765），再起前端
-python -m backend.server
-cd frontend && npm install && npm run dev      # http://localhost:5173
-
-npm run test:workspace   # 路径规范化 / 分组（26 项）
-npm run test:session     # 会话隔离 + 状态映射（21 项）
-npm run test:events      # 事件契约：后端 EventType ↔ 前端清单 ↔ 样式（33 项）
-```
-
-> `test:events` 不是可选的：`eventStream.ts` 是**按 `EVENT_TYPES` 逐个 addEventListener**
-> 的，清单少一种，那种事件的 SSE 帧就会被浏览器静默丢弃（`context.compacted` 就这么丢过一次）。
-
-**三栏布局：左侧按工作目录分组的会话列表 + 中央双视图 + 底部工作区与输入框。**
-
-| 视图 | 看什么 |
-|---|---|
-| 聊天视图 | 日常对话：用户消息、Markdown 答复、运行状态 |
-| 执行流 | Agent 的每一步：PLAN / TOOL_CALL / TOOL_RESULT / 审批 / 最终回答 |
-
-**四层数据模型**（详细说明见 `frontend/src/features/session/`）：
-
-```
-Session（有自己的工作目录）
-  └── Task（一次具体执行，有自己的 task_id 和事件流）
-        ├── Message（可读对话，不是每条事件都算）
-        └── AgentEvent（执行过程）
-```
-
-**几条硬规则：**
-
-- **历史会话按工作目录分组**，不按时间。分组 key 是**完整规范化路径**，
-  所以 `D:\Projects\demo-app` 和 `E:\Experiments\demo-app` 是两组（界面会自动加长显示名区分）。
-- **切换视图只换渲染**，`SET_VIEW` 只改一个字段，不碰任何数据。
-- **切换会话不重新执行任务**，`SET_ACTIVE_SESSION` 只改选中项。
-- **同一会话多个 Task 时**，执行流顶部会出现任务选择器，事件不会串台。
-
-**调试参数**：
-
-| 参数 | 作用 |
-|---|---|
-| `?view=execution` | 直接打开执行流视图 |
-| `?view=execution&scroll=top` | 从时间线开头看，而不是贴底 |
-
-**当前进度**：布局 / 会话分组 / 双视图 / 事件配色 / 折叠 / 自动滚动 / 响应式都已就绪，
-并且 Phase 3c 已把演示数据换成真实事件（含审批卡、取消、断线补拉）。
-**下一步**：M4（MCP 接入）‖ M5（Multi-Agent），最后 M6 做展示增强（子任务树 / mcp 标记）。
+镜像只需 build 一次；运行期 `--network none` + `--pull never`，**不会联网拉依赖**。
+Docker 不可用时 `run_command` 直接返回 `sandbox_unavailable`——**不降级到宿主机**。
+需要本机环境时用 `terminal`（另一个工具，见 §7）。
 
 ---
 
-## 项目知识检索（M3）
+## 4. 架构
 
-**它是什么**：基于 **SQLite FTS5 的全文关键词检索**。给 Agent 提供"当前工作区内的项目资料"。
-排序依据是 bm25（词频 + 稀有词权重），**不是**语义相似度。
-**它不是什么**：不是向量检索、没有 embedding、没有重排模型——同义词、改述都搜不到，
-只能命中"确实出现过这些词"的片段。
+```mermaid
+flowchart TB
+    UI["React 前端<br/>Chat / 时间线 / 审批卡片"]
+    API["FastAPI<br/>sessions · tasks · approvals · health"]
+    SSE["SSE /api/stream<br/>EventHub（since + gap）"]
+    SCH["TaskScheduler<br/>并发槽 / 取消 / 审批路由"]
+    RT["TaskRuntime"]
+    CORE["AgentCore<br/>阶段方法 · 闸门 · 审计"]
+    G["Graph 引擎（默认）"]
+    L["Legacy _loop（兜底）"]
+    POL["Policy 七道关卡"]
+    APR["ApprovalManager<br/>Future 挂起"]
+    ST["TaskState（59 字段）"]
+    T["工具层<br/>readonly / mutating / exec / subagent / mcp"]
+    EXT["外部<br/>模型 · Docker · 本机 shell · MCP Server"]
+    DB[("SQLite<br/>sessions/tasks/history")]
+    IDX[("FTS5 索引<br/>+ 可选向量")]
 
-### 索引范围
+    UI -->|HTTP| API
+    UI -->|EventSource| SSE
+    API --> SCH
+    SCH --> RT
+    RT --> CORE
+    CORE --> G
+    CORE --> L
+    G --> CORE
+    CORE --> ST
+    CORE --> POL
+    POL --> APR
+    CORE --> T
+    CORE --> EXT
+    CORE -->|事件| SSE
+    SCH --> DB
+    CORE --> DB
+    CORE --> IDX
+```
 
-| 会索引 | 不索引 |
+**依赖方向单向**：`server/ → agent/ → tools/`，**`agent/` 禁止 import `server/`**
+（所以 RAG 自带 SQLite 连接，不复用 server 的库句柄）。
+
+| 层 | 关键文件 | 职责 |
+|---|---|---|
+| 入口 | `server/app.py` `scheduler.py` `runtime.py` | HTTP/SSE、并发调度、单任务执行器 |
+| 内核 | `agent/core.py` | 阶段方法、闸门、审计、RAG 接入、子任务入口 |
+| 编排 | `agent/graph_engine.py` | LangGraph 图；节点调 core 的阶段方法 |
+| 状态 | `agent/state.py` | `TaskState`（唯一真相）、`TaskStatus`、`RiskLevel`、`PlanStep` |
+| 策略 | `agent/policy.py` `agent/approval.py` | 七道关卡、审批挂起/恢复 |
+| 工具 | `tools/base.py` `registry.py` `tools/*` | 工具抽象、注册表、具体工具 |
+| 检索 | `agent/rag/*` | 索引 / 检索 / 融合 / 嵌入 |
+| 外部 | `mcp/*` `sandbox/manager.py` `models/openai_compat.py` | MCP 客户端、Docker 沙箱、模型适配 |
+
+---
+
+## 5. 一个任务的一生
+
+```mermaid
+sequenceDiagram
+    participant FE as 前端
+    participant API as FastAPI
+    participant SCH as Scheduler
+    participant CORE as AgentCore
+    participant POL as Policy
+    participant T as 工具
+    participant HUB as EventHub
+
+    FE->>API: POST /api/tasks {goal, workspace, session_id}
+    API->>SCH: submit(task_id)（落库 status=created）
+    FE->>API: GET /api/stream?task_id&since=0
+    SCH->>CORE: run()（占槽 → mark_started）
+    CORE->>CORE: 意图分类 + 预算初始化 + 历史恢复（只读）
+    loop 每轮
+        CORE->>CORE: 预算 / 取消检查
+        CORE->>CORE: PLAN（首轮）→ RAG 预检索（≤2 次）
+        CORE->>CORE: ACT（调模型）
+        alt 要调工具
+            CORE->>POL: check(tool, args, state)
+            opt 需要审批
+                POL-->>HUB: approval.request
+                FE->>API: POST /api/approvals/{id}/decision
+                API->>POL: resolve（Future.set_result）
+            end
+            POL->>T: 放行 → run()
+            T-->>CORE: ToolResult(ok/summary/data/error)
+            CORE-->>HUB: tool.call / tool.result / observe
+        else 文本答复
+            CORE->>CORE: 三道关口（空回复/证据/闸门）
+        end
+        CORE->>CORE: REFLECT（done? 继续? 收敛?）
+    end
+    CORE->>CORE: 验证闸门 + 证据分级 + 机器判定
+    CORE-->>HUB: final_answer + task.end
+```
+
+关键落点：
+
+| 步骤 | 位置 |
 |---|---|
-| `.md/.markdown/.rst`、`.txt`、`.py/.pyi`、`.json/.toml/.yaml/.yml/.ini`、常见前端与脚本文件 | `.git`、`node_modules`、`.venv`、构建产物、缓存目录 |
-| 单个文件 ≤ 256KB（可配） | `.env*`、密钥/凭据、`*.key/*.pem`、锁文件、二进制、超大文件 |
+| 建任务 / 落库 | `server/app.py` → `store.create_task` |
+| 引擎选择 | `AgentCore.run`：`config.orchestrator`（默认 `graph`） |
+| 上下文构造 | `agent/context.py` + `prompts/system.py`（阶段提示） |
+| 模型调用 | `AgentCore._call_model` → `OpenAICompatAdapter` |
+| 工具执行 | `AgentCore._execute_tools` → `Policy.check` → `tools/registry.execute` |
+| 收尾 | `_finalize_text_reply` / `_final_phase` → `state.finish` |
+| 落终态 | `store.save_task`（写 `state_json`）+ `task_history` |
 
-排除是**在索引阶段**做的：`.env` 根本不会进库，所以检索也不可能命中它。
+---
 
-### 索引存在哪、怎么更新
+## 6. 核心机制
 
-- 默认库：`<项目根>/sandbox/index/knowledge.db`（可用 `LOOM_RAG_DB` 改）
-- **一个文件存所有工作区**，靠 `workspace` 列隔离——切项目不会串内容
-- 增量更新按**内容 sha256**：没变的文件直接跳过；改过的重建该文件的片段；删掉的清出索引
-- 每次任务开始做一次增量同步（毫秒级；仓库几百个文件时）
+### 6.1 阶段与方法
 
-### 查询怎么来
+`AgentCore` 是唯一执行内核，两条引擎调同一组方法：
 
-- 任务开始：用**用户目标**（裁掉"不要修改…"这类纯约束从句，上限 300 字符）检索一次；
-- 计划出来后：用**目标 + 前 3 个步骤标题**再检索一次（步骤标题通常比整段目标更接近检索词）；
-- 每个任务**自动检索最多 2 次**，同一查询不重复 —— 不为了"看起来用了 RAG"而每轮都查；
-- 事件里带 `query_source`（`goal` / `goal+plan`），出问题时能看出"这次为什么查这个"。
+| 阶段 | 方法 | 产出 |
+|---|---|---|
+| 预算 | `_budget_verdict` | 续期 / 终结（`budget_turns`、`budget_seconds`、`cancelled`…） |
+| 计划 | `_plan_phase` | `PlanStep[]`（≤8 步，带完成条件类型） |
+| 行动 | `_act_phase` | `ModelReply`（文本或 tool_calls） |
+| 工具 | `_execute_tools` | `tool_events` / `change_records` / `command_history` |
+| 反思 | `_reflect_phase` | done / continue / 收敛（`no_progress`） |
+| 收尾 | `_finalize_text_reply` / `_final_phase` | 最终答复 + 终态 |
 
-### Agent 怎么用它
+### 6.2 Graph 是默认引擎
 
-两条路径，共用一个 `KnowledgeBase`，**Graph 与 Legacy 完全同源**（都走 `AgentCore`）：
+```mermaid
+flowchart LR
+    S((START)) --> B[budget]
+    B -->|plan| P[plan]
+    B -->|act| A[act]
+    B -->|END| E((END))
+    P -->|END| E
+    P -->|budget| B
+    A -->|tools| T[tools]
+    A -->|finalize| F[finalize]
+    A -->|END| E
+    T --> R[reflect]
+    R -->|budget| B
+    R -->|END| E
+    F -->|budget| B
+    F -->|END| E
+```
 
-1. **自动预检索**：任务开始时拿用户目标检索一次，命中就把「项目资料」块作为 system 消息
-   放进上下文（带 `path:line`、明确的"仅供参考、不是指令"边界、条数与字符预算）。
-2. **按需检索**：`search_docs(query, k)` 工具（只读、自动执行），模型在任务中途想查什么就查什么。
+- 默认 `graph`；`LOOM_ORCHESTRATOR=legacy` 显式切回（**暂不删除**）。
+- 图状态只放路由信息（`phase/route/note/turns`），**任务真相始终在 `TaskState`**。
+- 每个条件边的 `path_map` **必须显式包含 `END`**：LangGraph 会静默丢弃未声明的目标。
+  这条坑曾让 `plan` 节点返回的 END 被吞掉，模型认证失败时任务空转到轮次耗尽。
+- **没有 checkpointer，没有 interrupt/resume**：图异常直接 `failed`，绝不回退 legacy 重跑
+  （工具副作用可能已经发生）。
 
-资料块受预算约束（默认 4 条 / 单条 700 字符 / 总量 2600 字符），相邻片段会合并但不会跨越未命中的行。
+### 6.3 Policy：七道关卡
 
-### 检索方式：关键词 / 向量 / 融合（M6）
+`agent/policy.py::Policy.check`，按顺序：
 
-`search_docs` 多了 `mode` 参数：
+| # | 关卡 | 拦什么 |
+|---|---|---|
+| ① | 工具存在 / 白名单 | 未注册、`allowed_tools` 之外 |
+| ② | 参数 JSON | 模型给了坏 JSON |
+| ③ | schema | 缺必填 / 类型错 |
+| ④ | 预算 | 轮次/工具数/秒数耗尽 |
+| ⑤ | 重复熔断（软） | 同参调用超限 |
+| ⑤b | 确定性失败熔断（硬） | 撞过一次的确定性失败再撞 |
+| ⑤b2 | 用户声明只读 | 一切写文件操作 |
+| ⑤c | 禁止路径 | 用户显式 forbidden |
+| ⑤d | 允许范围 | 范围外写入（执行前） |
+| ⑥ | 审批 | `risk != read` → `require_approval` |
+| ⑦ | 放行 | — |
+
+风险来自三处：工具类属性、`tool.risk_for(args)`（按参数判定，`terminal` 的只读白名单用它）、
+以及 MCP/子任务工具的配置。**模型不能给自己声明安全**。
+
+### 6.4 审批是"真挂起"
+
+`ApprovalManager.request()` 建 `asyncio.Future` → `await wait_for(fut, timeout)`。
+**不是轮询**：任务真的停住，事件循环继续服务其他任务。
+用户点批准 → `POST /api/approvals/{id}/decision` → `Future.set_result` →
+`recheck_after_approval`（TOCTOU 防护）→ 工具才执行。
+`args_hash` 防"批准后换参数"、`pop` 防重放。超时 = 拒绝；**跨进程不支持**。
+
+### 6.5 预算、取消、闸门
+
+- 预算：`max_turns=20`、`max_seconds=300`、`max_tool_calls=40`、`max_same_call_repeat=3`、`max_errors=5`；
+  轮次可**有界续期**一次（出现循环/停滞/冲突则不续）。
+- 取消：`scheduler.cancel` → `cancel_event` → 下一轮检查点生效；工具层各自尽力终止
+  （容器 stop / `taskkill /T` / 子任务 cancel）。
+- 验证闸门 `_verification_gate`：意图 → 最后命令 → 证据 A/B/C → 风险收尾；
+  `repair` 且零改动零命令 → 直接判未通过。收尾时 `answer` 附**机器判定段**（非模型自述）。
+
+### 6.6 事件与 SSE
+
+- 19 种事件：`task.start/end`、`plan`、`thinking`、`act`、`observe`、`tool.call/result`、
+  `approval.request/decision/expired`、`reflect`、`final_answer`、`error`、`budget.exceeded`、
+  `context.compacted`、`rag.retrieve/result`、`state.snapshot`。
+- `EventBus.emit` 同步分配全局 `seq`；`EventHub` 缓冲（3000 条 / 单条 64KB），
+  订阅者队列满 → 丢最旧 + 标 `need_gap` → 前端收到 `stream.gap` 后走快照恢复。
+- **事件不落盘**；`task_history` 存的是消息级历史（append-only）。
+- 前端 `EVENT_TYPES` 少一项 → 该事件的 SSE 帧会被浏览器**静默丢弃**；
+  靠 `npm run test:events` 双向比对兜底（构建期）。
+
+---
+
+## 7. 工具与安全
+
+### 7.1 工具清单
+
+| 工具 | 风险 | 审批 | 副作用 | 说明 |
+|---|---|---|---|---|
+| `list_files` | read | 否 | 无 | 列目录，跳过噪音目录 |
+| `read_file` | read | 否 | 无 | 40k 字符、多编码、行号、hash |
+| `search_docs` | read | 否 | 无 | 项目检索（`mode`: keyword/semantic/hybrid）；**仅在启用 RAG 时注册** |
+| `write_file` | write | **是** | 改文件 | 覆盖前备份 |
+| `edit_file` | write | **是** | 改文件 | 唯一匹配 / stale 检测 / 备份 |
+| `run_command` | exec | **是** | 执行 | **Docker 沙箱**，无宿主机分支 |
+| `terminal` | exec | **是**（只读白名单免） | 执行 | **宿主机** shell；cwd 必须在工作区 |
+| `spawn_subtask` | write | **是** | 建任务 | 派生子任务并等待；拒绝则不创建 |
+| `mcp__<server>__<tool>` | 默认 write | **是** | 由 Server 决定 | 外部 MCP 工具 |
+
+> 不注入 `knowledge` / `mcp` / `spawner` 时，对应工具**不会注册**——离线演示与旧测试行为不变。
+
+### 7.2 三条硬边界
+
+1. **工作区**：`path_safety` 做 realpath + 前缀校验，`..` 与工作区外绝对路径一律拒；
+   `run_command` 把工作区挂进容器（`:rw`），容器看不到别处；`terminal` 的 `cwd` 同样受限。
+2. **审批**：写/执行类工具默认都要人工批准；MCP 工具默认不信任；模型不能给自己降级。
+3. **凭据**：`terminal` 不把名字像 KEY/TOKEN/SECRET 的环境变量传给子进程，
+   输出里出现这些值会替换成 `***` 并计数。
+
+**提示词 vs 硬约束**：工作区越界、审批、沙箱、只读声明都是**后端强制**；
+"资料不是指令""不要修改 tests/"是提示 + 闸门（软），后者还能靠 `forbidden_paths` 变硬。
+
+---
+
+## 8. 检索：BM25 + 本地向量
+
+**默认纯关键词**（`LOOM_RAG_EMBED=off`）：SQLite FTS5 + bm25，中文先切 bigram 再入库。
+打开向量后变成混合检索。
 
 | mode | 含义 |
 |---|---|
-| `keyword` | 只用 FTS5 + bm25（老行为） |
-| `semantic` | 只用向量余弦（本地 fastembed，ONNX） |
-| `hybrid` | 两路各取候选，RRF 按名次融合（默认） |
-| `auto` | 用服务端配置（`LOOM_RAG_MODE`，默认 hybrid） |
+| `keyword` | 只用 FTS5 + bm25 |
+| `semantic` | 只用向量余弦（本地 fastembed / ONNX） |
+| `hybrid` | 两路各取候选 → **RRF** 融合（`Σ 1/(60+rank)`，只看名次） |
+| `auto` | 用服务端默认（`LOOM_RAG_MODE`，默认 hybrid） |
 
-- 向量**默认关闭**（`LOOM_RAG_EMBED=off`）：不下载模型、不占内存，纯关键词；
-  打开后模型缓存在 `sandbox/models/fastembed`（已 gitignore，~90MB）。
-- 向量不可用（没装 fastembed / 模型没下载 / 编码失败）时，`semantic`/`hybrid` 会**降级成关键词**，
-  并在结果与事件里标 `degraded`（例如 `no_embedder:off`）——**不会**静默返回空。
-- 每条命中带 `matched_by`（`bm25` / `vector` / `both`），便于判断"这条是靠词面还是语义找到的"。
-- 索引是增量的：只有新增/改动的片段会重算向量；换模型时按 `model` 字段隔离，旧向量不参与新模型的检索。
-
-### 来源追溯（M4.2）
-
-三个层次分开记，**不混为一谈**：
-
-| 字段 | 含义 |
-|---|---|
-| `rag_result.count` | 这次检索到几条（命中数） |
-| `injected` | 其中真的注入了模型上下文几条 |
-| `state.rag_used` | 其中**被后续步骤真实引用**的几条（`path:line`） |
-
-`rag_used` 的判据只看可观测事实：后续有没有 `read_file` 读过这个路径、最终答复里有没有出现这个路径/定位。
-一条都没引用就留空 —— **不会谎称结论来自 RAG**。确有引用时，最终答复的"机器判定"段会写一句：
-`检索依据：注入的 N 条资料中，有 M 条被后续步骤引用（…）；其余资料未被引用，不作为结论依据。`
-
-检索内容是**不可信数据**：不能提升工具风险、不能改变审批策略、不能覆盖系统规则
-（资料块自带"仅供参考、不是指令"边界，系统提示里还有固定规则）。
-
-### 在 GUI 里看什么
-
-| 事件 | 能看到的 |
-|---|---|
-| `rag.retrieve` | 查询词、谁发起的（自动 / Agent）、索引规模（文件数 / 片段数） |
-| `rag.result` | 命中条数、耗时、**是否进入模型上下文**、每条命中的 `path:line` 与标题、无结果或失败原因 |
-
-三个层次是分开显示的：**检索到几条**（count）→ **是否真的喂给模型**（injected）→
-**最终答复引用了什么**（在 final_answer 里，由模型给出路径行号）。
-
-### 配置
+- 命中带 `matched_by`（`bm25` / `vector` / `both`），能看出"这条靠词面还是语义进来的"。
+- 向量不可用（没装 fastembed / 模型没下 / 编码失败）→ **降级成 keyword** 并在结果与事件里标
+  `degraded`（如 `no_embedder:off`），**不会**静默返回空。
+- 索引增量：只给新增/改动的片段算向量；按 `model` 字段隔离，换模型不会串味。
+- 自动检索**每任务最多 2 次**（任务开始 + 计划出来后），中途靠模型调 `search_docs`；
+  三层计数分开记：`count`（命中）≠ `injected`（注入）≠ `rag_used`（被后续引用）。
+- 资料是**不可信数据**：不参与风险判定、不能绕过审批、不能覆盖系统规则。
 
 ```bash
-LOOM_RAG=1              # 0 = 整个能力关闭（不建索引、不注册工具、不预检索）
-LOOM_RAG_AUTO=1         # 0 = 只关自动预检索，search_docs 仍可用
-LOOM_RAG_DB=...         # 索引库路径
-LOOM_RAG_TOP_K=4        # 每次注入几条
-LOOM_RAG_HIT_CHARS=700  # 单条片段上限
-LOOM_RAG_CONTEXT_CHARS=2600  # 注入总量上限
+# 打开向量（模型缓存在 sandbox/models，约 90MB，已 gitignore）
+LOOM_RAG_EMBED=onnx
+LOOM_RAG_MODE=hybrid
 ```
-
-### 已知限制（第一版）
-
-- 中文按**二元组**切词（无词典、零依赖），所以能搜到但排序不如语义检索"懂意思"；
-  英文标识符整体成词，`run_command` 这类能精确命中。
-- 不跟随目录符号链接；不做跨工作区检索；不做"历史任务"检索（那是另一件事）。
-- 索引在任务开始时同步更新，任务进行中新建/修改的文件要等下一次任务才进索引
-  （所以"改完再看"仍应 `read_file`）。
 
 ---
 
-## 外部工具：MCP Client（M4.1）
+## 9. 外部工具：MCP
 
-**第一版只支持本地 `stdio` Server**，用官方 Python SDK（`mcp`，实测 2.3.0 / Python 3.13）。
-远程传输、OAuth、多租户、连接池都不在本版内（`McpManager` 换成别的 transport 只需替换 Worker 里的一段）。
-
-### 怎么配
+第一版只支持**本地 stdio** Server（官方 SDK `mcp`，实测 2.3.0）。
 
 ```json
-{ "servers": [
-    { "id": "demo",
-      "command": "D:/.../.venv/Scripts/python.exe",
-      "args": ["-B", "D:/.../server.py"],
-      "env": { "MCP_TEST_DIR": "C:/tmp/notes" },
-      "enabled": true,
-      "trust": "prompt",
-      "read_tools": ["read_note"] } ] }
+{"servers":[{"id":"notes","command":"...python.exe","args":["-B","server.py"],
+             "env":{"MCP_TEST_DIR":"..."},"enabled":true,"trust":"prompt",
+             "read_tools":["read_note"]}]}
 ```
 
-开启：`LOOM_MCP=1` + `LOOM_MCP_CONFIG=<该文件绝对路径>`（默认关闭）。示例见 `mcp_servers.example.json`。
+- 开启：`LOOM_MCP=1` + `LOOM_MCP_CONFIG=<json>`（默认关，示例见 `mcp_servers.example.json`）。
+- 生命周期：**服务启动时**连接并发现工具；每个 Server 一个常驻 task 持有 SDK 异步上下文
+  （anyio 要求 `__aenter__/__aexit__` 同 task）；退出统一 `close()`。
+- 安全：**默认 `risk=write`（必须审批）**；只有配置 `trust:"read"` 或 `read_tools` 才按只读；
+  Server 的 description/schema **不参与**风险判定；子进程 env 走白名单，主进程凭据不给。
+- 命名 `mcp__<server>__<tool>`，来源用 `source={kind,server,tool}` 元数据（不靠解析名字）。
+- 超时/断开 → 该 Server 标记 `failed`，**不自动重连、不自动重试**。
 
-### 安全边界（默认不信任）
+---
 
-| 规则 | 说明 |
+## 10. 父子任务
+
+`spawn_subtask` 让父 Agent 把一件可独立验收的事派给子任务，并**等它结束**（首版串行）。
+
+| 边界 | 默认值 |
 |---|---|
-| 命令与参数分开 | `command` + `args` 直接给 subprocess，不经 shell；`command` 含 `&&`/`\|`/`>` 等控制符直接拒绝启动 |
-| 环境变量白名单 | 子进程只继承 PATH/SYSTEMROOT/TEMP 等少数键；名字像 KEY/TOKEN/SECRET/PASSWORD 的默认剔除；主进程的模型 API Key 永远不给 |
-| **默认要审批** | `trust` 缺省 `prompt` → 所有 MCP 工具都是 `risk=write`，必须走现有审批流程；只有配置里显式 `trust:"read"` 或列进 `read_tools` 才当只读 |
-| Server 自述不可信 | 工具的 description / inputSchema / annotations 都不参与风险判定 |
-| 审批可见来源 | 审批卡片写清 Server、原始工具名、参数（像密钥的键打码）与"本机进程、无沙箱"的影响说明 |
-| 无沙箱声明 | MCP Server 是本机普通进程，拥有你自己的操作系统权限；Loom 不提供隔离 |
+| 派生层级 | 2 |
+| 每父任务子任务数 | 3 |
+| 子任务预算 | 8 轮 / 180s / 12 次工具 |
+| 单次派生总超时 | 240s |
+| 审批 | 派生本身要审批；拒绝 → 子任务**根本不创建** |
 
-### 命名与来源
-
-`mcp__<server_id>__<tool_name>`，例如 `mcp__demo__read_note`。
-来源追踪**不靠解析名字**：每个工具实例带 `source = {"kind":"mcp","server":...,"tool":...}`，
-`tool.call` 事件会带上它，前端时间线在工具名旁显示 `MCP · <server>` 徽标。
-
-### 生命周期
-
-- **服务启动时**连接一次并发现工具，注册进同一 `ToolRegistry`（不是每轮推理启动进程）；
-- 每个 Server 由一个常驻任务持有 SDK 的异步上下文（`__aenter__`/`__aexit__` 必须同 task），
-  调用方直接用 `session.call_tool`；
-- 单次调用超时（默认 30s）后该 Server 标记 failed，**不自动重启、不盲目重试**；
-- 服务关闭时统一 `close()`（幂等），退出顺序在沙箱与数据库之前。
-
-### 已知限制（第一版）
-
-- 只有 stdio；没有远程传输、没有连接池、没有自动重连（需要时显式 `restart()`，会重新发现工具与 schema）。
-- **取消**：任务取消时 SDK 侧的 in-flight 调用没有安全取消接口；Loom 侧靠"调用超时 + 标记不可用 + 关闭时强制收尾"兜底，
-  不会无限阻塞，但**正在 Server 里跑的那次调用无法被中断**（Server 进程本身不受 Loom 控制）。
-- Server 进程健康度没有持续探测（只在调用失败/超时时转为 failed）。
+- `tasks.parent_task_id`（schema v2，`ALTER` 迁移）；根任务为 NULL。
+- 子任务**共用父任务的 ToolRegistry / Policy / 审批 / 闸门**，没有旁路；引擎与工作区约束继承。
+- 结果信封：`task_id / status / end_reason / summary / evidence / tools / commands / changes`；
+  子任务非 `done` → 工具返回失败，**不伪装成功**。
+- 子任务默认不开 PLAN/REFLECT（父已拆解，省轮次给工具与验证）。
 
 ---
 
-## 父子任务（M5，首版串行）
+## 11. 数据与持久化
 
-`spawn_subtask` 让父 Agent 把一件可独立验收的事派给**子任务**，并**等它结束**：
-
-```
-父 Agent → spawn_subtask(goal) → 审批（risk=write）→ 子任务（自己的 task_id/事件/预算）
-                                                    → 子 AgentCore 跑完 → 结果信封回父
-```
-
-结果信封：`task_id / status / end_reason / summary / evidence / tools / commands / changes` ——
-父任务依据**证据**决定是否采纳，而不是因为子任务说"已完成"。
-
-安全边界（都经过测试）：
-
-| 约束 | 默认 | 说明 |
+| 实体 | 存储 | 说明 |
 |---|---|---|
-| 派生层级 | 2 | 子任务再派生会被拒绝（`rejected`） |
-| 每父任务子任务数 | 3 | 超限拒绝，不会无限派生 |
-| 子任务预算 | 8 轮 / 180s / 12 次工具 | 比父任务小，**不是**白拿一份新预算 |
-| 单次派生总超时 | 240s | 父任务不会被子任务无限拖住 |
-| 审批 | 派生本身需审批 | 拒绝 = 子任务根本不会被创建 |
-| 引擎 | 继承父任务 | M4.3 起默认 graph；显式 legacy 时子任务也是 legacy |
+| Session | `sessions` 表 | 会话容器，1:N 任务 |
+| Task | `tasks` 表（含 `state_json`、`parent_task_id`） | 一次任务的状态与结果 |
+| 消息历史 | `task_history`（append-only，`(task_id, seq)` 幂等） | 刷新后能看历史 |
+| 事件 | **内存**（EventHub，3000 条上限） | 不落盘；断线靠 `since` + 快照 |
+| 审批 | 内存（`asyncio.Future`） | 进程退出即失效 |
+| 知识索引 | 独立 SQLite（`sandbox/index/knowledge.db`） | 按 workspace 隔离；可含向量 |
 
-子任务**共用同一套 ToolRegistry / Policy / 审批 / 闸门 / 审计**，没有旁路；
-子任务默认不再自己规划/反思（父任务已做过拆解），省下的轮次留给工具与验证。
-
-首版不做：并行调度、角色体系、前端任务树（任务树属于 M6）。
+**重启能恢复什么**：任务列表 / 快照 / 结果 / 历史消息 ✅；
+**继续跑中断的任务** ❌（`safe_to_resume` 恒 False，无 checkpoint）；恢复挂起的审批 ❌。
 
 ---
 
-## 终端执行（`terminal`）
+## 12. 前端
 
-**两个执行工具，安全模型完全不同，别混着理解：**
+React 19 + Vite 8 + TypeScript 6 + Tailwind 4，单一 `useReducer` store（`features/session/store.tsx`）。
 
-| 工具 | 在哪跑 | 隔离 | 用来做什么 |
-|---|---|---|---|
-| `run_command` | Docker 容器 | 断网 / 只读根 / 非 root / 限额 | 想要"干净环境"时跑测试、构建 |
-| `terminal` | **你的机器**（PowerShell / CMD / Git Bash） | **没有沙箱** | 需要真实本机环境：git、本地路径、已安装工具 |
-
-`terminal` 的安全边界 = **审批 + 工作目录 + 超时 + 输出限制**，不是容器。
-
-### 参数
-
-```json
-{"command": "git status --short", "cwd": ".", "shell": "auto", "timeout": 60}
-```
-
-- `shell`：`auto`（优先 PowerShell 7 → Windows PowerShell → CMD）/ `powershell` / `cmd` / `bash`（只认 Git Bash，System32 下的 WSL 启动器会被排除）；
-- `cwd`：相对工作区，**不允许跳出工作区**（`..`、绝对路径都会被拒）；
-- `timeout`：默认 60s，上限 300s；超时/取消会 `taskkill /T` 杀掉整棵进程树。
-
-### 什么要审批
-
-- 默认**每条都要批**（`risk=exec`）；
-- 只有命中只读白名单（`git status`、`dir`、`echo`、`python --version`…）**且不含任何 shell 元字符**时才免审批；
-- 含 `;` `&&` `|` `>` `$(` 之类的一律按 exec 处理 —— 白名单只是"少打扰"，不是安全边界。
-
-### 输出与凭据
-
-- stdout / stderr **分开**返回，退出码非零就是失败（不会伪装成功）；
-- 单条流最多 6000 字符，超出保留首尾并标注"输出被截断"；
-- 名字像 KEY/TOKEN/SECRET/PASSWORD 的环境变量**不传给子进程**；输出里若出现这些值，会被替换成 `***` 并记录打码次数。
-
-### 已知限制
-
-- **没有操作系统级沙箱**：命令以你的用户身份运行，能访问你的文件和网络。审批卡片里写明了这一点。
-- 复杂引号在 CMD 下会被拆坏（例如 `python -c "print(1)"`）。这是 cmd 的引号规则，不是工具行为；需要复杂引号请用 `shell="powershell"` 或写成脚本文件。
-- 前端展示的是命令 + 输出文本，不是交互式 PTY（没有持续输入/光标控制）。
+- 三栏：左侧按**工作目录**分组的会话列表 / 中央双视图（聊天 · 执行流）/ 底部工作区与输入框。
+- 事件时间线：`EventCard` 按事件类型分派渲染——工具调用（含 MCP 来源徽标）、终端的
+  命令/exit/stdout/stderr、审批卡、RAG 检索命中、压缩事件等。
+- 断线：自研指数退避重连（显式关掉浏览器原生重连），带 `since` 续传；`stream.gap` → 快照恢复。
+- 模型下拉：显示 `/api/health` 的真实模型，其余候选 `disabled`（**只能看，不能切**）。
 
 ---
 
-## 它是怎么跑的
+## 13. 测试
 
-```
-User Task → PLAN → ACT(Tool Calling) → OBSERVE(Tool Result) → REFLECT → FINAL ANSWER
-```
+```bash
+# 离线自检（不需要 API Key）—— 1308 项
+python -m backend.selfcheck_p1        #  55  契约层：事件/错误码/schema
+python -m backend.selfcheck_p2        #  45  模型层：候选轮换/错误分类
+python -m backend.selfcheck_agent     # 597  Agent 全链路：阶段/闸门/预算/审批/压缩/意图
+python -m backend.selfcheck_cli       #  67  CLI 渲染/审批/中文解码
+python -m backend.selfcheck_server    # 185  存储/Hub/运行时/调度/恢复
+python -m backend.selfcheck_sandbox   #  96  Docker 参数与控制流
+python -m backend.selfcheck_rag       # 109  索引/检索/集成/安全/闭环/混合
+python -m backend.selfcheck_mcp       #  63  MCP 连接/发现/注册/审批/超时/关闭
+python -m backend.selfcheck_subtask   #  32  父子任务/迁移/上限/取消
+python -m backend.selfcheck_terminal  #  59  终端探测/真跑/越界/审批/双引擎
 
-| 阶段 | 做什么 | 带 `tools` 吗 |
-|---|---|---|
-| **PLAN** | 让模型输出 JSON 计划（2-5 步）。格式不符**降级**，不崩溃、不设计划、留痕 | ❌ |
-| **ACT** | 决定：调工具，还是直接作答 | ✅ **只有这里带** |
-| **OBSERVE** | 工具结果进 `Evidence` 列表 | ❌ |
-| **REFLECT** | 判断是否收敛；顺便推进计划步骤 | ❌ |
-| **FINAL** | 基于已观测的证据，**真正回答用户的问题** | ❌ |
+# 集成 / 真实环境（按需）
+python -m backend.server.test_live_e2e       #  51  真 HTTP/SSE/调度/审批（模型替身）
+python -m backend.test_sandbox_docker        #  25  真实容器
+python -m backend.test_live_model            #   7  真实模型 7 场景（要 Key）
 
-**阶段工具门控**是被测试钉死的：`PLAN=False, ACT=True, REFLECT=False, FINAL=False`
-（`FakeAdapter.tools_gate` 断言）。只有 ACT 阶段给模型工具 —— 否则它会在该收口的时候又去调工具。
-
-### FINAL 为什么必须是一次独立的模型调用
-
-这一条是踩过坑才明白的。最初 REFLECT 判定 `done=true` 就直接用程序生成的模板收尾：
-
-```
-任务已完成（第 4 轮，共观测 6 条事实）。
-计划共 4 步，已完成 4 步。
-已执行的动作：
-  ✓ list_files：. 下有 0 个目录、5 个文件
-  ...
+cd frontend
+npm run test:events    # 33  事件契约：后端 EventType ↔ 前端清单 ↔ 样式
+npm run test:session   # 21  会话隔离 + 状态映射
+npm run test:workspace # 26  路径规范化 / 分组
+npx tsc -p tsconfig.app.json --noEmit
 ```
 
-**这没有回答用户的问题。** 用户问「分析当前项目结构」，拿到的却是一份工具调用清单 ——
-而模型其实早在思维链里得出了真结论（"main.py 引用了 `services/`，但这个目录不存在"），
-只因为收尾走了模板而被丢弃。
-
-区别在于：
-
-| | 回答的问题 | 谁生成 |
-|---|---|---|
-| 进度清单 | 「你做了什么」 | **程序**（已由 `task.end` / 运行摘要承担） |
-| 最终答复 | 「你发现了什么」 | **模型**（基于证据作答） |
-
-所以 FINAL 是独立的一次调用，且**不带 tools** —— 强制它收口成答案。
-调用失败时降级回记账式答复，但会**如实说明原因**。
-
-### 终止条件都有明确的原因
-
-`agent_done` / `no_more_actions` / `empty_reply` / `budget_turns` / `budget_seconds` /
-`budget_tool_calls` / `too_many_errors` / `model_error` / `cancelled` / `internal_error` /
-`verification_failed` / **`no_progress`**
-
-`no_progress` 是 M2.2 新增的：模型反复把 REFLECT 格式的进展汇报当答复提交、而期间
-**没有任何工具执行 / 新证据 / 计划推进**时，先给一次受控恢复提示，仍无进展就以这个原因终止
-（判据是"零进展"，不是"反思了几次"，见 `_handle_reflect_answer`）。
-
-中断时兜底答复会**诚实声明**"以上为中断时的实际进展，不是完整结论" ——
-只在真正中断时才说，正常完成时不出现。
+**最值钱的是"可证伪"断言**：删掉事件发射、把风险判定改成全都免审批、去掉派生上限、
+把 `rag_context_block` 置空——都会立刻让测试变红。数量本身不重要，**能失败**才重要。
 
 ---
 
-## 几个值得讲的设计
+## 14. 配置
 
-### 1. 事件是第一公民 —— `events.py`
+`.env`（示例见 `.env.example`），常用项：
 
-Agent 做任何事都产生**结构化事件**，而不是 `print` 日志：
-
-```python
-{"seq": 7, "ts": 1759..., "task_id": "task_ab12", "turn": 2,
- "type": "tool.call",
- "data": {"id": "call_1", "tool": "read_file",
-          "args": {"path": "main.py"}, "risk": "read"}}
-```
-
-19 种类型：`task.start` / `task.end` / `plan` / `thinking` / `act` / `observe` /
-`tool.call` / `tool.result` / `approval.request` / `approval.decision` / `approval.expired` /
-`reflect` / `final_answer` / `error` / `budget.exceeded` / `context.compacted` /
-`rag.retrieve` / `rag.result` / `state.snapshot`
-
-两个关键设计：
-
-- **`emit()` 同步分配 `seq`，投递走 `asyncio.create_task`** —— 订阅者永远拖不慢 Agent
-- **订阅者抛异常被吞掉并单独记日志** —— 一个 UI 组件崩了不该搞死整个任务
-
-`to_sse()` 直接产出 SSE 帧，将来接 GUI 零改造。
-
-### 2. State ≠ 聊天记录 —— `state.py` / `context.py`
-
-`TaskState` 是**结构化的程序状态**：轮次、预算用量、计划步骤、证据列表、
-工具调用指纹、待审批项、文件变更记录。
-
-`messages[]` 是从 TaskState **派生**出来的视图（`context.py` 单向生成）。
-反过来（从消息数组反推状态）不好使 —— 这是从上一个项目里学到的。
-
-还有一个协议不变量由 `TurnBuilder` 强制守：**带 `tool_calls` 的 assistant 消息后面，
-必须紧跟每个 call_id 对应的 `tool` 消息，且顺序一致**。缺失的自动补占位符，
-在 `build()` 里统一执行 —— 只有一处，不会漏。（漏了会直接吃 API 400。）
-
-### 3. 模型的输出是建议，不是权限 —— `policy.py`
-
-每次工具调用前过一条 7 步校验链，顺序是设计过的：
-
-```
-① 工具存在且在白名单
-② 参数 JSON 可解析           ← parse_error 优先于 schema 校验
-③ 参数符合 schema
-④ 预算还有余额               ← 在路径检查之前：已超时的任务不该继续写文件
-⑤ 重复熔断（软）
-⑤b 确定性失败熔断（硬）
-⑥ 是否需要审批               ← 放最后：别为注定失败的调用打扰用户
-⑦ 放行
-```
-
-**双层熔断**的分工：
-
-| 层 | 触发条件 | 行为 |
+| 变量 | 默认 | 说明 |
 |---|---|---|
-| 软 | 同一「工具+参数」出现 ≥ 3 次 | 拒绝，提示换思路 |
-| 硬 | 同一「工具+参数」**失败过且错误不可重试** | **第 2 次就拒** |
+| `BAILIAN_API_KEY` / `DEEPSEEK_API_KEY` / `XFYUN_API_KEY` | — | 三家任选其一 |
+| `LOOM_MODEL` | 供应商默认 | 模型名，如 `spark-x2.6`、`qwen3.7-plus` |
+| `LOOM_ORCHESTRATOR` | `graph` | `graph` / `legacy` |
+| `LOOM_MAX_TURNS` / `LOOM_MAX_SECONDS` / `LOOM_MAX_TOOL_CALLS` | 20 / 300 / 40 | 任务预算 |
+| `LOOM_APPROVAL_TIMEOUT` | 180 | 审批等待上限（超时=拒绝） |
+| `LOOM_RAG` / `LOOM_RAG_DB` | 1 / `sandbox/index/knowledge.db` | 检索开关与库路径 |
+| `LOOM_RAG_EMBED` / `LOOM_RAG_MODE` | `off` / `hybrid` | 向量开关与默认检索方式 |
+| `LOOM_MCP` / `LOOM_MCP_CONFIG` | 0 / — | MCP 开关与配置路径 |
+| `LOOM_AGENTS` / `LOOM_AGENT_MAX_DEPTH` / `LOOM_AGENT_MAX_CHILDREN` | 1 / 2 / 3 | 子任务开关与上限 |
+| `LOOM_TERMINAL` | 1 | 宿主机终端开关 |
+| `LOOM_SANDBOX_IMAGE` | `loom-sandbox:py312` | 沙箱镜像 |
 
-硬熔断针对的是"参数不变则结论必然不变"的失败：`path_outside_workspace` /
-`sensitive_file` / `permission_denied`。可重试类（`not_found` 等）不受影响。
+完整列表见 `.env.example`（按模块分组，含注释）。
 
-> 加这条是因为真实模型实测：对越界路径它会拿**完全相同的参数**连撞两次才换思路。
-> 软熔断要数到 3 才拦，中间那次是纯浪费的 token 和一个轮次。
+---
 
-### 4. 审批是真挂起，不是轮询 —— `approval.py`
+## 15. 已知限制
 
-三种做法里只有第三种是对的：
+- **没有跨进程恢复**：无 checkpointer，`safe_to_resume` 恒 False；重启只能看结果，不能续跑。
+- **没有并行子任务**：`spawn_subtask` 是同步等待，多子任务线性累加时间。
+- **`terminal` 没有沙箱**：命令以你的用户身份运行，安全靠审批 + cwd + 超时；
+  审批卡里写明了这一点，不要把它当隔离环境。
+- **MCP 只支持本地 stdio**：无远程传输、OAuth、自动重连；in-flight 调用无法取消。
+- **检索以关键词为主**：向量是可选增强，没有 reranker；同义词/改述仍可能搜不到。
+- **事件不落盘**：前端落后一个版本时，未知事件会被静默丢弃（构建期有契约测试兜底）。
+- **CMD 的引号**：`python -c "print(1)"` 在 CMD 下会被拆坏，复杂引号用 PS 或脚本文件。
+- **没有 Tauri 桌面壳**、**没有 `delete_file`**。
 
-- ❌ **轮询**：Agent 循环里查标志位 —— 不是真挂起，浪费 CPU，语义含糊
-- ❌ **事后审计**：执行完再记录 —— 那不叫审批
-- ✅ **`asyncio.Future` 挂起/恢复** —— 本项目的做法
+---
 
-```python
-fut = loop.create_future()
-self._pending[aid] = fut
-verdict = await asyncio.wait_for(fut, timeout=self.timeout_s)   # ← 真的挂在这里
-```
+## 16. 路线图
 
-三道安全防线：
-
-| 问题 | 防线 |
+| 阶段 | 状态 |
 |---|---|
-| "批的是 A，执行的是 B" | `args_hash` = sha256[:16]（工具名 + 排序后参数），执行前重新比对 |
-| "同一个审批重放两次" | `pop()` 一次性消费，审批 ID 用完即焚 |
-| "等待审批期间文件被换了" | `recheck_after_approval()` 重新校验路径 + 预算（TOCTOU） |
-
-> **踩坑**：`input()` 是同步阻塞的，直接调会把事件循环卡死，
-> 连 `asyncio.wait_for` 的超时都不会生效。必须用
-> `loop.run_in_executor(None, sys.stdin.readline)` 包一层。
-
-### 5. 路径安全 —— `path_safety.py`
-
-真实攻击面有三个：`../` 穿越、**符号链接逃逸**、Windows 8.3 短名。
-
-```python
-t = os.path.normcase(os.path.normpath(target))
-r = os.path.normcase(os.path.normpath(root))
-if not r.endswith(os.sep):
-    r += os.sep          # ← 关键
-return t.startswith(r)
-```
-
-朴素 `startswith` 会把 `D:/proj_evil` 误判成在 `D:/proj` 里面 —— 补上分隔符才安全。
-用 `realpath` 而不是 `abspath`，是因为只有前者会解析符号链接。
+| M1 编排地基 / M2 LangGraph / M2.1 工具链 / M2.2 事件契约 | ✅ |
+| M3 项目知识检索（FTS5） | ✅ |
+| M4.1 MCP Client（stdio） | ✅ |
+| M4.2 RAG 实用化（查询构建 / 计划后检索 / 来源追溯） | ✅ |
+| M4.3 Graph 设为默认引擎 | ✅ |
+| M5 父子任务（串行） | ✅ |
+| M6 展示与对比 | 🟡 混合检索已完成；前端任务树 / 对比报告待做 |
+| 并行子任务调度 | ⬜ |
+| Tauri 桌面外壳 | ⬜ |
 
 ---
 
-## 项目结构
+## 17. 目录结构
 
 ```
 loom/
-├── loom.bat                     一键启动器（Windows）
-│
-├── backend/                     Python Agent Runtime
-│   ├── events.py          ★★★  事件契约的唯一来源（17 种事件）
-│   ├── state.py           ★★★  TaskState：结构化程序状态（≠ 聊天记录）
-│   ├── config.py                路径 / 模型 / 预算 / 安全常量
-│   ├── demo.py                  离线演示（不需要 API Key）
-│   │
-│   ├── rag/                     ── 项目知识检索（M3）──
-│   │   ├── discover.py          文件发现：排除目录 / 敏感文件 / 二进制 / 超大
-│   │   ├── chunk.py             切分：Markdown 标题 / 代码符号 / 段落，带行号
-│   │   ├── store.py             SQLite：文件表 + 片段表 + FTS5（增量按内容哈希）
-│   │   └── service.py           KnowledgeBase：ensure_indexed / retrieve / 上下文块
-│   │
-│   ├── agent/                   ── Agent Core ──
-│   │   ├── core.py        ★★★  五阶段循环主控（legacy 引擎）
-│   │   ├── graph_engine.py ★★  LangGraph 引擎（复用 core 的同一组检查点）
-│   │   ├── policy.py      ★★   执行前校验链 + 软/硬双层熔断
-│   │   ├── approval.py    ★★   审批管理器（asyncio.Future 真挂起）
-│   │   ├── context.py     ★★   State → messages 单向派生
-│   │   ├── compaction.py       上下文压缩（状态块 + 摘要，可降级）
-│   │   ├── intent.py           意图分类 / 约束抽取 / 证据分级
-│   │   ├── scope.py            改动范围审计（基线 diff + 归因）
-│   │   ├── history_log.py      消息历史持久化（append-only + 缺口检测）
-│   │   └── state.py            （见上，契约层）
-│   │
-│   ├── tools/                   ── 工具层 ──
-│   │   ├── base.py        ★★   统一工具契约（15 种错误类型）
-│   │   ├── path_safety.py ★★★  路径越界防护
-│   │   ├── registry.py    ★★   注册表 + 统一执行入口
-│   │   ├── readonly/           list_files / read_file / search_docs（自动执行）
-│   │   ├── mutating/           write_file / edit_file（需审批）
-│   │   │   └── _shared.py      备份 / 哈希 / 文本读取（两个写工具共用）
-│   │   └── exec/               run_command（需审批 + Docker 沙箱）
-│   │
-│   ├── models/                  ── 模型层 ──
-│   │   ├── adapter.py           ModelAdapter 抽象 + FakeAdapter
-│   │   └── openai_compat.py     一套实现服务百炼 / DeepSeek / 讯飞（含候选轮换）
-│   │
-│   ├── cli/                     CLI 交互层
-│   │   ├── render.py            Agent 运行日志区（按事件类型渲染）
-│   │   ├── console.py           终端输入解码（UTF-8 / GBK 宽容处理）
-│   │   ├── approve.py           审批交互
-│   │   └── main.py              入口 + 参数 + 交互 REPL
-│   │
-│   └── selfcheck_*.py           自检套件（1103 项，全离线）
-│
-├── dev/                         开发辅助
-│   ├── loom.bat.src             启动器源文件（UTF-8）
-│   ├── build_bat.py             构建：UTF-8 源 → GBK 产物
-│   ├── simulate_keys.py         模拟真人按键，端到端验证启动器
-│   └── test_workspace_reuse.py  工作目录选择器回归测试
-│
-└── sandbox/demo_project/        测试夹具（故意埋了矛盾供模型发现）
+├── backend/
+│   ├── agent/          core.py（内核）· graph_engine.py · policy.py · approval.py
+│   │                   state.py · context.py · intent.py · compaction.py · subtask.py
+│   │   └── rag/        discover / chunk / store / service / query / embed
+│   ├── tools/          base · registry · path_safety
+│   │   ├── readonly/   list_files · read_file · search_docs
+│   │   ├── mutating/   write_file · edit_file · spawn_subtask
+│   │   └── exec/       run_command（Docker）· shells + terminal（宿主机）
+│   ├── mcp/            config · client（每 Server 一个常驻 task）· tool
+│   ├── models/         openai_compat（三家共用）· adapter（协议 + FakeAdapter）
+│   ├── server/         app（HTTP+SSE）· scheduler · runtime · store · hub
+│   ├── sandbox/        manager（Docker 参数与生命周期）
+│   ├── prompts/        system（系统提示 / 阶段提示 / 收尾提示）
+│   ├── cli/            main · approve · render
+│   └── selfcheck_*.py  10 套离线自检 + 3 个真实环境测试
+├── frontend/src/       App.tsx · features/session（store）· components · services · types
+├── dev/                Dockerfile.sandbox · 启动器构建脚本 · 测试脚本
+└── sandbox/            运行时产物（index / 模型 / 数据库，已 gitignore）
 ```
-
-### 依赖方向是单向的
-
-```
-server/  →  agent/  →  tools/
-             ↓
-          events.py   ←（server 与 agent 都 import，但它不 import 任何项目内模块）
-```
-
-**铁律：`agent/` 里禁止 import `server/`。**
-这是"Agent 逻辑不写死在 GUI"在代码层的落地 —— 哪天有人在 Agent 里直接推 GUI 状态，import 就会失败。
 
 ---
 
-## 工具边界
+## 18. 文档索引
 
-| 工具 | 风险 | 需审批 | 说明 |
-|---|---|---|---|
-| `list_files` | read | ❌ 自动 | 只列一层，跳过噪音目录，上限 300 条 |
-| `read_file` | read | ❌ 自动 | 40k 字符上限，多编码探测，带行号，返回内容哈希 |
-| `search_docs` | read | ❌ 自动 | M3：工作区项目资料的**关键词检索**（FTS5），返回路径+行号+片段；未启用 RAG 时不注册 |
-| `write_file` | write | ✅ **需确认** | 写前自动备份，`overwrite=false` 保护 |
-| `edit_file` | write | ✅ **需确认** | 只改一小段。**唯一匹配**；匹配到多处时拒绝而不是猜 |
-| `run_command` | exec | ✅ **需确认** | **只能在 Docker 沙箱里跑**（断网 / 只读根 / 非 root / 限额） |
-| `delete_file` | — | — | ⬜ **未实现**（`tools/mutating/` 里只有 write/edit） |
+深度材料在仓库**外**的 `docs/`（按日期编号，不进 git）：
 
-判据是 **"有没有副作用"**，不是工具名。
-
-统一返回形状：
-
-```python
-{"ok": bool, "tool": str, "summary": str, "data": {...},
- "error": {"kind": ..., "message": ..., "hint": ...} | None,
- "side_effects": [...], "retryable": bool, "security": bool}
-```
-
-15 种错误类型（`tools/base.py` 的 `ErrorKind`，本次实测 `len(ErrorKind)==15`）：
-`not_found` / `not_a_file` / `not_a_dir` / `permission_denied` / `invalid_arguments` /
-`path_outside_workspace` / `sensitive_file` / `too_large` / `timeout` / `execution_error` /
-`not_implemented` / `internal_error` / `patch_conflict` / `stale_content` / `sandbox_unavailable`
-（审批被拒 / 超时不单列错误类型，走 `ToolResult` 的失败摘要回灌）
-
-`summary` 进 Evidence（给模型看结论），`data` 进消息体（给模型看细节）—— 分两个粒度是有意的。
-
----
-
-## 测试
-
-```bash
-# 离线自检（不需要 API Key）—— 本次全部实跑，合计 1308 项
-python -m backend.selfcheck_p1      #  55 —— 契约层（含事件类型 19 的断言）
-python -m backend.selfcheck_p2      #  45 —— 模型层（含候选轮换）
-python -m backend.selfcheck_agent   # 594 —— Agent 全链路（重点，含修复任务门禁）
-python -m backend.selfcheck_cli     #  67 —— CLI 渲染 + 审批 + 终端输入解码
-python -m backend.selfcheck_server  # 185 —— 存储 / 事件广播 / 运行时 / 调度
-python -m backend.selfcheck_sandbox #  96 —— 沙箱参数与控制流（假进程）
-python -m backend.selfcheck_rag     # 109 —— M3/M4.2/M6：索引 / 检索 / 集成 / 安全 / 闭环 / 混合 / 事件契约
-python -m backend.selfcheck_mcp     #  63 —— M4.1：真实 stdio 子进程，连接/发现/注册/审批/取消/超时/关闭
-python -m backend.selfcheck_subtask  #  32 —— M5：父子任务关联/迁移/派生/审批/上限/超时/取消
-python -m backend.selfcheck_terminal #  59 —— 终端：探测/真跑/退出码/stdout-stderr/超时/取消/越界/审批/双引擎
-python dev/test_workspace_reuse.py  #  17 —— 启动器的工作目录选择器
-
-# 集成 / 真实环境
-python -m backend.server.test_live_e2e     # 51 —— 真 HTTP/SSE/调度/审批（模型用替身）
-python -m backend.test_sandbox_docker      # 25 —— 真实容器（无 Docker 会 SKIP）
-python -m backend.test_live_model          #  7 个真实模型场景（联网、烧 token）
-python -m backend.test_approval_live       # 真实交互式审批（管道喂 stdin）
-
-# 前端（cd frontend）
-npm run test:workspace   # 26 —— 路径规范化 / 分组
-npm run test:session     # 21 —— 会话隔离 + 任务状态映射
-npm run test:events      # 33 —— 事件契约：后端 EventType ↔ 前端清单 ↔ 样式
-```
-
-> 数字口径：以上是**代码里实际注册的断言数**（本次运行核对）。`selfcheck_*` 与前端
-> 三个脚本本次都实跑并通过；E2E / 真实容器 / 真实模型本次**未运行**。
-
-**为什么自检写这么多？** 因为 Agent 的行为有太多"看起来对但实际不对"的地方：
-
-- 计划步骤没推进 → 却报告"计划已完成"
-- 正常完成 → 却说"这不是完整结论"
-- 审批批了 A → 实际执行的是 B
-- `/proj_evil` 被当成 `/proj` 的子目录
-
-这些都不会崩，只会静默地做错事。**1308 项自检就是用来钉死这些的。**
-
----
-
-## 路线图
-
-已完成的阶段：
-
-- ✅ **v0.1a** — 五阶段 Loop + 4 工具 + Policy + 审批（CLI）
-- ✅ **v0.1b** — `edit_file`（唯一匹配 / `patch_conflict` / `stale_content` / CRLF+BOM 保真）
-- ✅ **v0.1c** — `run_command` + Docker 沙箱（唯一执行出口，无宿主机分支）
-- ✅ **Phase 3a–3d** — SQLite 持久化 / 调度 / FastAPI+SSE / 前端接真后端 / E2E 51 项
-- ✅ **第三阶段 1–6 批** — 验证闸门 / 计划状态 / 范围审计 / 意图与证据分级 / 风险收尾确认 /
-  约束一致性 / 读取复用 / 上下文压缩 / 预算续期
-- ✅ **M1** — 编排器开关 + 消息历史持久化（`task_history`）
-- ✅ **M2** — LangGraph 引擎（`LOOM_ORCHESTRATOR=graph`，与 legacy 共用同一组检查点）
-- ✅ **M2.1** — 工具链修复（`command` 含空格一律拒 / exit 127 专属提示 / task_id 孤儿）
-- ✅ **M2.2** — 前端事件契约（`context.compacted`）+ 反思答复的无进展终止（`no_progress`）
-- ✅ **M3** — 项目知识检索：SQLite FTS5 关键词检索 + 自动预检索 + `search_docs` 工具 +
-  `rag.retrieve` / `rag.result` 事件与 GUI 展示（**不是**向量/语义检索）
-
-未实现 / 后续（原始计划的 M1–M6）：
-
-- ⬜ **M4** — MCP 接入（`MCPToolAdapter` → 现有 Registry，默认需审批）
-- ⬜ **M5** — Multi-Agent（`spawn_subtask` + 父子任务 + 证据分级验收）
-- ⬜ **M6** — 前端展示与前后对比
-- ⬜ `delete_file`（不在 M1–M6 计划内）、Tauri 桌面外壳、跨进程续跑
-
----
-
-## 一些真实踩过的坑
-
-这些坑的共同点是：**不报错，只是静默地做错事** —— 所以值得记下来。
-
-**编码不能猜。** Windows 上终端送进 stdin 的字节可能是 UTF-8（现代终端 / Git Bash），
-也可能是 GBK（传统 cmd）—— **取决于终端，不取决于代码**。
-一开始按"控制台代码页"去猜，在 cmd 里对了，在 MSYS 终端下必错。
-最终方案是**宽容解码**：先按 UTF-8 解，失败回退 GBK。
-可靠性来自字节结构 —— UTF-8 的续字节一律 `10xxxxxx`，而 GBK 双字节是 `81-FE + 40-FE`，
-几乎不可能碰巧构成合法 UTF-8。关键是**从 `sys.stdin.buffer` 拿原始字节** ——
-走 TextIOWrapper 那一层的话，字节早被解完了，到手的乱码救不回来。
-
-**批处理文件不能用 UTF-8 存。** cmd 读 `.bat` 时按系统 ANSI 代码页逐字节解释。
-存成 UTF-8 不只是中文乱码 —— cmd 定位文件位置时按字节偏移 seek，
-一个汉字占 3 字节会让指针落在字符中间，整行被切碎。报错长这样：
-`'ps_proxy' 不是内部或外部命令`（其实是 `set "https_proxy="` 被切了一半），
-**完全看不出是编码问题**。所以：源用 UTF-8（好编辑），产物用 GBK（cmd 能读）。
-
-**`set /p` 分不清「空行」和「EOF」。** 两者表现完全一样：变量保持原值 + errorlevel=1。
-用它判断"读不到输入"，就等于把"用户敲回车复用上次目录"直接判死。
-
-**`echo` 里落单的 `!` 会静默吃掉后面一大段文字**（在 `enabledelayedexpansion` 下）。
-`echo [!] 提示...（例如 D:\` 输出成 `[\` —— 不报错，就是断半截。
-
----
-
-## 环境要求
-
-- Python 3.11+（开发用的是 3.13）
-- 一个 OpenAI 兼容的模型 API（百炼 / DeepSeek，或任何兼容端点）
+| 文档 | 内容 |
+|---|---|
+| `architecture/LOOM_ARCHITECTURE_AND_FEATURES.md` | 完整架构与功能说明书（1000+ 行） |
+| `09-M3-项目知识检索.md` · `12-M4.2-RAG-验收报告.md` | 检索的设计与验收 |
+| `12-M4.1-MCP-Client验收报告.md` | MCP 集成 |
+| `13-M4.3-LangGraph-集成验收报告.md` | Graph 默认引擎的切换与缺陷修复 |
+| `14-M5-Multi-Agent-验收报告.md` | 父子任务 |
+| `15-Terminal-Tool-验收报告.md` | 宿主机终端 |
+| `16-混合检索-验收报告.md` | BM25 + 向量 + RRF |
 
 ---
 
 ## License
 
-[MIT](LICENSE) —— 随意使用、修改、分发，保留版权声明即可。
+MIT
