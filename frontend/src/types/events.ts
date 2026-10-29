@@ -38,6 +38,7 @@ export const EVENT_TYPES = [
   "context.compacted",
   "rag.retrieve",
   "rag.result",
+  "workflow.state",
   "state.snapshot",
 ] as const;
 

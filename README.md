@@ -4,7 +4,7 @@
 给它一句话，它会规划、查项目、调工具、改文件、跑命令、验证结果，最后给一份**带证据**的答案。
 
 - 默认执行引擎 **Graph**（LangGraph），**Legacy** 保留为显式兜底
-- **1308** 项离线自检 · **19** 种事件 · **6** 个内置工具 + 可选 RAG / MCP / 子任务
+- **1349** 项离线自检 · **20** 种事件 · **7** 个内置工具 + 可选 RAG / MCP / 子任务 / 工作流
 - 离线优先、审批前置：没有 API Key 也能跑演示，没有网络也不影响核心逻辑
 
 > 这是**学习型项目**，不是产品：架构清晰 > 功能数量，可理解性 > 代码量。
@@ -68,6 +68,7 @@ Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批�
 | 项目知识检索 | ✅ | FTS5 + bm25；**可选**本地向量 + RRF 融合 |
 | MCP 工具接入 | ✅ | 仅本地 stdio；默认要审批；无自动重连 |
 | 父子任务 | 🟡 | 串行派生、结果信封、层级/数量/预算上限 |
+| **异步工作流（并行）** | ✅ | DAG 依赖调度：互不依赖的步骤真并行；http / 只读工具 / 本机命令 |
 | 事件 + SSE 时间线 | ✅ | 19 种事件，`since` 补拉 + `stream.gap` 快照恢复 |
 | 任务持久化 | ✅ | SQLite：sessions / tasks / task_history |
 | 跨进程恢复 | ❌ | 无 checkpoint，重启不能续跑 |
@@ -182,6 +183,8 @@ flowchart TB
 
 **依赖方向单向**：`server/ → agent/ → tools/`，**`agent/` 禁止 import `server/`**
 （所以 RAG 自带 SQLite 连接，不复用 server 的库句柄）。
+`workflow/` 是一个**平级基础设施**：tools 里的 `run_workflow` 调它，server 启动时用它做恢复扫描，
+它自己不依赖 agent —— 新增执行器不需要动调度核心。
 
 | 层 | 关键文件 | 职责 |
 |---|---|---|
@@ -192,6 +195,7 @@ flowchart TB
 | 策略 | `agent/policy.py` `agent/approval.py` | 七道关卡、审批挂起/恢复 |
 | 工具 | `tools/base.py` `registry.py` `tools/*` | 工具抽象、注册表、具体工具 |
 | 检索 | `agent/rag/*` | 索引 / 检索 / 融合 / 嵌入 |
+| 工作流 | `workflow/*` | DAG 调度、Job 执行适配（http/tool/shell）、outbox、重启恢复 |
 | 外部 | `mcp/*` `sandbox/manager.py` `models/openai_compat.py` | MCP 客户端、Docker 沙箱、模型适配 |
 
 ---
@@ -332,9 +336,9 @@ flowchart LR
 
 ### 6.6 事件与 SSE
 
-- 19 种事件：`task.start/end`、`plan`、`thinking`、`act`、`observe`、`tool.call/result`、
+- 20 种事件：`task.start/end`、`plan`、`thinking`、`act`、`observe`、`tool.call/result`、
   `approval.request/decision/expired`、`reflect`、`final_answer`、`error`、`budget.exceeded`、
-  `context.compacted`、`rag.retrieve/result`、`state.snapshot`。
+  `context.compacted`、`rag.retrieve/result`、**`workflow.state`**、`state.snapshot`。
 - `EventBus.emit` 同步分配全局 `seq`；`EventHub` 缓冲（3000 条 / 单条 64KB），
   订阅者队列满 → 丢最旧 + 标 `need_gap` → 前端收到 `stream.gap` 后走快照恢复。
 - **事件不落盘**；`task_history` 存的是消息级历史（append-only）。
@@ -357,6 +361,7 @@ flowchart LR
 | `run_command` | exec | **是** | 执行 | **Docker 沙箱**，无宿主机分支 |
 | `terminal` | exec | **是**（只读白名单免） | 执行 | **宿主机** shell；cwd 必须在工作区 |
 | `spawn_subtask` | write | **是** | 建任务 | 派生子任务并等待；拒绝则不创建 |
+| `run_workflow` | exec | **是**（整条工作流一次） | 执行多步 | DAG 并行调度；支持 http / 工具 / 命令 |
 | `mcp__<server>__<tool>` | 默认 write | **是** | 由 Server 决定 | 外部 MCP 工具 |
 
 > 不注入 `knowledge` / `mcp` / `spawner` 时，对应工具**不会注册**——离线演示与旧测试行为不变。
@@ -442,6 +447,42 @@ LOOM_RAG_MODE=hybrid
 
 ---
 
+## 10.5 异步工作流：让"等"不再堵住一切
+
+`run_workflow` 把目标拆成**带依赖**的步骤交给调度器：互不依赖的步骤同时跑，
+依赖别人的等前置完成，全部结束才把结构化结果还给模型。
+
+```json
+{"goal": "对比两份资料并汇总结论",
+ "steps": [
+   {"id": "a", "kind": "http", "spec": {"url": "https://example.com/a"}},
+   {"id": "b", "kind": "tool", "spec": {"tool": "read_file", "args": {"path": "notes/b.md"}}},
+   {"id": "c", "kind": "http", "spec": {"url": "https://example.com/slow"}, "timeout_s": 5},
+   {"id": "sum", "kind": "tool", "spec": {"tool": "read_file",
+                                          "args": {"path": "notes/summary.md"}},
+    "depends_on": ["a", "b"]}
+ ]}
+```
+
+| 层 | 含义 | 例子 |
+|---|---|---|
+| Workflow | 一个目标 | "对比两份资料" |
+| Step | 可验收的一步（有依赖） | `sum` 依赖 `a`、`b` |
+| Job | 一次真实执行（有状态与重试） | `a` 的这次 HTTP GET |
+
+- **并行是调度出来的**，不是把多个工具调用一起发出去：只启动依赖已完成的步骤，最多 `max_parallel` 个同时跑。
+- **失败隔离**：一步失败 → 依赖它的步骤标 `blocked`，不相关的步骤照常完成；工作流整体记 `failed`。
+- **超时/取消**：单步超时 → `failed(timed_out)`；任务取消 → 未完成步骤标 `cancelled`，不等慢请求自然结束。
+- **持久化**：`workflows / workflow_steps / workflow_jobs / workflow_outbox` 四张表与任务共用同一个 SQLite 文件。
+- **事件可靠**：状态变更先写 outbox 再投递（`workflow.state`，第 20 种事件）；重复投递幂等。
+- **重启恢复**：幂等步骤（http GET / 只读工具）自动重跑；有副作用的 shell 步骤只能标 `unknown` + `needs_attention`，**绝不自动重跑**。
+- **安全**：整个工具一次审批；`shell` 步骤等同 `terminal`；`http` 只允许 GET 且**禁止内网/回环**（防 SSRF）；后台只允许只读工具。
+
+> 这仍然**不是**"多个子 Agent 并行"：`run_workflow` 派的是"操作"，没有独立推理。
+> 子 Agent 依旧串行（见 §10）。
+
+---
+
 ## 11. 数据与持久化
 
 | 实体 | 存储 | 说明 |
@@ -473,7 +514,7 @@ React 19 + Vite 8 + TypeScript 6 + Tailwind 4，单一 `useReducer` store（`fea
 ## 13. 测试
 
 ```bash
-# 离线自检（不需要 API Key）—— 1308 项
+# 离线自检（不需要 API Key）—— 1349 项
 python -m backend.selfcheck_p1        #  55  契约层：事件/错误码/schema
 python -m backend.selfcheck_p2        #  45  模型层：候选轮换/错误分类
 python -m backend.selfcheck_agent     # 597  Agent 全链路：阶段/闸门/预算/审批/压缩/意图
@@ -484,6 +525,7 @@ python -m backend.selfcheck_rag       # 109  索引/检索/集成/安全/闭环/
 python -m backend.selfcheck_mcp       #  63  MCP 连接/发现/注册/审批/超时/关闭
 python -m backend.selfcheck_subtask   #  32  父子任务/迁移/上限/取消
 python -m backend.selfcheck_terminal  #  59  终端探测/真跑/越界/审批/双引擎
+python -m backend.selfcheck_workflow   #  41  工作流 DAG/并行/失败隔离/取消/恢复
 
 # 集成 / 真实环境（按需）
 python -m backend.server.test_live_e2e       #  51  真 HTTP/SSE/调度/审批（模型替身）
@@ -527,7 +569,7 @@ npx tsc -p tsconfig.app.json --noEmit
 ## 15. 已知限制
 
 - **没有跨进程恢复**：无 checkpointer，`safe_to_resume` 恒 False；重启只能看结果，不能续跑。
-- **没有并行子任务**：`spawn_subtask` 是同步等待，多子任务线性累加时间。
+- **没有并行子 Agent**：`spawn_subtask` 是同步等待；并行的是 `run_workflow` 里的**步骤**（没有独立推理）。
 - **`terminal` 没有沙箱**：命令以你的用户身份运行，安全靠审批 + cwd + 超时；
   审批卡里写明了这一点，不要把它当隔离环境。
 - **MCP 只支持本地 stdio**：无远程传输、OAuth、自动重连；in-flight 调用无法取消。
@@ -562,10 +604,12 @@ loom/
 │   ├── agent/          core.py（内核）· graph_engine.py · policy.py · approval.py
 │   │                   state.py · context.py · intent.py · compaction.py · subtask.py
 │   │   └── rag/        discover / chunk / store / service / query / embed
+│   ├── workflow/       models（Workflow/Step/Job）· store（4 表 + outbox）
+│   │                   executors（http/tool/shell）· service（DAG 调度 + 恢复）
 │   ├── tools/          base · registry · path_safety
 │   │   ├── readonly/   list_files · read_file · search_docs
 │   │   ├── mutating/   write_file · edit_file · spawn_subtask
-│   │   └── exec/       run_command（Docker）· shells + terminal（宿主机）
+│   │   └── exec/       run_command（Docker）· shells + terminal（宿主机）· run_workflow
 │   ├── mcp/            config · client（每 Server 一个常驻 task）· tool
 │   ├── models/         openai_compat（三家共用）· adapter（协议 + FakeAdapter）
 │   ├── server/         app（HTTP+SSE）· scheduler · runtime · store · hub

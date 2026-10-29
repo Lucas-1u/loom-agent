@@ -57,6 +57,7 @@ export const EVENT_STYLES: Record<EventType, EventVisualStyle> = {
   "context.compacted": { label: "上下文压缩", tone: "violet", icon: "⤓" },
   "rag.retrieve":      { label: "检索资料", tone: "violet", icon: "⌕" },
   "rag.result":        { label: "检索结果", tone: "cyan",   icon: "◈" },
+  "workflow.state":    { label: "工作流",   tone: "violet", icon: "⧉" },
   "state.snapshot":    { label: "状态快照", tone: "slate",  icon: "▤" },
 };
 

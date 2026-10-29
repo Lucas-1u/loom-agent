@@ -97,6 +97,9 @@ class EventType(str, Enum):
     # ---- 前端可用的辅助信号 -------------------------------------------------
     STATE_SNAPSHOT = "state.snapshot"  # 全量状态快照（重连/初始化时同步用）
 
+    # ---- 异步工作流（V1）---------------------------------------------------
+    WORKFLOW_STATE = "workflow.state"  # 工作流/步骤状态快照（每个状态变更发一次）
+
 
 # --------------------------------------------------------------------------- #
 # 事件外壳
@@ -390,6 +393,10 @@ class EventBus:
     def rag_result(self, payload: dict[str, Any], turn: int = 0) -> Event:
         """检索结束（命中数、路径、耗时、是否注入、无结果原因）。"""
         return self.emit(Event.make(EventType.RAG_RESULT, payload, turn=turn))
+
+    def workflow_state(self, payload: dict[str, Any], turn: int = 0) -> Event:
+        """工作流状态快照（包含 event 名、workflow 状态、每个 step 的状态）。"""
+        return self.emit(Event.make(EventType.WORKFLOW_STATE, payload, turn=turn))
 
     def budget_exceeded(self, kind: str, limit: Any, used: Any, turn: int = 0) -> Event:
         return self.emit(

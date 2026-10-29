@@ -272,6 +272,64 @@ function EventBody({
       );
     }
 
+    case "workflow.state": {
+      const wfSteps = (d.steps ?? []) as Array<Record<string, unknown>>;
+      const wfStatus = String(d.status ?? "");
+      const event = String(d.event ?? "");
+      const tone =
+        wfStatus === "completed"
+          ? "text-tone-green"
+          : wfStatus === "cancelled" || wfStatus === "failed" || wfStatus === "needs_attention"
+            ? "text-tone-red"
+            : "text-tone-violet";
+      const stepTone = (st: string) =>
+        st === "done"
+          ? "text-tone-green"
+          : st === "failed" || st === "blocked"
+            ? "text-tone-red"
+            : st === "running"
+              ? "text-tone-cyan"
+              : "text-slate-500";
+
+      return (
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px]">
+            <span className={`font-mono ${tone}`}>{wfStatus || "?"}</span>
+            <span className="text-slate-500">{event}</span>
+            <span className="truncate text-slate-400">{String(d.goal ?? "")}</span>
+            <span className="ml-auto shrink-0 font-mono text-[10px] text-slate-600">
+              {wfSteps.filter((x) => String(x.status) === "done").length}/{wfSteps.length} 步
+            </span>
+          </div>
+          <div className="space-y-0.5">
+            {wfSteps.map((st, i) => {
+              const deps = (st.depends_on ?? []) as string[];
+              return (
+                <div key={i} className="flex items-center gap-2 font-mono text-[10.5px]">
+                  <span className={stepTone(String(st.status))}>
+                    {String(st.status ?? "?")}
+                  </span>
+                  <span className="text-slate-300">{String(st.step_id ?? "")}</span>
+                  <span className="text-slate-600">{String(st.kind ?? "")}</span>
+                  {deps.length > 0 && (
+                    <span className="text-slate-600">← {deps.join(",")}</span>
+                  )}
+                  {st.error ? (
+                    <span className="truncate text-tone-red/80">{String(st.error)}</span>
+                  ) : null}
+                  {Number(st.elapsed_ms ?? 0) > 0 && (
+                    <span className="ml-auto shrink-0 text-slate-700">
+                      {String(st.elapsed_ms)}ms
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
     case "observe":
       return <p className="text-[12px] text-slate-400">{String(d.digest ?? "")}</p>;
 

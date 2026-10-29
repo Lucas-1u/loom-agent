@@ -160,6 +160,9 @@ def build_default_registry(
     mcp: "McpManager | None" = None,
     spawner: Any = None,
     terminal: bool | None = None,
+    workflow: Any = None,
+    workflow_allow_local: bool = False,
+    workflow_parallel: int = 3,
 ) -> ToolRegistry:
     """
     构建默认工具集。
@@ -223,6 +226,13 @@ def build_default_registry(
         if _terminal_on:
             from .exec.terminal import make as make_terminal
             reg.register(make_terminal(), group="exec")
+
+        # ★ M6：异步工作流（不传 store 就不注册；离线测试与旧部署行为不变）
+        if workflow is not None:
+            from .exec.run_workflow import make as make_workflow
+            reg.register(make_workflow(workflow, reg, allow_local=workflow_allow_local,
+                                       max_parallel=workflow_parallel),
+                         group="workflow")
 
     return reg
 

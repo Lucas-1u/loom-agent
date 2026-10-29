@@ -128,6 +128,8 @@ def create_app(
     sandbox: Any = None,
     rag: dict[str, Any] | None = None,
     mcp: dict[str, Any] | None = None,
+    workflow_store: Any = None,
+    workflow_info: dict[str, Any] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Loom Agent Server", version="0.1.0")
 
@@ -172,6 +174,8 @@ def create_app(
             "rag": rag,
             # M4.1：MCP Server 状态（id/state/tools/error）—— 不含 env 值
             "mcp": mcp,
+            # M6：异步工作流（enabled / 恢复摘要）
+            "workflow": workflow_info or {"enabled": False},
         }
 
     # ===================================================================== #
@@ -340,6 +344,16 @@ def create_app(
         if snap is None:
             raise HTTPException(404, f"任务不存在：{task_id}")
         return snap
+
+    @app.get("/api/workflows/{workflow_id}")
+    async def get_workflow(workflow_id: str) -> dict[str, Any]:
+        """工作流快照（步骤/依赖/状态）。前端时间线是主视图，这个接口用于刷新与排障。"""
+        if workflow_store is None:
+            raise HTTPException(status_code=503, detail="workflow 未启用")
+        view = workflow_store.get(workflow_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail=f"没有这个工作流：{workflow_id}")
+        return {"ok": True, **view.to_dict()}
 
     @app.get("/api/tasks/{task_id}/events")
     async def task_events(

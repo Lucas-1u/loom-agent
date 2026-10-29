@@ -937,6 +937,7 @@ class AgentCore:
         # ---- Policy 校验 -------------------------------------------------
         ctx = make_context(state)
         ctx.spawner = self.spawner      # M5：子任务能力随上下文下发（工具不持有全局状态）
+        ctx.bus = self.bus              # M6：工作流工具用它发 workflow.state 事件
         decision = self.policy.check(
             tc.name,
             tc.arguments,
@@ -982,6 +983,10 @@ class AgentCore:
                 # ★ 长耗时工具（run_command）要能感知"用户点了停止"
                 cancel_event=self._cancel_event,
             )
+            # ★ 批准后的路径会重建 ctx：能力（子任务 / 事件总线）必须一并带上，
+            #   否则"批准前能用、批准后就没了"——这类不一致极难排查。
+            ctx.spawner = self.spawner
+            ctx.bus = self.bus
 
         # ---- 执行 -------------------------------------------------------
         # ★ M3：search_docs 的检索事件在这里发（工具的"开始/结束"与其它工具一致），
@@ -1168,6 +1173,8 @@ class AgentCore:
 
         # ---- 批准 → 执行前复检（TOCTOU）--------------------------------
         ctx = make_context(state)
+        ctx.spawner = self.spawner
+        ctx.bus = self.bus
         recheck = self.policy.recheck_after_approval(tc.name, tc.arguments, state, ctx, pending)
         if not recheck.allow:
             res = recheck.result or ToolResult.failure(

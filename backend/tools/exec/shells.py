@@ -179,6 +179,11 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
            if not any(h in k.upper() for h in SENSITIVE_ENV_HINTS)}
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUNBUFFERED", "1")
+    # ★ PATHEXT 必须存在且非空：PS 靠它给裸命令名补 .EXE。
+    #   本机实测过父进程 PATHEXT 为空的情况：cmd 仍能找到 python，
+    #   而 PS 报"无法将 python 项识别为..." —— 同一台机两个 shell 行为不一致。
+    if not env.get("PATHEXT"):
+        env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS;.MSC"
     if extra:
         env.update({k: v for k, v in extra.items()
                     if not any(h in k.upper() for h in SENSITIVE_ENV_HINTS)})

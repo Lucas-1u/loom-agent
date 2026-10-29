@@ -418,7 +418,7 @@ async def suite_failures(tmp: Path) -> None:
 # --------------------------------------------------------------------------- #
 def suite_events() -> None:
     print("\n[E] 事件与契约")
-    check(len(list(EventType)) == 19, f"事件类型仍是 19 种（实际 {len(list(EventType))}）")
+    check(len(list(EventType)) == 20, f"事件类型仍是 20 种（实际 {len(list(EventType))}）")
     src = Path(__file__).resolve().parents[1] / "frontend" / "src" / "types" / "events.ts"
     if src.exists():
         text = src.read_text(encoding="utf-8")

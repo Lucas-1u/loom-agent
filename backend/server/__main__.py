@@ -158,7 +158,25 @@ async def amain(args: argparse.Namespace) -> int:
     #   最后把 spawn_subtask 注册进去 —— 这样父子任务共用 Policy/审批/闸门，不存在旁路。
     adapter = OpenAICompatAdapter.from_config(cfg.model)
     agent_cfg = AgentConfig.from_budget_config(cfg.budgets, rag_auto=cfg.rag.auto_prefetch)
-    registry = build_default_registry(sandbox=sandbox, knowledge=knowledge, mcp=mcp_manager)
+
+    # ★ M6：异步工作流。与 tasks 共用同一个 SQLite 文件（表名 workflow_* 分区）。
+    #   allow_local 默认关：http 步骤禁止访问内网/回环（防 SSRF）；本机 mock 测试时才开。
+    from ..workflow import WorkflowService, WorkflowStore
+    import os as _os
+
+    workflow_store = WorkflowStore(db_path)
+    workflow_allow_local = _os.environ.get("LOOM_WORKFLOW_ALLOW_LOCAL", "0").lower() in (
+        "1", "true", "on", "yes")
+    try:
+        workflow_parallel = max(1, int(_os.environ.get("LOOM_WORKFLOW_PARALLEL", "3")))
+    except ValueError:
+        workflow_parallel = 3
+
+    registry = build_default_registry(
+        sandbox=sandbox, knowledge=knowledge, mcp=mcp_manager,
+        workflow=workflow_store, workflow_allow_local=workflow_allow_local,
+        workflow_parallel=workflow_parallel,
+    )
 
     from ..agent.subtask import SubtaskSpawner
     from ..tools.mutating.spawn_subtask import make as make_spawn
@@ -186,6 +204,35 @@ async def amain(args: argparse.Namespace) -> int:
         spawner=spawner,
     )
 
+    # ---- 工作流恢复：启动时扫一遍未终结的 Workflow ---------------------
+    #   · 幂等步骤（http GET / 只读工具）→ 退回 pending，后台继续跑
+    #   · 有副作用的步骤（shell）→ 标 unknown + 工作流转 needs_attention，绝不自动重跑
+    from ..agent.policy import make_context
+    from ..agent.state import TaskState
+
+    async def _workflow_tool_runner(name: str, wargs: dict, workspace: str) -> dict:
+        tool = registry.get(name)
+        if tool is None:
+            return {"ok": False, "error": f"工具不存在：{name}"}
+        st = TaskState(task_id="workflow", goal="(workflow step)", workspace=workspace)
+        res = await tool.run(wargs, make_context(st))
+        return {"ok": res.ok, "summary": res.summary, "data": res.data, "error": res.error}
+
+    wf_service = WorkflowService(
+        workflow_store, tool_runner=_workflow_tool_runner,
+        allow_local=workflow_allow_local, max_parallel=workflow_parallel,
+    )
+    try:
+        workflow_recovery = await wf_service.recover()
+    except Exception as exc:  # noqa: BLE001 —— 恢复失败不能拖垮启动
+        workflow_recovery = {"error": f"{type(exc).__name__}: {exc}"}
+    workflow_info = {
+        "enabled": True,
+        "allow_local": workflow_allow_local,
+        "max_parallel": workflow_parallel,
+        "recovery": workflow_recovery,
+    }
+
     app = create_app(
         store=store,
         hub=hub,
@@ -195,6 +242,8 @@ async def amain(args: argparse.Namespace) -> int:
         sandbox=sandbox,
         rag=rag_info,
         mcp=mcp_info,
+        workflow_store=workflow_store,
+        workflow_info=workflow_info,
     )
 
     print("=" * 62)

@@ -251,6 +251,8 @@ class ToolContext:
     cancel_event: Any = None
     # M5：子任务派生器（由服务端装配注入；为 None 表示当前不允许派生子任务）
     spawner: Any = None
+    # M6：事件总线（工作流这类"多步并行"的工具需要自己发进度事件）
+    bus: Any = None
     # M5：子任务要继承的安全约束（来自父任务 TaskState）
     allowed_paths: list[str] | None = None
     forbidden_paths: list[str] | None = None
