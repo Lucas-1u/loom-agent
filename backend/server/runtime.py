@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any
 
@@ -79,6 +80,41 @@ class TaskRuntime:
         self.bus = EventBus()
         self.bus.bind_task(task_id)
         self.approvals = ApprovalManager(timeout_s=config.approval_timeout_s)
+
+        # Spill：溢出存储（对齐 DeepSeek Harness dsh-spill-policy）
+        spill_store = None
+        spill_cfg = getattr(config, "spill", None)
+        if spill_cfg and getattr(spill_cfg, "enabled", False):
+            from ..agent.spill import LocalSpillStore
+            spill_base = os.path.join(
+                self.workspace,
+                getattr(spill_cfg, "dir_name", ".loom_spill"),
+            )
+            spill_store = LocalSpillStore(spill_base)
+
+        # Checkpoint：跨进程恢复快照（对齐 DeepSeek Harness dsh-session-checkpoint-policy）
+        checkpoint_store = None
+        ckpt_cfg = getattr(config, "checkpoint", None)
+        ckpt_policy = None
+        if ckpt_cfg and getattr(ckpt_cfg, "enabled", False):
+            from ..agent.checkpoint import (
+                CheckpointPolicyConfig,
+                LocalDiskCheckpointStore,
+            )
+            ckpt_base = os.path.join(
+                self.workspace,
+                getattr(ckpt_cfg, "dir_name", ".loom_checkpoints"),
+            )
+            checkpoint_store = LocalDiskCheckpointStore(ckpt_base)
+            ckpt_policy = CheckpointPolicyConfig(
+                enabled=True,
+                before_model_call=getattr(ckpt_cfg, "before_model_call", True),
+                before_tool_exec=getattr(ckpt_cfg, "before_tool_exec", True),
+                at_turn_start=getattr(ckpt_cfg, "at_turn_start", True),
+                max_history=getattr(ckpt_cfg, "max_history", 20),
+                fail_closed=getattr(ckpt_cfg, "fail_closed", False),
+            )
+
         self.core = AgentCore(
             adapter, registry, config=config, bus=self.bus, approvals=self.approvals,
             # M1：消息历史随任务持久化（store.task_history）
@@ -87,6 +123,17 @@ class TaskRuntime:
             knowledge=knowledge,
             # M5：子任务派生器（不传则 spawn_subtask 不可用）
             spawner=spawner,
+            # Spill：溢出存储（不传则退化为纯截断）
+            spill_store=spill_store,
+            spill_enabled=getattr(spill_cfg, "enabled", False),
+            spill_max_inline_chars=getattr(spill_cfg, "max_inline_chars", 12_000),
+            prune_threshold_chars=getattr(spill_cfg, "prune_threshold_chars", 8_192),
+            prune_head_chars=getattr(spill_cfg, "prune_head_chars", 4_096),
+            prune_tail_chars=getattr(spill_cfg, "prune_tail_chars", 1_024),
+            # Checkpoint：跨进程恢复（P0，对齐 DSH dsh-session-checkpoint-policy）
+            checkpoint_store=checkpoint_store,
+            checkpoint_enabled=getattr(ckpt_cfg, "enabled", False),
+            checkpoint_policy=ckpt_policy,
         )
 
         # ---- 服务层状态 ----

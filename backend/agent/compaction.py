@@ -273,11 +273,13 @@ class ContextCompactor:
         *,
         max_chars: int = 60_000,
         keep_recent_turns: int = 3,
+        long_turn_chars: int = 20_000,
         min_gain_ratio: float = 0.15,
         summarizer: Callable[[str], Awaitable[str | None]] | None = None,
     ) -> None:
         self.max_chars = max_chars
         self.keep_recent_turns = keep_recent_turns
+        self.long_turn_chars = long_turn_chars
         self.min_gain_ratio = min_gain_ratio
         self.summarizer = summarizer
 
@@ -289,7 +291,7 @@ class ContextCompactor:
         # 单轮超长：早压一次，免得下一次请求直接撞墙
         for turn in split_turns(messages):
             turn_chars = sum(len(m.content) for m in turn)
-            if turn_chars > LONG_TURN_CHARS:
+            if turn_chars > self.long_turn_chars:
                 return True, f"单轮内容过长（{turn_chars} 字符）", stats
         return False, "", stats
 

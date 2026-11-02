@@ -187,6 +187,16 @@ class GraphTaskEngine:
         if core.config.use_plan_phase and not st.plan and not st.plan_note:
             return {"phase": "budget", "route": "plan", "turns": st.turn}
         st.next_turn()
+
+        # Checkpoint：每轮开始前（对齐 DSH agent/pre-step）
+        # 与 legacy _loop 的 at_turn_start checkpoint 同源；不传 store 时跳过
+        if core._checkpoint_store is not None and core._checkpoint_policy is not None:
+            core._ckpt_save(
+                core._checkpoint_store, st,
+                phase="at_turn_start",
+                policy=core._checkpoint_policy,
+            )
+
         return {"phase": "budget", "route": "act", "turns": st.turn}
 
     async def node_plan(self, state: GraphState) -> dict[str, Any]:

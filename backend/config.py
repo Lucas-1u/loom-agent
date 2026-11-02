@@ -197,8 +197,11 @@ class BudgetConfig:
     # ---- 上下文压缩（第五批）-------------------------------------------
     # ★ 阈值用**字符数**表达：没有可靠 tokenizer，不假装精确 token 数。
     #   60k 字符 ≈ 40k token（按 1.5 字符/token 估算）。
+    #   对 1M 上下文的模型（如星火 spark-x2.6）可调大，如 200_000。
     compact_max_chars: int = 60_000
     compact_keep_turns: int = 3
+    # 单轮字符数超过此值就提前压一次（长输出场景，防止下一次请求撞墙）
+    compact_long_turn_chars: int = 20_000
 
     # ---- 编排引擎（M1 / M4.3）-----------------------------------------
     # graph = LangGraph 引擎（M2 已实现，M4.3 起为**默认**）；
@@ -212,6 +215,7 @@ class BudgetConfig:
             orchestrator=validate_orchestrator(_env("LOOM_ORCHESTRATOR", "graph")),
             compact_max_chars=_env_int("LOOM_COMPACT_CHARS", 60_000),
             compact_keep_turns=_env_int("LOOM_COMPACT_KEEP_TURNS", 3),
+            compact_long_turn_chars=_env_int("LOOM_COMPACT_LONG_TURN", 20_000),
             max_turns=_env_int("LOOM_MAX_TURNS", 20),
             max_seconds=_env_float("LOOM_MAX_SECONDS", 300.0),
             max_tool_calls=_env_int("LOOM_MAX_TOOL_CALLS", 40),
@@ -273,6 +277,27 @@ MAX_TOOL_RESULT_CHARS: int = 8_000
 
 # 覆盖写入前的备份目录（相对于工作区根）
 BACKUP_DIR_NAME: str = ".loom_backup"
+
+
+# --------------------------------------------------------------------------- #
+# Spill 溢出存储（对齐 DeepSeek Harness dsh-spill-policy）
+# --------------------------------------------------------------------------- #
+
+#: 工具结果超过此字符数 → 触发 spill（完整存盘 + head/tail 保留）
+SPILL_MAX_INLINE_CHARS: int = 12_000
+
+#: spill 存储根目录（相对于工作区根）
+SPILL_DIR_NAME: str = ".loom_spill"
+
+#: 是否启用 spill（默认开；关闭则退化为旧行为：纯截断）
+SPILL_ENABLED: bool = True
+
+#: 工具结果修剪器：超过此字符数的历史 tool 消息 → 修剪中间部分
+PRUNE_THRESHOLD_CHARS: int = 8_192
+#: 修剪时保留开头字符数
+PRUNE_HEAD_CHARS: int = 4_096
+#: 修剪时保留结尾字符数
+PRUNE_TAIL_CHARS: int = 1_024
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +454,85 @@ class MultiAgentConfig:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Spill 溢出存储（对齐 DeepSeek Harness dsh-spill-policy）
+# --------------------------------------------------------------------------- #
+@dataclass
+class SpillConfig:
+    """
+    Spill 溢出存储配置。
+
+    当工具结果超过 max_inline_chars 时，完整内容存盘，上下文只保留 head + tail。
+    关闭时退化为旧行为（纯截断）。
+
+    ★ 和 DeepSeek Harness 的关系：本配置对应 dsh-spill-policy 的 maxInlineTokens
+      + dsh-compaction-tool-result-pruner 的 thresholdChars / headChars / tailChars。
+    """
+
+    enabled: bool = True
+    max_inline_chars: int = SPILL_MAX_INLINE_CHARS
+    dir_name: str = SPILL_DIR_NAME
+    # 工具结果修剪器（compaction 时修剪历史 tool 消息）
+    prune_threshold_chars: int = PRUNE_THRESHOLD_CHARS
+    prune_head_chars: int = PRUNE_HEAD_CHARS
+    prune_tail_chars: int = PRUNE_TAIL_CHARS
+
+    @classmethod
+    def from_env(cls) -> "SpillConfig":
+        return cls(
+            enabled=_env("LOOM_SPILL", "1").lower() not in ("0", "false", "off", "no"),
+            max_inline_chars=max(1000, _env_int("LOOM_SPILL_MAX_INLINE", SPILL_MAX_INLINE_CHARS)),
+            dir_name=_env("LOOM_SPILL_DIR", SPILL_DIR_NAME) or SPILL_DIR_NAME,
+            prune_threshold_chars=max(1024, _env_int("LOOM_PRUNE_THRESHOLD", PRUNE_THRESHOLD_CHARS)),
+            prune_head_chars=max(0, _env_int("LOOM_PRUNE_HEAD", PRUNE_HEAD_CHARS)),
+            prune_tail_chars=max(0, _env_int("LOOM_PRUNE_TAIL", PRUNE_TAIL_CHARS)),
+        )
+
+
+# Checkpoint 目录名（对齐 DeepSeek Harness dsh-session-checkpoint-policy）
+CHECKPOINT_DIR_NAME: str = ".loom_checkpoints"
+
+
+@dataclass
+class CheckpointConfig:
+    """
+    Checkpoint 跨进程恢复配置（P0，对齐 DeepSeek Harness）。
+
+    在关键执行点（模型调用前 / 工具执行前 / 每轮开始前）保存 TaskState 快照
+    到本地磁盘，进程崩溃后可从最近 checkpoint 恢复。
+
+    ★ 和 DeepSeek Harness 的关系：本配置对应 dsh-session-checkpoint-policy 的
+      checkpoint 频率策略。Loom 选择**可用性优先**（fail_closed=False）：
+      checkpoint 保存失败只记日志，不阻止下游执行。
+
+    ★ 与 Spill 的区别：Spill 是"工具结果太大→存盘+截断"（省上下文），
+      Checkpoint 是"整份 TaskState→存盘"（防崩溃丢状态）。两者独立。
+    """
+
+    enabled: bool = True
+    # 三个 checkpoint 点（对应 DSH 的 llm/stream、tools/execute、agent/pre-step）
+    before_model_call: bool = True
+    before_tool_exec: bool = True
+    at_turn_start: bool = True
+    # 每个任务最多保留多少个历史 checkpoint（超出按 seq 裁剪最旧的）
+    max_history: int = 20
+    # True = 保存失败阻止下游执行（DSH 默认）；False = 只记日志（Loom 默认）
+    fail_closed: bool = False
+    dir_name: str = CHECKPOINT_DIR_NAME
+
+    @classmethod
+    def from_env(cls) -> "CheckpointConfig":
+        return cls(
+            enabled=_env("LOOM_CHECKPOINT", "1").lower() not in ("0", "false", "off", "no"),
+            before_model_call=_env("LOOM_CKPT_MODEL", "1").lower() not in ("0", "false", "off", "no"),
+            before_tool_exec=_env("LOOM_CKPT_TOOL", "1").lower() not in ("0", "false", "off", "no"),
+            at_turn_start=_env("LOOM_CKPT_TURN", "1").lower() not in ("0", "false", "off", "no"),
+            max_history=max(1, _env_int("LOOM_CKPT_MAX_HISTORY", 20)),
+            fail_closed=_env("LOOM_CKPT_FAIL_CLOSED", "0").lower() in ("1", "true", "on", "yes"),
+            dir_name=_env("LOOM_CKPT_DIR", CHECKPOINT_DIR_NAME) or CHECKPOINT_DIR_NAME,
+        )
+
+
 def _load_mcp_config():
     """懒加载 MCP 配置（LOOM_MCP=0 时返回 None，不读文件）。"""
     from .mcp.config import McpConfig
@@ -451,6 +555,10 @@ class Config:
     mcp: Any = None
     # M5：父子任务边界（层级/数量/子任务预算/超时）
     multiagent: MultiAgentConfig = field(default_factory=MultiAgentConfig.from_env)
+    # Spill：溢出存储 + 工具结果修剪（对齐 DeepSeek Harness）
+    spill: SpillConfig = field(default_factory=SpillConfig.from_env)
+    # Checkpoint：跨进程恢复快照（P0，对齐 DeepSeek Harness dsh-session-checkpoint-policy）
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig.from_env)
     log_level: str = "INFO"
 
     @classmethod
@@ -464,6 +572,8 @@ class Config:
             rag=RagConfig.from_env(),
             mcp=_load_mcp_config(),
             multiagent=MultiAgentConfig.from_env(),
+            spill=SpillConfig.from_env(),
+            checkpoint=CheckpointConfig.from_env(),
             log_level=_env("LOOM_LOG_LEVEL", "INFO"),
         )
 

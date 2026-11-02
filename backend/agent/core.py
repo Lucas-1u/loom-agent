@@ -160,6 +160,7 @@ class AgentConfig:
         # 60k 字符 ≈ 40k token 估算，对 128k 窗口的模型留足余量。
         compact_max_chars: int = 60_000,
         compact_keep_turns: int = 3,
+        compact_long_turn_chars: int = 20_000,
         # ---- 预算续期（第六批）-------------------------------------
         # 有界续期：只续一次，幅度固定。出现循环/停滞/冲突时绝不续。
         budget_extend_turns: int = 10,
@@ -186,6 +187,7 @@ class AgentConfig:
         self.stream = stream
         self.compact_max_chars = compact_max_chars
         self.compact_keep_turns = compact_keep_turns
+        self.compact_long_turn_chars = compact_long_turn_chars
         self.budget_extend_turns = budget_extend_turns
         self.budget_extend_enabled = budget_extend_enabled
         self.orchestrator = orchestrator
@@ -355,6 +357,18 @@ class AgentCore:
         extra_rules: str = "",
         knowledge: "KnowledgeBase | None" = None,
         spawner: Any = None,
+        # Spill：溢出存储后端（不传 = 不启用 spill，退化为旧行为）
+        spill_store: Any = None,
+        spill_enabled: bool = True,
+        spill_max_inline_chars: int = 12_000,
+        # 工具结果修剪器（compaction 时修剪历史 tool 消息）
+        prune_threshold_chars: int = 8_192,
+        prune_head_chars: int = 4_096,
+        prune_tail_chars: int = 1_024,
+        # Checkpoint：跨进程恢复（对齐 DSH dsh-session-checkpoint-policy）
+        checkpoint_store: Any = None,
+        checkpoint_enabled: bool = True,
+        checkpoint_policy: Any = None,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -370,6 +384,31 @@ class AgentCore:
         self.knowledge = knowledge
         # M5：子任务派生器（不传 = 不能派生子任务；由 TaskRuntime 注入）
         self.spawner = spawner
+        # Spill：溢出存储 + 工具结果修剪（对齐 DeepSeek Harness dsh-spill-policy）
+        from .spill import SpillPolicyConfig, apply_spill
+        from .tool_result_pruner import PrunerConfig, prune_messages
+        self._spill_store = spill_store
+        self._spill_policy_config = SpillPolicyConfig(
+            enabled=spill_enabled,
+            max_inline_chars=spill_max_inline_chars,
+        )
+        self._spill_apply = apply_spill
+        self._pruner_config = PrunerConfig(
+            threshold_chars=prune_threshold_chars,
+            head_chars=prune_head_chars,
+            tail_chars=prune_tail_chars,
+        )
+        self._prune_messages = prune_messages
+        self._spill_count = 0  # 统计本任务触发了几次 spill（测试用）
+
+        # Checkpoint：跨进程恢复（对齐 DeepSeek Harness dsh-session-checkpoint-policy）
+        from .checkpoint import CheckpointPolicyConfig, save_checkpoint as _ckpt_save
+        self._checkpoint_store = checkpoint_store
+        self._checkpoint_policy = checkpoint_policy or CheckpointPolicyConfig(
+            enabled=checkpoint_enabled,
+        )
+        self._ckpt_save = _ckpt_save
+        self._checkpoint_count = 0  # 统计本任务保存了几次 checkpoint（测试用）
 
         # 运行期状态（每次 run 重置）
         self._state: TaskState | None = None
@@ -515,6 +554,7 @@ class AgentCore:
         self.compactor = ContextCompactor(
             max_chars=self.config.compact_max_chars,
             keep_recent_turns=self.config.compact_keep_turns,
+            long_turn_chars=self.config.compact_long_turn_chars,
             summarizer=self._summarize_history,
         )
         # ---- 历史持久化（M1）：sink 在 __init__ 注入；这里只重置游标 ------
@@ -634,6 +674,15 @@ class AgentCore:
             # ---- 新一轮 -------------------------------------------------
             turn = state.next_turn()
 
+            # Checkpoint：每轮开始前（对齐 DSH agent/pre-step）
+            ref = self._ckpt_save(
+                self._checkpoint_store, state,
+                phase="at_turn_start",
+                policy=self._checkpoint_policy,
+            )
+            if ref is not None:
+                self._checkpoint_count += 1
+
             # ---- ACT：问模型要动作 --------------------------------------
             reply = await self._act_phase(state)
 
@@ -692,6 +741,14 @@ class AgentCore:
         )
         msgs.append(Message.system(PLAN_PROMPT))
 
+        # Checkpoint：模型调用前（对齐 DSH llm/stream）
+        ref = self._ckpt_save(
+            self._checkpoint_store, state,
+            phase="before_model_call",
+            policy=self._checkpoint_policy,
+        )
+        if ref is not None:
+            self._checkpoint_count += 1
         try:
             reply = await self._call_model(msgs, turn=state.turn, allow_tools=False)
         except ModelError as exc:
@@ -769,6 +826,14 @@ class AgentCore:
             history=self._history,
             phase_hint=phase_hint("act"),
         )
+        # Checkpoint：模型调用前（对齐 DSH llm/stream）
+        ref = self._ckpt_save(
+            self._checkpoint_store, state,
+            phase="before_model_call",
+            policy=self._checkpoint_policy,
+        )
+        if ref is not None:
+            self._checkpoint_count += 1
         try:
             return await self._call_model(msgs, turn=state.turn, allow_tools=True)
         except ModelError as exc:
@@ -795,6 +860,15 @@ class AgentCore:
 
         name_map = {tc.id: tc.name for tc in calls}
 
+        # Checkpoint：工具执行前（对齐 DSH tools/execute）
+        ref = self._ckpt_save(
+            self._checkpoint_store, state,
+            phase="before_tool_exec",
+            policy=self._checkpoint_policy,
+        )
+        if ref is not None:
+            self._checkpoint_count += 1
+
         for tc in calls:
             # ---- 该调用是否已被拒绝/失败（要保证 tool 消息数量对齐）----
             result = await self._one_tool_call(state, tc)
@@ -813,6 +887,19 @@ class AgentCore:
                 if marker:
                     content = marker
                     state.read_reuse_hits += 1
+                # ---- Spill（对齐 DeepSeek Harness dsh-spill-policy）----
+                # 超预算的工具结果：完整存盘 + head/tail 保留 + spill notice。
+                # 只在未命中读取复用时介入（marker 是短文本，无需 spill）。
+                if not marker and content and len(content) > self._spill_policy_config.max_inline_chars:
+                    content, _ref = self._spill_apply(
+                        content,
+                        tool_name=tc.name,
+                        owner=state.task_id,
+                        store=self._spill_store,
+                        config=self._spill_policy_config,
+                    )
+                    if _ref is not None:
+                        self._spill_count += 1
                 tb.add_tool(tc.id, tc.name, content)
 
         # ★ 补齐缺失的 tool 消息 —— 保证 OpenAI 协议不变量
@@ -1756,6 +1843,20 @@ class AgentCore:
         need, reason, stats = compactor.should_compact(msgs)
         if not need:
             return msgs
+
+        # ---- 工具结果修剪（对齐 DeepSeek Harness dsh-compaction-tool-result-pruner）----
+        # compaction 之前先修剪历史里的 tool 消息中间部分：这些大块内容
+        # （读大文件的结果）在后续轮次里已无用，模型只需知道"读过"。
+        self._history, pruned = self._prune_messages(
+            self._history, config=self._pruner_config
+        )
+        if pruned:
+            msgs = _build(self._history)
+            stats = measure(msgs)
+            log.info(
+                "任务 %s 修剪了 %d 条工具结果（中间部分替换为标记）",
+                state.task_id, pruned,
+            )
 
         outcome = await compactor.compact(
             state, self._history, before=stats, reason=reason
