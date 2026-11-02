@@ -254,6 +254,8 @@ export interface RawTask {
   turn: number;
   queued: boolean;
   events_available: boolean;
+  /** M5 父子关系（后端 tasks.parent_task_id；根任务为 null） */
+  parent_task_id: string | null;
 }
 
 function toTask(r: RawTask): Task {
@@ -269,6 +271,7 @@ function toTask(r: RawTask): Task {
     result: r.result || undefined,
     turn: r.turn,
     workspace: r.workspace,
+    parent_task_id: r.parent_task_id ?? null,
   };
 }
 

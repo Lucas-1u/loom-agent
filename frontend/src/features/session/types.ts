@@ -56,6 +56,12 @@ export interface Task {
    *   UI 会明确标出来，不假装一致。
    */
   workspace?: string;
+  /**
+   * M5 父子关系：父任务的 task_id；根任务为 null / undefined。
+   * ★ 前端用它构建任务树（ExecutionFlowView 的任务树栏）。
+   *   子任务与父任务同 session_id，所以按 session 过滤后可直接建树。
+   */
+  parent_task_id?: string | null;
 }
 
 // --------------------------------------------------------------------------- //

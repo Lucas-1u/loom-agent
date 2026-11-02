@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "test:workspace": "npx esbuild src/features/session/workspace.ts --bundle --format=esm --outfile=.tmp/workspace.mjs && npx esbuild src/features/session/selectors.ts --bundle --format=esm --outfile=.tmp/selectors.mjs && node scripts/test-workspace.mjs",
     "test:session": "npx esbuild src/features/session/store.tsx --bundle --format=esm --define:import.meta.env={} --outfile=.tmp/store.mjs && node scripts/test-session-isolation.mjs",
-    "test:events": "npx esbuild src/types/events.ts --bundle --format=esm --outfile=.tmp/events.mjs && npx esbuild src/lib/eventStyles.ts --bundle --format=esm --outfile=.tmp/eventStyles.mjs && node scripts/test-events-contract.mjs"
+    "test:events": "npx esbuild src/types/events.ts --bundle --format=esm --outfile=.tmp/events.mjs && npx esbuild src/lib/eventStyles.ts --bundle --format=esm --outfile=.tmp/eventStyles.mjs && node scripts/test-events-contract.mjs",
+    "test:tasktree": "npx esbuild src/features/session/taskTree.ts --bundle --format=esm --outfile=.tmp/taskTree.mjs && node scripts/test-tasktree.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

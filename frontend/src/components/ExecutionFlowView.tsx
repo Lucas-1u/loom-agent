@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EventEnvelope } from "../types/events";
 import type { Task } from "../features/session/types";
-import { relativeTime } from "../features/session/selectors";
+import { buildTaskTree } from "../features/session/taskTree";
 import { sameWorkspace } from "../features/session/workspace";
 import { EventTimeline } from "./EventTimeline";
+import { TaskTree } from "./TaskTree";
 
 /**
  * 执行流视图（瀑布式时间线）
@@ -57,6 +58,14 @@ export function ExecutionFlowView({
     [sessionWorkspace],
   );
 
+  /**
+   * 任务树：把扁平任务列表按 parent_task_id 构建成树。
+   *
+   * ★ 有子任务时，下拉里显示树（可折叠）；无子任务时退化为扁平列表（行为不变）。
+   *   buildTaskTree 是纯函数，每次 tasks 变化时重算。
+   */
+  const taskTree = useMemo(() => buildTaskTree(tasks), [tasks]);
+
   const initialScroll = useRef(
     new URLSearchParams(window.location.search).get("scroll") === "top" ? "top" : "bottom",
   );
@@ -106,7 +115,7 @@ export function ExecutionFlowView({
 
   return (
     <div className="flex h-full flex-col">
-      {/* ---- Task 选择器：只有多于一个任务时才出现 ---- */}
+      {/* ---- Task 选择器：多任务时显示，支持父子树 ---- */}
       {tasks.length > 1 && (
         <div className="relative shrink-0 border-b border-ink-700 bg-ink-900/60 px-4 py-1.5">
           <button
@@ -141,45 +150,16 @@ export function ExecutionFlowView({
           </button>
 
           {expandedPicker && (
-            <div className="absolute left-4 right-4 top-full z-20 mx-auto mt-1 max-w-[860px] overflow-hidden rounded-lg border border-ink-600 bg-ink-850 shadow-xl">
-              {tasks.map((t, i) => {
-                const active = t.task_id === activeTaskId;
-                return (
-                  <button
-                    key={t.task_id}
-                    type="button"
-                    onClick={() => {
-                      onSelectTask(t.task_id);
-                      setExpandedPicker(false);
-                    }}
-                    className={[
-                      "flex w-full items-start gap-2 px-3 py-2 text-left transition-colors",
-                      active ? "bg-tone-blue/10" : "hover:bg-ink-800",
-                    ].join(" ")}
-                  >
-                    <span className="mt-[2px] shrink-0 font-mono text-[10px] text-slate-600">
-                      #{i + 1}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span
-                        className={`block truncate text-[12px] ${
-                          active ? "text-slate-100" : "text-slate-300"
-                        }`}
-                      >
-                        {t.goal}
-                      </span>
-                      <span className="block text-[10px] text-slate-600">
-                        <StatusDot status={t.status} /> {t.status} · {relativeTime(t.started_at)}
-                      </span>
-                      {mismatch(t) && (
-                        <span className="mt-0.5 block truncate text-[10px] text-tone-amber">
-                          ⚠ 实际在 {t.workspace} 执行（与会话目录不同）
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                );
-              })}
+            <div className="absolute left-4 right-4 top-full z-20 mx-auto mt-1 max-w-[860px] overflow-hidden rounded-lg border border-ink-600 bg-ink-850 shadow-xl p-1.5">
+              <TaskTree
+                tree={taskTree}
+                activeTaskId={activeTaskId}
+                sessionWorkspace={sessionWorkspace}
+                onSelect={(id) => {
+                  onSelectTask(id);
+                  setExpandedPicker(false);
+                }}
+              />
             </div>
           )}
         </div>
@@ -258,21 +238,5 @@ function EmptyState({ hasTask }: { hasTask: boolean }) {
         </p>
       </div>
     </div>
-  );
-}
-
-function StatusDot({ status }: { status: string }) {
-  const map: Record<string, string> = {
-    running: "bg-tone-cyan",
-    awaiting_approval: "bg-tone-amber",
-    done: "bg-tone-green",
-    aborted: "bg-tone-amber",
-    failed: "bg-tone-red",
-    created: "bg-slate-600",
-  };
-  return (
-    <span
-      className={`inline-block h-1.5 w-1.5 rounded-full align-middle ${map[status] ?? "bg-slate-600"}`}
-    />
   );
 }
