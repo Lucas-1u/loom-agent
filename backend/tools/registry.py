@@ -193,6 +193,9 @@ def build_default_registry(
         # M5：父子任务（不传 spawner 就没有这个工具，行为与 M4 完全一致）
         from .mutating.spawn_subtask import make as make_spawn
         reg.register(make_spawn(spawner), group="subagent")
+        # P1-#42：并行派生多个子任务
+        from .mutating.spawn_parallel import make as make_spawn_parallel
+        reg.register(make_spawn_parallel(spawner), group="subagent")
 
     if mcp is not None:
         # MCP 工具走同一套注册表；风险等级由配置决定（默认 WRITE=需审批）。

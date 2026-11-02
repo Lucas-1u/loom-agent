@@ -281,7 +281,29 @@ class TaskStore:
                     "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)"
                 )
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            # ver == SCHEMA_VERSION：已是最新
+
+            # ---- 补齐历史表（任何版本都跑一次）--------------------------------
+            # ★ 为什么不能只放在 ver == 0 分支：
+            #   task_history 是 v1 才加进建表脚本的，之前建的库永远停在 v1 且没有这张表；
+            #   后来的 v1→v2 迁移只补了 parent_task_id —— 于是"用了一段时间的老库"
+            #   会静默地每条历史都写失败（core 只记 history_persist_errors，不致命，
+            #   但界面上历史消息/回放是空的）。这里无条件补一次，成本为零。
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_history (
+                  task_id     TEXT NOT NULL,
+                  seq         INTEGER NOT NULL,
+                  role        TEXT NOT NULL,
+                  content     TEXT NOT NULL DEFAULT '',
+                  reasoning   TEXT NOT NULL DEFAULT '',
+                  tool_call_id TEXT NOT NULL DEFAULT '',
+                  tool_name   TEXT NOT NULL DEFAULT '',
+                  tool_calls_json TEXT NOT NULL DEFAULT '',
+                  created_at  REAL NOT NULL,
+                  PRIMARY KEY (task_id, seq)
+                );
+                """
+            )
 
     async def init(self) -> None:
         await asyncio.to_thread(self.init_sync)

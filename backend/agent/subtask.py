@@ -85,6 +85,35 @@ class SubtaskResult:
         }
 
 
+@dataclass
+class ParallelSpawnResult:
+    """并行派生多个子任务的聚合结果。"""
+
+    results: list[SubtaskResult] = field(default_factory=list)
+    total: int = 0
+    done_count: int = 0
+    aborted_count: int = 0
+    rejected_count: int = 0
+    timed_out_count: int = 0
+    cancelled_count: int = 0
+
+    @property
+    def ok(self) -> bool:
+        """所有子任务都完成才算 ok。"""
+        return self.done_count == self.total and self.total > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "results": [r.to_dict() for r in self.results],
+            "total": self.total,
+            "done_count": self.done_count,
+            "aborted_count": self.aborted_count,
+            "rejected_count": self.rejected_count,
+            "timed_out_count": self.timed_out_count,
+            "cancelled_count": self.cancelled_count,
+        }
+
+
 class SubtaskSpawner:
     """派生并**同步等待**一个子任务（首版串行）。"""
 
@@ -322,6 +351,101 @@ class SubtaskSpawner:
         log.info("子任务 %s（父 %s）：%s/%s，%d 轮，%.1fs", child_id, parent_task_id,
                  result.status, result.end_reason, result.turn, time.time() - started)
         return result
+
+    # ---- 并行派生入口 ----------------------------------------------------
+    async def spawn_parallel(
+        self,
+        *,
+        goals: list[str],
+        parent_task_id: str,
+        workspace: str,
+        allowed_paths: list[str] | None = None,
+        forbidden_paths: list[str] | None = None,
+        cancel_event: Any = None,
+    ) -> ParallelSpawnResult:
+        """
+        并行派生多个子任务（P1-#42，对齐 DSH dsh-subagent-spawn-in-process）。
+
+        与 spawn() 的区别：
+          · spawn() 串行执行一个子任务，父任务 await 等待
+          · spawn_parallel() 并发执行多个子任务，父任务等待所有完成后聚合结果
+
+        数量上限检查：如果 goals 数量超过 (max_children - 已派生数)，
+        多余的会被拒绝（返回 rejected 状态的结果）。
+        """
+        if not goals:
+            return ParallelSpawnResult()
+
+        # 检查数量上限
+        try:
+            existing = await self.store.count_children(parent_task_id)
+        except Exception as exc:  # noqa: BLE001
+            return ParallelSpawnResult(
+                results=[SubtaskResult(status="rejected", error=f"数量检查失败：{exc}")],
+                total=1, rejected_count=1,
+            )
+
+        available = self.max_children - existing
+        if available <= 0:
+            return ParallelSpawnResult(
+                results=[SubtaskResult(status="rejected", error=f"子任务数量已达上限（{self.max_children} 个）")],
+                total=len(goals), rejected_count=len(goals),
+            )
+
+        # 截断到可用数量
+        accepted = goals[:available]
+        rejected = goals[available:]
+
+        # 并发执行所有 accepted goals
+        tasks = []
+        for goal in accepted:
+            # 每个子任务有自己的 cancel_event（父 cancel_event 共享）
+            task = asyncio.create_task(
+                self.spawn(
+                    goal=goal,
+                    parent_task_id=parent_task_id,
+                    workspace=workspace,
+                    allowed_paths=allowed_paths,
+                    forbidden_paths=forbidden_paths,
+                    cancel_event=cancel_event,
+                )
+            )
+            tasks.append(task)
+
+        # 等待所有完成
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 组装聚合结果
+        parallel = ParallelSpawnResult(total=len(goals))
+        for r in results:
+            if isinstance(r, Exception):
+                parallel.results.append(SubtaskResult(status="failed", error=str(r)))
+                parallel.aborted_count += 1
+            else:
+                parallel.results.append(r)
+                if r.status == "done":
+                    parallel.done_count += 1
+                elif r.status == "rejected":
+                    parallel.rejected_count += 1
+                elif r.timed_out:
+                    parallel.timed_out_count += 1
+                elif r.cancelled:
+                    parallel.cancelled_count += 1
+                else:
+                    parallel.aborted_count += 1
+
+        # 添加被拒绝的（数量超限）
+        for goal in rejected:
+            parallel.results.append(SubtaskResult(
+                status="rejected", error=f"子任务数量已达上限（{self.max_children} 个）",
+            ))
+            parallel.rejected_count += 1
+
+        log.info("并行派生 %d 个子任务（父 %s）：完成 %d，拒绝 %d，超时 %d，取消 %d",
+                 len(goals), parent_task_id, parallel.done_count,
+                 parallel.rejected_count, parallel.timed_out_count,
+                 parallel.cancelled_count)
+        return parallel
 
 
 async def _wait_event(ev: Any) -> None:
