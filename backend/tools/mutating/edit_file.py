@@ -133,6 +133,58 @@ def _count_occurrences(content: str, needle: str) -> int:
     return content.count(needle)
 
 
+def _find_occurrence_at_line(content: str, old_string: str, target_line: int) -> int | None:
+    """
+    找到 old_string 在 target_line 处的字节偏移量。
+
+    用于多匹配时的行号锚定（对齐 DSH dsh-tool-str-replace-editor）：
+    当 old_string 出现多次时，用行号确定要改哪一处，而不是随便挑一个。
+    """
+    start = 0
+    while True:
+        idx = content.find(old_string, start)
+        if idx < 0:
+            return None
+        line = content.count("\n", 0, idx) + 1
+        if line == target_line:
+            return idx
+        start = idx + len(old_string)
+
+
+def _fuzzy_match_at_line(content: str, old_string: str, target_line: int) -> str | None:
+    """
+    在 target_line 处尝试模糊匹配 old_string。
+
+    归一化空白后比较：如果 target_line 处的文本块与 old_string
+    仅在缩进/空格上有差异，返回实际内容。
+
+    这解决了模型凭印象给出缩进（差一个空格）时编辑失败的问题 ——
+    模型记得行号但记不准缩进时，仍能成功编辑。
+    """
+    lines = content.splitlines(keepends=True)
+    if target_line < 1 or target_line > len(lines):
+        return None
+
+    old_lines = old_string.splitlines()
+    if not old_lines:
+        return None
+
+    start_idx = target_line - 1
+    n = min(len(old_lines), len(lines) - start_idx)
+    actual_block = "".join(lines[start_idx:start_idx + n])
+
+    # 归一化空白：去掉所有空格和制表符，统一换行符
+    def _norm(s: str) -> str:
+        return "".join(ch for ch in s if ch not in " \t\r").strip()
+
+    if _norm(actual_block) == _norm(old_string):
+        # 去掉行尾换行符：模型给的 old_string 通常不含 \n，
+        # 替换时 new_string 也不含 \n，这样替换后行结构正确。
+        # 行号定位靠 _find_occurrence_at_line，不依赖 \n。
+        return actual_block.rstrip("\r\n")
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # 工具
 # --------------------------------------------------------------------------- #
@@ -180,6 +232,14 @@ class EditFileTool(Tool):
                     "避免用旧内容去覆盖新内容。"
                 ),
             },
+            "line": {
+                "type": "integer",
+                "description": (
+                    "可选。当 old_string 在文件中出现多次时，用此参数指定要修改的那一处所在的行号（1-based）。"
+                    "配合缩进不一致时也能定位：若该行的文本块与 old_string 仅在缩进/空格上有差异，"
+                    "会自动模糊匹配（对齐 DSH dsh-tool-str-replace-editor 的行号锚定机制）。"
+                ),
+            },
         },
         "required": ["path", "old_string", "new_string"],
     }
@@ -206,6 +266,12 @@ class EditFileTool(Tool):
             new_string = args.get("new_string")
             replace_all = bool(args.get("replace_all", False))
             expect_hash = str(args.get("expect_hash", "") or "").strip()
+            target_line = args.get("line")
+            if target_line is not None and not isinstance(target_line, int):
+                try:
+                    target_line = int(target_line)
+                except (ValueError, TypeError):
+                    target_line = None
 
             if not raw_path:
                 return ToolResult.failure(
@@ -322,6 +388,28 @@ class EditFileTool(Tool):
             # ---- 5. ★ 定位：匹配并检查唯一性 -------------------------------
             count = _count_occurrences(content, old_string)
 
+            # ★ 行号锚定（对齐 DSH dsh-tool-str-replace-editor）：
+            #   当 count==0 时，尝试在 target_line 处模糊匹配（缩进差异容错）；
+            #   当 count>1 时，用 target_line 定位要改的那一处。
+            effective_old = old_string  # 实际用于替换的文本（可能是模糊匹配到的实际内容）
+            replace_at_idx = None       # 指定位置的字节偏移（行号锚定后用）
+
+            # ---- count == 0：尝试行号模糊匹配 --------------------------------
+            if count == 0 and target_line:
+                fuzzy = _fuzzy_match_at_line(content, old_string, target_line)
+                if fuzzy:
+                    effective_old = fuzzy
+                    # 用行号定位，避免多匹配时 find 到错误位置
+                    replace_at_idx = _find_occurrence_at_line(content, effective_old, target_line)
+                    if replace_at_idx is None:
+                        replace_at_idx = content.find(effective_old)
+                    count = 1
+                    log_info = f"行号 {target_line} 处模糊匹配成功（缩进/空格差异已容错）"
+                else:
+                    log_info = f"行号 {target_line} 处模糊匹配也失败"
+            else:
+                log_info = ""
+
             if count == 0:
                 hint = locate_hint(content, old_string)
                 return ToolResult.failure(
@@ -333,36 +421,83 @@ class EditFileTool(Tool):
                     duration_ms=t.ms,
                 )
 
+            # ---- count > 1 且未 replace_all：行号锚定消歧 --------------------
             if count > 1 and not replace_all:
-                # ★ 这是 patch 语义最重要的一条：出现多次 → 不知道改哪个 → 不改。
-                #   随便挑一个（比如第一个）是**危险**的：用户以为改的是 A，实际改了 B。
-                positions = _first_positions(content, old_string, limit=5)
-                return ToolResult.failure(
-                    self.name,
-                    ErrorKind.PATCH_CONFLICT,
-                    (
-                        f"old_string 在 {rp.relative} 中出现了 {count} 次，"
-                        f"无法确定要修改哪一处"
-                    ),
-                    hint=(
-                        f"匹配位置的行号：{positions}。请选择其一：\n"
-                        "  · 在 old_string 里**多带上几行上下文**（比如包含上一行或下一行），"
-                        "让它变得唯一；\n"
-                        "  · 或者，如果确实要把这 {count} 处全部改掉，把 replace_all 设为 true。"
-                    ),
-                    data={
-                        "path": rp.relative,
-                        "occurrences": count,
-                        "lines": positions,
-                        "current_hash": current_hash,
-                    },
-                    duration_ms=t.ms,
-                )
+                if target_line:
+                    # 尝试在 target_line 处找到匹配
+                    idx = _find_occurrence_at_line(content, effective_old, target_line)
+                    if idx is not None:
+                        # 行号锚定成功：只替换这一处
+                        replace_at_idx = idx
+                        count = 1
+                        effective_old = content[idx:idx + len(old_string)]
+                    else:
+                        # 行号处找不到，尝试模糊匹配
+                        fuzzy = _fuzzy_match_at_line(content, old_string, target_line)
+                        if fuzzy:
+                            replace_at_idx = content.find(fuzzy)
+                            count = 1
+                            effective_old = fuzzy
+                            log_info = f"行号 {target_line} 处模糊匹配成功（缩进/空格差异已容错）"
+                        else:
+                            positions = _first_positions(content, old_string, limit=5)
+                            return ToolResult.failure(
+                                self.name,
+                                ErrorKind.PATCH_CONFLICT,
+                                (
+                                    f"old_string 在 {rp.relative} 中出现了 {count} 次，"
+                                    f"指定的行号 {target_line} 处未找到匹配"
+                                ),
+                                hint=(
+                                    f"匹配位置的行号：{positions}。请选择其一：\n"
+                                    "  · 在 old_string 里**多带上几行上下文**（比如包含上一行或下一行），"
+                                    "让它变得唯一；\n"
+                                    "  · 或者，如果确实要把这 {count} 处全部改掉，把 replace_all 设为 true。"
+                                ),
+                                data={
+                                    "path": rp.relative,
+                                    "occurrences": count,
+                                    "lines": positions,
+                                    "current_hash": current_hash,
+                                },
+                                duration_ms=t.ms,
+                            )
+                else:
+                    # 没有行号 → 拒绝（保持原有安全语义）
+                    positions = _first_positions(content, old_string, limit=5)
+                    return ToolResult.failure(
+                        self.name,
+                        ErrorKind.PATCH_CONFLICT,
+                        (
+                            f"old_string 在 {rp.relative} 中出现了 {count} 次，"
+                            f"无法确定要修改哪一处"
+                        ),
+                        hint=(
+                            f"匹配位置的行号：{positions}。请选择其一：\n"
+                            "  · 在 old_string 里**多带上几行上下文**（比如包含上一行或下一行），"
+                            "让它变得唯一；\n"
+                            "  · 或者，如果确实要把这 {count} 处全部改掉，把 replace_all 设为 true。\n"
+                            "  · 或者，用 line 参数指定要修改的那一处的行号（1-based）。"
+                        ),
+                        data={
+                            "path": rp.relative,
+                            "occurrences": count,
+                            "lines": positions,
+                            "current_hash": current_hash,
+                        },
+                        duration_ms=t.ms,
+                    )
 
             # ---- 6. 生成新内容 ---------------------------------------------
             if replace_all:
                 new_content = content.replace(old_string, new_string)
-                replaced = count
+                replaced = _count_occurrences(content, old_string)
+            elif replace_at_idx is not None:
+                # 行号锚定：只替换指定位置的那一处
+                before = content[:replace_at_idx]
+                after = content[replace_at_idx + len(effective_old):]
+                new_content = before + new_string + after
+                replaced = 1
             else:
                 new_content = content.replace(old_string, new_string, 1)
                 replaced = 1
@@ -432,7 +567,17 @@ class EditFileTool(Tool):
 
             delta = new_lines - old_lines
             delta_txt = f"{delta:+d} 行" if delta else "行数不变"
-            where = f"{replaced} 处" if replaced > 1 else f"第 {_first_positions(content, old_string, 1)[0]} 行"
+            if replaced > 1:
+                where = f"{replaced} 处"
+            else:
+                # 用 effective_old 定位行号；fuzzy 路径下 old_string 可能未匹配
+                positions = _first_positions(content, effective_old, 1)
+                if positions:
+                    where = f"第 {positions[0]} 行"
+                elif replace_at_idx is not None:
+                    where = f"第 {content.count(chr(10), 0, replace_at_idx) + 1} 行"
+                else:
+                    where = "1 处"
             summary = (
                 f"修改 {rp.relative}（{where}，{delta_txt}，"
                 f"{human_size(len(write_text.encode('utf-8')))}）；"
