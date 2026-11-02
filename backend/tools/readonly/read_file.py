@@ -40,6 +40,71 @@ from ...agent.state import RiskLevel
 # 编码探测顺序（老项目经验：GB18030 能覆盖 GBK/GB2312，放它而不是 GBK）
 ENCODING_CANDIDATES = ("utf-8", "utf-8-sig", "gb18030", "big5", "latin-1")
 
+# ---- 三重截断 + 流式读取（对齐 DeepSeek Harness dsh-tool-fs）----
+# 对齐 DeepSeek Harness：READ_MAX_LINE_LENGTH=2000, READ_MAX_BYTES=50KB, STREAM_MIN_SIZE=10MB
+MAX_LINE_LENGTH = 2_000        # 单行最大字符数
+STREAM_MIN_SIZE = 10 * 1024 * 1024  # 10MB 以上用流式读取（不一次性载入内存）
+
+
+def _stream_read(
+    abs_path: str,
+    start_line: int,
+    max_lines: int,
+    max_chars: int,
+    encoding: str = "utf-8",
+) -> tuple[list[str], int, bool, bool]:
+    """
+    流式读取文件，边读边截断，读到够就停。
+
+    对齐 DeepSeek Harness `buildWindow`：
+      · 逐行读取（readline 本身就是流式的，不会一次性载入大文件）
+      · 三重截断：行数 / 字节 / 单行字符
+      · 达到截断条件立即停止，后面的 chunk 不读
+
+    返回 (选中的行列表, 总行数, 是否字节截断, 是否行数截断)
+    """
+    lines: list[str] = []
+    total_lines = 0
+    chars_used = 0
+    truncated_by_bytes = False
+    truncated_by_lines = False
+
+    with open(abs_path, "r", encoding=encoding, errors="replace") as f:
+        # 跳过前 start_line-1 行
+        for _ in range(start_line - 1):
+            if f.readline() == "":
+                break
+            total_lines += 1
+
+        # 读取目标行
+        while True:
+            if len(lines) >= max_lines:
+                truncated_by_lines = True
+                break
+            line = f.readline()
+            if line == "":
+                break
+            total_lines += 1
+
+            # 单行字符截断
+            if len(line) > MAX_LINE_LENGTH:
+                line = line[:MAX_LINE_LENGTH] + f"... (行被截断至 {MAX_LINE_LENGTH} 字符)\n"
+
+            # 字节截断检查
+            if chars_used + len(line) > max_chars:
+                remaining = max_chars - chars_used
+                if remaining > 0:
+                    line = line[:remaining] + "... (字节上限截断)\n"
+                    lines.append(line)
+                    chars_used += remaining
+                truncated_by_bytes = True
+                break
+
+            lines.append(line)
+            chars_used += len(line)
+
+    return lines, total_lines, truncated_by_bytes, truncated_by_lines
+
 
 def _read_text(abs_path: str) -> tuple[str, str, str]:
     """
@@ -183,6 +248,68 @@ class ReadFileTool(Tool):
             )
 
             # ---- 5. 读取 ---------------------------------------------------
+            # 大文件（≥ 10MB）用流式读取，边读边截断，不一次性载入内存。
+            # 小文件用现有逻辑（编码探测 + splitlines），行为不变。
+            max_chars = ctx.max_read_chars or 40_000
+            max_lines = limit if limit else 2_000  # 对齐 DeepSeek READ_LIMIT=2000
+
+            if size >= STREAM_MIN_SIZE:
+                # ---- 流式读取：先探测编码（读前 8KB），再边读边截断 ----
+                raw = open(rp.absolute, "rb").read(8192)
+                if b"\x00" in raw:
+                    return ToolResult.failure(
+                        self.name,
+                        ErrorKind.INVALID_ARGUMENTS,
+                        f"这是二进制文件，无法作为文本读取：{rp.relative}",
+                        hint="read_file 只支持文本文件。",
+                        duration_ms=t.ms,
+                    )
+                encoding = "utf-8"
+                for enc in ENCODING_CANDIDATES:
+                    try:
+                        raw.decode(enc)
+                        encoding = enc
+                        break
+                    except UnicodeDecodeError:
+                        continue
+
+                stream_lines, stream_total, trunc_bytes, trunc_lines = _stream_read(
+                    rp.absolute, start_line=offset or 1,
+                    max_lines=max_lines, max_chars=max_chars, encoding=encoding,
+                )
+                body = "\n".join(stream_lines)
+                numbered = _with_line_numbers(body, start_line=offset or 1)
+                end_idx = (offset or 1) + len(stream_lines) - 1
+                truncated_by_chars = trunc_bytes
+
+                # ---- 7. 摘要 ---------------------------------------------------
+                parts = [f"读取 {rp.relative}（{stream_total} 行，{human_size(size)}，{encoding}）"]
+                if offset or limit:
+                    parts.append(f"本次取第 {offset or 1}-{end_idx} 行")
+                if truncated_by_chars:
+                    parts.append(f"内容超过 {max_chars} 字符已截断，可用 offset 继续读")
+                if sensitive:
+                    parts.append(f"⚠ 敏感文件：{why}")
+                summary = "；".join(parts)
+
+                data: dict[str, Any] = {
+                    "path": rp.relative,
+                    "content": numbered,
+                    "lines": stream_total,
+                    "range": [offset or 1, end_idx],
+                    "encoding": encoding,
+                    "size": size,
+                    "hash": sha256_file(rp.absolute),
+                }
+                if truncated_by_chars:
+                    data["truncated"] = True
+                    data["next_offset"] = end_idx + 1
+                if sensitive:
+                    data["sensitive"] = True
+                    data["sensitive_reason"] = why
+                return ToolResult.success(self.name, summary, data=data, duration_ms=t.ms)
+
+            # ---- 小文件：编码探测 + 一次性读取 ------------------------------
             try:
                 text, encoding, warning = _read_text(rp.absolute)
             except ValueError as exc:
@@ -218,7 +345,6 @@ class ReadFileTool(Tool):
             body = "\n".join(selected)
 
             truncated_by_chars = False
-            max_chars = ctx.max_read_chars or 40_000
             if len(body) > max_chars:
                 body = body[:max_chars]
                 truncated_by_chars = True

@@ -412,96 +412,125 @@ class OpenAICompatAdapter(ModelAdapter):
         # 累加器：index -> {id, name, args_str}
         acc: dict[int, dict[str, str]] = {}
         emitted: set[int] = set()
+        # 是否已经对外吐出过内容 —— 决定流中途失败能不能安全重试
+        emitted_any = False
 
         # ★ 与非流式一致：模型不可用就按顺序换下一个（流式在第一次产出前换是安全的）
+        #
+        # ★ 为什么外面还要再包一层 attempt：
+        #   SDK 的 max_retries 只重试「发起请求」，流打开之后的超时它不管
+        #   （这次线上失败就是 APITimeoutError 在读流途中抛出，被当成 internal_error）。
+        #   只要**还没吐出任何内容**，整轮重来就是安全的 —— 调用方不会收到两遍正文。
         stream = None
         last_err: ModelError | None = None
-        for model in self._candidates():
-            payload = self._build_payload(model, messages, tools, temperature, max_tokens, stream=True)
-            try:
-                stream = await self._client.chat.completions.create(**payload)
-                break
-            except Exception as exc:  # noqa: BLE001
-                err = self._translate_exception(exc)
-                if not self._should_rotate(err):
-                    raise err from exc
-                last_err = err
-                self._mark_dead(model, err)
-                continue
-        if stream is None:
-            raise last_err or ModelError(
-                "所有候选模型都不可用", kind="model_error", retryable=False,
-            )
 
-        try:
-            async for chunk in stream:
-                if not getattr(chunk, "choices", None):
-                    continue
-                delta = getattr(chunk.choices[0], "delta", None)
-                if delta is None:
-                    continue
+        for attempt in range(2):
+            if attempt:
+                acc.clear()
+                emitted.clear()
+                last_err = None
 
-                # ---- reasoning 增量 -------------------------------------
-                r = _extract_reasoning(delta)
-                if r:
-                    yield StreamDelta("reasoning", r)
-
-                # ---- content 增量 ---------------------------------------
-                c = getattr(delta, "content", None)
-                if isinstance(c, str) and c:
-                    yield StreamDelta("content", c)
-
-                # ---- tool_calls 碎片 ------------------------------------
-                for piece in getattr(delta, "tool_calls", None) or []:
-                    idx = _to_int(getattr(piece, "index", 0))
-                    slot = acc.setdefault(idx, {"id": "", "name": "", "args": ""})
-
-                    pid = getattr(piece, "id", None)
-                    if pid:
-                        slot["id"] = pid          # 只在有值时覆盖
-
-                    fn = getattr(piece, "function", None)
-                    if fn is not None:
-                        fname = getattr(fn, "name", None)
-                        if fname:
-                            slot["name"] = fname
-                        fargs = getattr(fn, "arguments", None)
-                        if fargs:
-                            slot["args"] += fargs  # ★ 累加，不是替换
-
-                    # finish_reason 出现时该 index 完成 → 吐完整 ToolCall
-                    fr = getattr(chunk.choices[0], "finish_reason", None)
-                    if fr in ("tool_calls", "stop") and idx not in emitted:
-                        emitted.add(idx)
-                        tc = ToolCall(
-                            id=slot["id"] or f"call_{idx}",
-                            name=slot["name"],
-                            arguments_raw=slot["args"],
-                        )
-                        self._fill_arguments(tc)
-                        yield StreamDelta("tool_call", tool_call=tc)
-
-            # ---- 收尾：把还没吐出的 index 补上（有些供应商不发 finish_reason）----
-            for idx, slot in acc.items():
-                if idx in emitted:
-                    continue
-                tc = ToolCall(
-                    id=slot["id"] or f"call_{idx}",
-                    name=slot["name"],
-                    arguments_raw=slot["args"],
-                )
-                self._fill_arguments(tc)
-                yield StreamDelta("tool_call", tool_call=tc)
-
-        finally:
-            # 确保连接/生成器被释放
-            aclose = getattr(stream, "aclose", None)
-            if callable(aclose):
+            # ---- 建流（模型轮换逻辑不变）----
+            for model in self._candidates():
+                payload = self._build_payload(model, messages, tools, temperature, max_tokens, stream=True)
                 try:
-                    await aclose()
-                except Exception:  # noqa: BLE001
-                    pass
+                    stream = await self._client.chat.completions.create(**payload)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    err = self._translate_exception(exc)
+                    if not self._should_rotate(err):
+                        raise err from exc
+                    last_err = err
+                    self._mark_dead(model, err)
+                    continue
+            if stream is None:
+                raise last_err or ModelError(
+                    "所有候选模型都不可用", kind="model_error", retryable=False,
+                )
 
+            try:
+                async for chunk in stream:
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    delta = getattr(chunk.choices[0], "delta", None)
+                    if delta is None:
+                        continue
+
+                    # ---- reasoning 增量 -------------------------------------
+                    r = _extract_reasoning(delta)
+                    if r:
+                        emitted_any = True
+                        yield StreamDelta("reasoning", r)
+
+                    # ---- content 增量 ---------------------------------------
+                    c = getattr(delta, "content", None)
+                    if isinstance(c, str) and c:
+                        emitted_any = True
+                        yield StreamDelta("content", c)
+
+                    # ---- tool_calls 碎片 ------------------------------------
+                    for piece in getattr(delta, "tool_calls", None) or []:
+                        idx = _to_int(getattr(piece, "index", 0))
+                        slot = acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+
+                        pid = getattr(piece, "id", None)
+                        if pid:
+                            slot["id"] = pid          # 只在有值时覆盖
+
+                        fn = getattr(piece, "function", None)
+                        if fn is not None:
+                            fname = getattr(fn, "name", None)
+                            if fname:
+                                slot["name"] = fname
+                            fargs = getattr(fn, "arguments", None)
+                            if fargs:
+                                slot["args"] += fargs  # ★ 累加，不是替换
+
+                        # finish_reason 出现时该 index 完成 → 吐完整 ToolCall
+                        fr = getattr(chunk.choices[0], "finish_reason", None)
+                        if fr in ("tool_calls", "stop") and idx not in emitted:
+                            emitted.add(idx)
+                            tc = ToolCall(
+                                id=slot["id"] or f"call_{idx}",
+                                name=slot["name"],
+                                arguments_raw=slot["args"],
+                            )
+                            self._fill_arguments(tc)
+                            emitted_any = True
+                            yield StreamDelta("tool_call", tool_call=tc)
+
+                # ---- 收尾：把还没吐出的 index 补上（有些供应商不发 finish_reason）----
+                for idx, slot in acc.items():
+                    if idx in emitted:
+                        continue
+                    tc = ToolCall(
+                        id=slot["id"] or f"call_{idx}",
+                        name=slot["name"],
+                        arguments_raw=slot["args"],
+                    )
+                    self._fill_arguments(tc)
+                    emitted_any = True
+                    yield StreamDelta("tool_call", tool_call=tc)
+
+            except Exception as exc:  # noqa: BLE001 —— 流中途失败
+                err = self._translate_exception(exc)
+                if attempt == 0 and err.retryable and not emitted_any:
+                    log.warning("[%s] 流式调用第 1 次尝试失败（%s），尚未产出内容 → 重试一次",
+                                self.name, err.kind)
+                    stream = None
+                    continue
+                raise err from exc
+
+            finally:
+                # 确保连接/生成器被释放
+                aclose = getattr(stream, "aclose", None)
+                if callable(aclose):
+                    try:
+                        await aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            break        # 正常读完 → 跳出 attempt 循环
         yield StreamDelta("done")
 
     # ---- 流式便捷方法在基类实现（ModelAdapter.chat_stream_collect）---------
