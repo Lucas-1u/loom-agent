@@ -1,0 +1,21 @@
+@echo off
+chcp 936 >nul
+setlocal
+
+REM ==========================================================================
+REM  Loom 后端启动器
+REM
+REM  被 src-tauri/tauri.conf.json 的 beforeDevCommand 通过 start /MIN 调用。
+REM
+REM  为什么需要这个文件，而不是在配置里 inline 命令？
+REM    1. beforeDevCommand 的 cwd 是 src-tauri，而 python -m backend.server
+REM       必须在 loom 根目录执行（backend 包在那里），否则 ModuleNotFoundError。
+REM    2. start 命令没有工作目录参数，只能用 bat 做 cd /d 包装。
+REM    3. start "标题" 的引号在 tauri 的 cmd /c 嵌套里会被吞（实测报
+REM       "找不到文件 \loom-backend\"），所以配置里不带标题、只 start 绝对路径。
+REM
+REM  源文件 UTF-8 → 产物 GBK：python dev/build_bat.py backend-launcher
+REM ==========================================================================
+
+cd /d "%~dp0"
+.venv\Scripts\python.exe -m backend.server

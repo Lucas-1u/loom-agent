@@ -4,7 +4,7 @@
 给它一句话，它会规划、查项目、调工具、改文件、跑命令、验证结果，最后给一份**带证据**的答案。
 
 - 默认执行引擎 **Graph**（LangGraph），**Legacy** 保留为显式兜底
-- **1349** 项离线自检 · **20** 种事件 · **7** 个内置工具 + 可选 RAG / MCP / 子任务 / 工作流
+- **1512** 项离线自检 · **20** 种事件 · 内置工具 + 可选 RAG / MCP / 子任务 / 工作流 / 上下文管理
 - 离线优先、审批前置：没有 API Key 也能跑演示，没有网络也不影响核心逻辑
 
 > 这是**学习型项目**，不是产品：架构清晰 > 功能数量，可理解性 > 代码量。
@@ -46,7 +46,7 @@ Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批�
 | 过程 | 无 | PLAN → ACT → TOOLS → REFLECT → FINAL，多轮自纠正 |
 | 副作用 | 无 | 读/写工作区、Docker 沙箱命令、宿主机终端、MCP 工具 |
 | 安全 | 无 | Policy 七道关卡 + 人工审批 + 预算熔断 + 验证闸门 |
-| 可观测 | 无 | 19 种事件经 SSE 推到时间线，可按 `task_id` 回放 |
+| 可观测 | 无 | 20 种事件经 SSE 推到时间线，可按 `task_id` 回放 |
 | 失败语义 | 编一段话 | 终态 + 原因码 + 证据等级，**绝不伪造成功** |
 
 一句话区分它和普通 Chatbot 的地方：**"说完成"不算完成，要过验证闸门**。
@@ -59,7 +59,7 @@ Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批�
 |---|---|---|
 | 多轮 Agent 执行 | ✅ | Graph 默认；Legacy 显式兜底 |
 | 文件读 / 列目录 | ✅ | 40k 字符截断、多编码、行号、hash |
-| 文件写 / 局部改 | ✅ | 覆盖前备份、唯一匹配、`expect_hash` 防 stale |
+| 文件写 / 局部改 | ✅ | 覆盖前备份、唯一匹配、`expect_hash` 防 stale、行号锚定 + 模糊匹配 |
 | Docker 沙箱命令 | ✅ | 断网 / 只读根 / 非 root / 限额，无宿主机分支 |
 | **宿主机终端** | ✅ | pwsh / Windows PS / CMD / Git Bash；**无沙箱**，靠审批 + cwd + 超时 |
 | Policy + 人工审批 | ✅ | 七道关卡；`asyncio.Future` 真挂起，超时=拒绝 |
@@ -67,12 +67,15 @@ Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批�
 | 验证闸门 + 证据分级 | ✅ | A/B/C 分级 + "零改动不得报 done" |
 | 项目知识检索 | ✅ | FTS5 + bm25；**可选**本地向量 + RRF 融合 |
 | MCP 工具接入 | ✅ | 仅本地 stdio；默认要审批；无自动重连 |
-| 父子任务 | 🟡 | 串行派生、结果信封、层级/数量/预算上限 |
+| 父子任务 | ✅ | 串行派生、结果信封、层级/数量/预算上限 |
+| 并行子任务 | ✅ | `spawn_parallel` 一次派生多个子任务并发执行；聚合结果 + 五类计数 |
+| 子任务树展示 | ✅ | 前端按 `parent_task_id` 构建可折叠树 |
 | **异步工作流（并行）** | ✅ | DAG 依赖调度：互不依赖的步骤真并行；http / 只读工具 / 本机命令 |
-| 事件 + SSE 时间线 | ✅ | 19 种事件，`since` 补拉 + `stream.gap` 快照恢复 |
+| 事件 + SSE 时间线 | ✅ | 20 种事件，`since` 补拉 + `stream.gap` 快照恢复 |
 | 任务持久化 | ✅ | SQLite：sessions / tasks / task_history |
-| 跨进程恢复 | ❌ | 无 checkpoint，重启不能续跑 |
-| 并行子任务 / 子任务树 | ❌ | 首版串行；前端树属于 M6 |
+| 跨进程恢复 | 🟡 | Checkpoint 三执行点默认落盘；`load_checkpoint` 恢复入口已实现，重启自动续跑未接线 |
+| 上下文溢出存储（Spill） | ✅ | 超长上下文溢出到磁盘，head/tail 保留策略 |
+| 工具结果修剪 | ✅ | 修剪陈旧工具结果，`shadowed_tool_call_ids` 保证 replay-safe |
 | 桌面应用（Tauri） | ❌ | 只有 `.bat` 启动器 |
 | 向量检索 | 🟡 | 已实现，默认关（`LOOM_RAG_EMBED=off`） |
 | `delete_file` | ❌ | 从未实现 |
@@ -293,8 +296,8 @@ flowchart LR
 - 图状态只放路由信息（`phase/route/note/turns`），**任务真相始终在 `TaskState`**。
 - 每个条件边的 `path_map` **必须显式包含 `END`**：LangGraph 会静默丢弃未声明的目标。
   这条坑曾让 `plan` 节点返回的 END 被吞掉，模型认证失败时任务空转到轮次耗尽。
-- **没有 checkpointer，没有 interrupt/resume**：图异常直接 `failed`，绝不回退 legacy 重跑
-  （工具副作用可能已经发生）。
+- **图引擎自身没有 checkpointer、没有 interrupt/resume**：图异常直接 `failed`，绝不回退 legacy 重跑
+  （工具副作用可能已经发生）。进程级 checkpoint 由 `agent/checkpoint/` 负责（见 §11）。
 
 ### 6.3 Policy：七道关卡
 
@@ -357,10 +360,11 @@ flowchart LR
 | `read_file` | read | 否 | 无 | 40k 字符、多编码、行号、hash |
 | `search_docs` | read | 否 | 无 | 项目检索（`mode`: keyword/semantic/hybrid）；**仅在启用 RAG 时注册** |
 | `write_file` | write | **是** | 改文件 | 覆盖前备份 |
-| `edit_file` | write | **是** | 改文件 | 唯一匹配 / stale 检测 / 备份 |
+| `edit_file` | write | **是** | 改文件 | 唯一匹配 / stale 检测 / 备份 / 行号锚定 / 空白归一化模糊匹配 |
 | `run_command` | exec | **是** | 执行 | **Docker 沙箱**，无宿主机分支 |
 | `terminal` | exec | **是**（只读白名单免） | 执行 | **宿主机** shell；cwd 必须在工作区 |
-| `spawn_subtask` | write | **是** | 建任务 | 派生子任务并等待；拒绝则不创建 |
+| `spawn_subtask` | write | **是** | 建任务 | 派生**一个**子任务并等待；拒绝则不创建 |
+| `spawn_parallel` | write | **是** | 建任务 | 派生**多个**子任务并发执行；聚合统计（仅注入 spawner 时注册） |
 | `run_workflow` | exec | **是**（整条工作流一次） | 执行多步 | DAG 并行调度；支持 http / 工具 / 命令 |
 | `mcp__<server>__<tool>` | 默认 write | **是** | 由 Server 决定 | 外部 MCP 工具 |
 
@@ -429,7 +433,8 @@ LOOM_RAG_MODE=hybrid
 
 ## 10. 父子任务
 
-`spawn_subtask` 让父 Agent 把一件可独立验收的事派给子任务，并**等它结束**（首版串行）。
+`spawn_subtask` 让父 Agent 把一件可独立验收的事派给子任务，并**等它结束**；
+`spawn_parallel` 一次派生**多个**子任务并发执行，全部完成后返回聚合结果。
 
 | 边界 | 默认值 |
 |---|---|
@@ -444,6 +449,8 @@ LOOM_RAG_MODE=hybrid
 - 结果信封：`task_id / status / end_reason / summary / evidence / tools / commands / changes`；
   子任务非 `done` → 工具返回失败，**不伪装成功**。
 - 子任务默认不开 PLAN/REFLECT（父已拆解，省轮次给工具与验证）。
+- 并行派生返回聚合统计（done / aborted / rejected / timed_out / cancelled 五类计数），
+  全部被拒 → 工具直接失败，不假装派生成功。
 
 ---
 
@@ -479,7 +486,7 @@ LOOM_RAG_MODE=hybrid
 - **安全**：整个工具一次审批；`shell` 步骤等同 `terminal`；`http` 只允许 GET 且**禁止内网/回环**（防 SSRF）；后台只允许只读工具。
 
 > 这仍然**不是**"多个子 Agent 并行"：`run_workflow` 派的是"操作"，没有独立推理。
-> 子 Agent 依旧串行（见 §10）。
+> 要并行推理子 Agent 用 `spawn_parallel`（见 §10）。
 
 ---
 
@@ -490,12 +497,15 @@ LOOM_RAG_MODE=hybrid
 | Session | `sessions` 表 | 会话容器，1:N 任务 |
 | Task | `tasks` 表（含 `state_json`、`parent_task_id`） | 一次任务的状态与结果 |
 | 消息历史 | `task_history`（append-only，`(task_id, seq)` 幂等） | 刷新后能看历史 |
+| Checkpoint | `<workspace>/.loom_checkpoints/`（每任务 JSON 快照） | 三执行点落盘，进程崩溃后可从最近点恢复 |
+| Spill 溢出 | `<workspace>/.loom_spill/` | 超长上下文溢出到磁盘，head/tail 保留 |
 | 事件 | **内存**（EventHub，3000 条上限） | 不落盘；断线靠 `since` + 快照 |
 | 审批 | 内存（`asyncio.Future`） | 进程退出即失效 |
 | 知识索引 | 独立 SQLite（`sandbox/index/knowledge.db`） | 按 workspace 隔离；可含向量 |
 
-**重启能恢复什么**：任务列表 / 快照 / 结果 / 历史消息 ✅；
-**继续跑中断的任务** ❌（`safe_to_resume` 恒 False，无 checkpoint）；恢复挂起的审批 ❌。
+**重启能恢复什么**：任务列表 / 快照 / 结果 / 历史消息 ✅；Checkpoint 快照文件 ✅；
+**继续跑中断的任务** 🟡（`safe_to_resume` 恒 False，`load_checkpoint` 可手动恢复 state 但自动续跑未接线）；
+恢复挂起的审批 ❌。
 
 ---
 
@@ -506,6 +516,8 @@ React 19 + Vite 8 + TypeScript 6 + Tailwind 4，单一 `useReducer` store（`fea
 - 三栏：左侧按**工作目录**分组的会话列表 / 中央双视图（聊天 · 执行流）/ 底部工作区与输入框。
 - 事件时间线：`EventCard` 按事件类型分派渲染——工具调用（含 MCP 来源徽标）、终端的
   命令/exit/stdout/stderr、审批卡、RAG 检索命中、压缩事件等。
+- **任务树**：执行流视图的任务选择器按 `parent_task_id` 构建可折叠树（▶ 展开/折叠、
+  状态圆点、子任务数、相对时间）；纯函数建树（`taskTree.ts`）+ 32 项脱离 React 的测试。
 - 断线：自研指数退避重连（显式关掉浏览器原生重连），带 `since` 续传；`stream.gap` → 快照恢复。
 - 模型下拉：显示 `/api/health` 的真实模型，其余候选 `disabled`（**只能看，不能切**）。
 
@@ -514,7 +526,7 @@ React 19 + Vite 8 + TypeScript 6 + Tailwind 4，单一 `useReducer` store（`fea
 ## 13. 测试
 
 ```bash
-# 离线自检（不需要 API Key）—— 1349 项
+# 离线自检（不需要 API Key）—— 1512 项
 python -m backend.selfcheck_p1        #  55  契约层：事件/错误码/schema
 python -m backend.selfcheck_p2        #  45  模型层：候选轮换/错误分类
 python -m backend.selfcheck_agent     # 597  Agent 全链路：阶段/闸门/预算/审批/压缩/意图
@@ -526,6 +538,12 @@ python -m backend.selfcheck_mcp       #  63  MCP 连接/发现/注册/审批/超
 python -m backend.selfcheck_subtask   #  32  父子任务/迁移/上限/取消
 python -m backend.selfcheck_terminal  #  59  终端探测/真跑/越界/审批/双引擎
 python -m backend.selfcheck_workflow   #  41  工作流 DAG/并行/失败隔离/取消/恢复
+python -m backend.selfcheck_checkpoint #  58  Checkpoint 三执行点/落盘/恢复/裁剪
+python -m backend.selfcheck_spill      #  33  溢出存储/head-tail 策略/集成
+python -m backend.selfcheck_edit_file_line # 28  行号锚定/模糊匹配
+python -m backend.selfcheck_spawn_parallel # 16  并行派生/聚合/上限
+python -m backend.selfcheck_pruner_replay  # 10  修剪 replay-safe
+python -m backend.selfcheck_orchestrator_equiv # 18  双引擎终态等价
 
 # 集成 / 真实环境（按需）
 python -m backend.server.test_live_e2e       #  51  真 HTTP/SSE/调度/审批（模型替身）
@@ -533,9 +551,10 @@ python -m backend.test_sandbox_docker        #  25  真实容器
 python -m backend.test_live_model            #   7  真实模型 7 场景（要 Key）
 
 cd frontend
-npm run test:events    # 33  事件契约：后端 EventType ↔ 前端清单 ↔ 样式
+npm run test:events    # 34  事件契约：后端 EventType ↔ 前端清单 ↔ 样式
 npm run test:session   # 21  会话隔离 + 状态映射
 npm run test:workspace # 26  路径规范化 / 分组
+npm run test:tasktree  # 32  任务树纯函数：建树/折叠/遍历/跨会话
 npx tsc -p tsconfig.app.json --noEmit
 ```
 
@@ -560,6 +579,9 @@ npx tsc -p tsconfig.app.json --noEmit
 | `LOOM_MCP` / `LOOM_MCP_CONFIG` | 0 / — | MCP 开关与配置路径 |
 | `LOOM_AGENTS` / `LOOM_AGENT_MAX_DEPTH` / `LOOM_AGENT_MAX_CHILDREN` | 1 / 2 / 3 | 子任务开关与上限 |
 | `LOOM_TERMINAL` | 1 | 宿主机终端开关 |
+| `LOOM_CHECKPOINT` / `LOOM_CKPT_MODEL` / `LOOM_CKPT_TOOL` / `LOOM_CKPT_TURN` | 1 / 1 / 1 / 1 | 跨进程恢复快照（三执行点开关） |
+| `LOOM_SPILL` / `LOOM_SPILL_MAX_INLINE` / `LOOM_SPILL_DIR` | 1 / 内联阈值 / `.loom_spill` | 上下文溢出存储开关与参数 |
+| `LOOM_PRUNE_THRESHOLD` / `LOOM_PRUNE_HEAD` / `LOOM_PRUNE_TAIL` | 修剪阈值 / head / tail 保留字符数 | 工具结果修剪策略 |
 | `LOOM_SANDBOX_IMAGE` | `loom-sandbox:py312` | 沙箱镜像 |
 
 完整列表见 `.env.example`（按模块分组，含注释）。
@@ -568,8 +590,9 @@ npx tsc -p tsconfig.app.json --noEmit
 
 ## 15. 已知限制
 
-- **没有跨进程恢复**：无 checkpointer，`safe_to_resume` 恒 False；重启只能看结果，不能续跑。
-- **没有并行子 Agent**：`spawn_subtask` 是同步等待；并行的是 `run_workflow` 里的**步骤**（没有独立推理）。
+- **自动续跑未接线**：Checkpoint 已落盘、`load_checkpoint` 可手动恢复 state，
+  但重启后任务不会自动从最近 checkpoint 继续（`safe_to_resume` 恒 False）。
+- **并行子任务有上限**：层级 2、每父 3 个、单次派生 240s；大规模并行要等调度层改造。
 - **`terminal` 没有沙箱**：命令以你的用户身份运行，安全靠审批 + cwd + 超时；
   审批卡里写明了这一点，不要把它当隔离环境。
 - **MCP 只支持本地 stdio**：无远程传输、OAuth、自动重连；in-flight 调用无法取消。
@@ -589,9 +612,10 @@ npx tsc -p tsconfig.app.json --noEmit
 | M4.1 MCP Client（stdio） | ✅ |
 | M4.2 RAG 实用化（查询构建 / 计划后检索 / 来源追溯） | ✅ |
 | M4.3 Graph 设为默认引擎 | ✅ |
-| M5 父子任务（串行） | ✅ |
-| M6 展示与对比 | 🟡 混合检索已完成；前端任务树 / 对比报告待做 |
-| 并行子任务调度 | ⬜ |
+| M5 父子任务（串行 + 并行派生） | ✅ |
+| M6 展示与对比 | ✅ 混合检索、前端任务树已完成；对比报告待做 |
+| 上下文管理（Spill / 修剪 / Checkpoint） | ✅ |
+| 自动续跑接线（从 checkpoint 恢复执行） | ⬜ |
 | Tauri 桌面外壳 | ⬜ |
 
 ---
@@ -603,12 +627,15 @@ loom/
 ├── backend/
 │   ├── agent/          core.py（内核）· graph_engine.py · policy.py · approval.py
 │   │                   state.py · context.py · intent.py · compaction.py · subtask.py
-│   │   └── rag/        discover / chunk / store / service / query / embed
+│   │   ├── rag/        discover / chunk / store / service / query / embed
+│   │   ├── spill/      溢出存储（spill_store + head/tail 策略）
+│   │   ├── checkpoint/ 跨进程恢复快照（store + policy，三执行点）
+│   │   └── tool_result_pruner.py  工具结果修剪（replay-safe）
 │   ├── workflow/       models（Workflow/Step/Job）· store（4 表 + outbox）
 │   │                   executors（http/tool/shell）· service（DAG 调度 + 恢复）
 │   ├── tools/          base · registry · path_safety
 │   │   ├── readonly/   list_files · read_file · search_docs
-│   │   ├── mutating/   write_file · edit_file · spawn_subtask
+│   │   ├── mutating/   write_file · edit_file · spawn_subtask · spawn_parallel
 │   │   └── exec/       run_command（Docker）· shells + terminal（宿主机）· run_workflow
 │   ├── mcp/            config · client（每 Server 一个常驻 task）· tool
 │   ├── models/         openai_compat（三家共用）· adapter（协议 + FakeAdapter）
@@ -616,10 +643,10 @@ loom/
 │   ├── sandbox/        manager（Docker 参数与生命周期）
 │   ├── prompts/        system（系统提示 / 阶段提示 / 收尾提示）
 │   ├── cli/            main · approve · render
-│   └── selfcheck_*.py  10 套离线自检 + 3 个真实环境测试
-├── frontend/src/       App.tsx · features/session（store）· components · services · types
+│   └── selfcheck_*.py  17 套离线自检 + 3 个真实环境测试
+├── frontend/src/       App.tsx · features/session（store · taskTree）· components · services · types
 ├── dev/                Dockerfile.sandbox · 启动器构建脚本 · 测试脚本
-└── sandbox/            运行时产物（index / 模型 / 数据库，已 gitignore）
+└── sandbox/            运行时产物（index / 模型 / 数据库 / spill / checkpoints，已 gitignore）
 ```
 
 ---
@@ -631,12 +658,15 @@ loom/
 | 文档 | 内容 |
 |---|---|
 | `architecture/LOOM_ARCHITECTURE_AND_FEATURES.md` | 完整架构与功能说明书（1000+ 行） |
-| `09-M3-项目知识检索.md` · `12-M4.2-RAG-验收报告.md` | 检索的设计与验收 |
+| `09-M3-项目知识检索.md` · `12-M4.2-RAG-验收报告.md` · `16-混合检索-验收报告.md` | 检索的设计与验收 |
 | `12-M4.1-MCP-Client验收报告.md` | MCP 集成 |
 | `13-M4.3-LangGraph-集成验收报告.md` | Graph 默认引擎的切换与缺陷修复 |
-| `14-M5-Multi-Agent-验收报告.md` | 父子任务 |
+| `14-M5-Multi-Agent-验收报告.md` · `22-P1-三项验收报告.md` | 父子任务（串行 / 并行派生） |
 | `15-Terminal-Tool-验收报告.md` | 宿主机终端 |
-| `16-混合检索-验收报告.md` | BM25 + 向量 + RRF |
+| `17-异步工作流-验收报告.md` | DAG 调度、outbox、重启恢复 |
+| `18-Spill与工具结果修剪-验收报告.md` | 上下文溢出存储、修剪 replay-safe |
+| `21-Checkpoint-验收报告.md` | 跨进程恢复快照 |
+| `23-EditFile行号锚定验收报告.md` | 编辑工具行号锚定 + 模糊匹配 |
 
 ---
 

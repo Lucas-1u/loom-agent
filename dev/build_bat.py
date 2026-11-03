@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TARGETS: dict[str, Path] = {
     "loom": ROOT / "loom.bat",
     "loom-gui": ROOT / "loom-gui.bat",
+    "backend-launcher": ROOT / "backend-launcher.bat",
 }
 
 # GBK 之外还允许这几个字符 —— 其实一个都编不进去就该报错，

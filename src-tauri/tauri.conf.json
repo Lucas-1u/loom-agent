@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Loom",
+  "version": "0.1.0",
+  "identifier": "com.loom.agent",
+  "build": {
+    "frontendDist": "../frontend/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "node C:\\Users\\11196\\.workbuddy\\binaries\\node\\versions\\22.22.2-6\\node_modules\\npm\\bin\\npm-cli.js run dev --prefix D:\\Loom_agent\\loom\\frontend",
+    "beforeBuildCommand": "node C://Users//11196//.workbuddy//binaries//node//versions//22.22.2-6//node_modules//npm//bin//npm-cli.js run build --prefix D://Loom_agent//loom//frontend"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Loom Agent",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 720,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
