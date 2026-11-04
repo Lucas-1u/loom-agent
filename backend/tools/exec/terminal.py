@@ -64,6 +64,10 @@ class TerminalTool(Tool):
     }
     risk = RiskLevel.EXEC          # 默认要审批；只读白名单会在 risk_for 里降级
 
+    # 步骤 4：ACL 受限令牌模式。None = 关闭，走原来的宿主机路径（行为零变化）。
+    # 由 make() 从 LOOM_ACL_MODE 读入，默认关闭 —— 降级优先，不改变既有行为。
+    acl_mode: str | None = None
+
     # ---- 动态风险：只读命令免审批（判定与现实一致，不依赖模型自述）----
     def risk_for(self, args: dict[str, Any]) -> RiskLevel:
         return RiskLevel.READ if is_readonly_command(str(args.get("command") or "")) else RiskLevel.EXEC
@@ -75,13 +79,19 @@ class TerminalTool(Tool):
             shell = detect_shell(str(args.get("shell") or "auto")).label
         except ShellUnavailable as exc:
             shell = f"（不可用：{exc}）"
+        impact = (
+            "命令在**宿主机**上执行，不受 Docker 沙箱隔离：可以访问你的文件、网络与已安装程序，"
+            "拥有与你当前用户相同的权限。批准只代表同意执行这一条命令。"
+        )
+        if self.acl_mode:
+            impact += (
+                f"（ACL 受限令牌已启用：mode={self.acl_mode}；写操作由操作系统级权限限制，"
+                "但读与网络不受限。超时/取消会终止整棵进程树。）"
+            )
         return {
             "action": f"在本机 {shell} 中执行命令（工作目录：{cwd}）",
             "target": command[:160],
-            "impact": (
-                "命令在**宿主机**上执行，不受 Docker 沙箱隔离：可以访问你的文件、网络与已安装程序，"
-                "拥有与你当前用户相同的权限。批准只代表同意执行这一条命令。"
-            ),
+            "impact": impact,
             "preview": f"shell={args.get('shell') or 'auto'}\ncwd={cwd}",
         }
 
@@ -122,6 +132,7 @@ class TerminalTool(Tool):
                 result = await run_command(
                     command, cwd=resolved.absolute, shell=shell_choice,
                     timeout=timeout, cancel_event=getattr(ctx, "cancel_event", None),
+                    acl_mode=self.acl_mode, workspace_root=str(ctx.workspace),
                 )
             except ShellUnavailable as exc:
                 return ToolResult.failure(
@@ -151,6 +162,7 @@ class TerminalTool(Tool):
                 "stderr": result.stderr,
                 "truncated": result.truncated,
                 "redacted": result.redacted,
+                "acl_mode": result.extra.get("acl_mode"),
             }
             head = (result.stdout.strip().splitlines() or [""])[0][:160]
 
@@ -182,5 +194,13 @@ class TerminalTool(Tool):
             )
 
 
-def make() -> TerminalTool:
-    return TerminalTool()
+def make(acl_mode: str | None = None) -> TerminalTool:
+    """构造 terminal 工具。
+
+    ``acl_mode`` 未给时读 ``LOOM_ACL_MODE``（默认空 = 关闭）；
+    非法值不在这里拦，由 ``run_command`` 返回可诊断的失败结果。
+    """
+    tool = TerminalTool()
+    raw = acl_mode if acl_mode is not None else os.environ.get("LOOM_ACL_MODE", "")
+    tool.acl_mode = str(raw).strip().lower() or None
+    return tool

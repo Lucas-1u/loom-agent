@@ -254,6 +254,99 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
+def _failed_shell_result(
+    info: ShellInfo, command: str, cwd: str, started: float, message: str
+) -> ShellResult:
+    """构造「没能启动」的结构化结果：契约是失败也是结果，不抛业务异常。"""
+    return ShellResult(
+        shell=info, command=command, cwd=cwd, exit_code=-1,
+        stdout="", stderr="", duration_ms=int((time.time() - started) * 1000),
+        spawn_error=message, extra={"acl": True},
+    )
+
+
+async def _run_acl_command(
+    *, info: ShellInfo, command: str, cwd: str, argv: list[str], env: dict,
+    timeout: float, cancel_event: Any, max_output: int,
+    acl_mode: str, workspace_root: str, started: float,
+) -> ShellResult:
+    """步骤 4：走 ACL 受限令牌的执行路径。
+
+    ★ 为什么用 ``asyncio.to_thread``：``AclSandbox.spawn`` 是同步的
+      （CreateProcessAsUser + WaitForSingleObject + 管道读取），直接放在协程里
+      会**卡住整个事件循环**。项目在 workflow 阶段踩过同类的坑（httpx 首次构造）。
+
+    ★ ``env`` 已经是 ``child_env()``：凭据类变量在这里就已经剔除，
+      ``AclSandbox.child_env()`` 再叠加 TMP/TEMP/TMPDIR 指向私有 temp。
+
+    ★ timeout / cancel 直接传给 ``spawn_with_token``：它分段等待进程、
+      非阻塞读管道，超时/取消时 ``taskkill /F /T`` 杀整棵进程树；
+      返回的 ``ACL_TIMEOUT`` / ``ACL_CANCELLED`` 在这里转成
+      ``ShellResult.timed_out`` / ``cancelled``。
+    """
+    from ...sandbox import acl  # 延迟导入：非 Windows 平台不该在 import 期炸
+
+    valid = (acl.READ_ONLY, acl.WORKSPACE_WRITE, acl.FULL_ACCESS)
+    if acl_mode not in valid:
+        return _failed_shell_result(
+            info, command, cwd, started,
+            f"未知 ACL 模式：{acl_mode!r}（可选 {' / '.join(valid)}）",
+        )
+
+    # ★ 已知机制限制：Git Bash 的 MSYS/Cygwin 运行时要 CreateFileMapping 建共享内存，
+    #   在 WRITE_RESTRICTED 令牌下必然 "Win32 error 5"（实测 dev/verify_acl_shells.py）。
+    #   与其返回莫名其妙的 exit 256，不如明确拒绝并给出可操作提示。
+    #   不要为了兼容 bash 去掉 DISABLE_MAX_PRIVILEGE / WRITE_RESTRICTED —— 那会削弱沙箱。
+    if info.kind == "bash":
+        return _failed_shell_result(
+            info, command, cwd, started,
+            "Git Bash 与 ACL 受限令牌不兼容（MSYS 运行时创建命名 file mapping 被拒，"
+            "Win32 error 5）。请改用 powershell / cmd，或关闭 LOOM_ACL_MODE。",
+        )
+
+    def _sync_spawn():
+        sb = acl.AclSandbox(mode=acl_mode, workspace_root=workspace_root)
+        try:
+            if not sb.create():
+                return None, "ACL 沙箱初始化失败（详见 Python warning）"
+            rc, out, err = sb.spawn(
+                argv[0], argv[1:], cwd=cwd, env=env,
+                timeout_ms=int(timeout * 1000),
+                cancel_event=cancel_event,
+            )
+            return (rc, out, err), ""
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{type(exc).__name__}: {exc}"
+        finally:
+            sb.close()  # 撤销 temp 授权、删私有 temp、关令牌
+
+    try:
+        payload, spawn_error = await asyncio.to_thread(_sync_spawn)
+    except Exception as exc:  # noqa: BLE001
+        payload, spawn_error = None, f"{type(exc).__name__}: {exc}"
+
+    if payload is None:
+        return _failed_shell_result(info, command, cwd, started, spawn_error)
+
+    rc, out, err = payload
+    text_out, hits = _redact(out, sensitive_env_values())
+    text_out, cut = clip_output(text_out, max_output)
+    timed_out = err == "ACL_TIMEOUT"
+    cancelled = err == "ACL_CANCELLED"
+    return ShellResult(
+        shell=info, command=command, cwd=cwd, exit_code=int(rc),
+        stdout=text_out, stderr="" if timed_out or cancelled else err,
+        duration_ms=int((time.time() - started) * 1000),
+        timed_out=timed_out, cancelled=cancelled, truncated=cut, redacted=hits,
+        extra={
+            "acl": True,
+            "acl_mode": acl_mode,
+            "acl_timeout_enforced": True,
+            "acl_kill_tree": True,
+        },
+    )
+
+
 async def run_command(
     command: str,
     *,
@@ -263,17 +356,30 @@ async def run_command(
     cancel_event: Any = None,
     extra_env: dict[str, str] | None = None,
     max_output: int = MAX_OUTPUT_CHARS,
+    acl_mode: str | None = None,
+    workspace_root: str | None = None,
 ) -> ShellResult:
     """
     执行一条命令并返回结构化结果（**不抛业务异常**：失败也是结果）。
 
     参数超限在这里再夹一次 —— 调用方（工具层）已经校验过，双保险成本很低。
+
+    ``acl_mode`` 为 None 时走**原来的宿主机路径，行为零变化**；
+    传入 read-only / workspace-write / full-access 才启用 ACL 受限令牌（步骤 4）。
     """
     info = detect_shell(shell)          # 探测失败由调用方转成可诊断错误
     timeout = max(1.0, min(float(timeout or DEFAULT_TIMEOUT_S), MAX_TIMEOUT_S))
     argv = info.argv(command)
     env = child_env(extra_env)
     started = time.time()
+
+    if acl_mode:
+        return await _run_acl_command(
+            info=info, command=command, cwd=cwd, argv=argv, env=env,
+            timeout=timeout, cancel_event=cancel_event, max_output=max_output,
+            acl_mode=str(acl_mode).strip().lower(),
+            workspace_root=str(workspace_root or cwd), started=started,
+        )
 
     proc = await asyncio.create_subprocess_exec(
         *argv,
