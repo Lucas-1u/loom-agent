@@ -30,6 +30,10 @@ sandbox/models/
 sandbox/live/
 sandbox/*.bin
 sandbox/*.log
+# ACL 沙箱运行时状态（本机状态，不入库）
+sandbox/acl_grants.json
+sandbox/acl_grants.json.tmp
+sandbox/acl_tmp/
 
 # ---- 内部文档（面向项目作者，含本机环境细节，不适合放进公开仓库）----
 README(to us).md
