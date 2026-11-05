@@ -12,7 +12,7 @@
  *   · `seq` 单调递增 → 用它排序、去重、断线补发（Last-Event-ID）
  */
 
-/** 19 种事件类型（顺序与后端 EventType 一致）
+/** 21 种事件类型（顺序与后端 EventType 一致）
  *
  * ★ 这份清单不只是类型：`services/eventStream.ts` 会**按它逐个 addEventListener**。
  *   少列一种 → 该事件的 SSE 帧在浏览器里没有监听器 → **静默丢失**（不会报错）。
@@ -31,6 +31,7 @@ export const EVENT_TYPES = [
   "approval.request",
   "approval.decision",
   "approval.expired",
+  "permission.mode",
   "reflect",
   "final_answer",
   "error",
@@ -177,6 +178,24 @@ export interface ApprovalDecisionData {
   status: "approved" | "rejected" | "expired";
   reason: string;
   waited_s: number;
+}
+
+/** 权限模式（步骤 6）
+ *
+ * ★ `enforced` 是后端如实报告的状态，不是承诺：
+ *   read-only 只有在写/执行工具都没注册时才是 true。
+ *   步骤 7 起服务端会按任务切换注册表，read-only 才真正生效。
+ */
+export type SessionMode = "read-only" | "workspace-write" | "full-access";
+
+export interface PermissionModeData {
+  mode: SessionMode;
+  /** api = 调用方显式传入；default = 没传，走默认值 */
+  source: "api" | "default";
+  /** 该模式下注册表里的工具总数 */
+  tools: number;
+  /** 这个模式在当前进程里是否真的生效 */
+  enforced: boolean;
 }
 
 /**

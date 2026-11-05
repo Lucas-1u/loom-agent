@@ -88,6 +88,14 @@ ok(cc.label === "上下文压缩", `中文标签正确（${cc.label}）`);
 ok(cc.tone === "violet", `色调已定义（${cc.tone}）`);
 ok(cc.label !== "context.compacted", "★ 不是兜底的原始事件名");
 
+console.log("\n[3b] permission.mode（步骤 6）");
+ok(EVENT_TYPES.includes("permission.mode"),
+   "★ permission.mode 在订阅清单里（否则 SSE 帧无人接收）");
+const pm = resolveStyle({ type: "permission.mode", data: { mode: "read-only" } });
+ok(pm.label === "权限模式", `中文标签正确（${pm.label}）`);
+ok(pm.tone === "amber", `色调已定义（${pm.tone}）`);
+ok(!!EVENT_STYLES["permission.mode"], "静态样式存在（不依赖运行时兜底）");
+
 console.log("\n[4] 未知事件的处理方式（未来新增事件的兜底行为）");
 const unknown = resolveStyle({ type: "future.event", data: {} });
 ok(unknown.label === "future.event", "未知事件回落到原始事件名（不崩、不丢）");

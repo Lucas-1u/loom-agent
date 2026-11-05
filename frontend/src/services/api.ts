@@ -311,7 +311,13 @@ export async function getTask(taskId: string): Promise<TaskSnapshot> {
  *   否则后端会当成两次新任务。新的任务才生成新 key。
  */
 export async function createTask(
-  b: { goal: string; session_id: string; workspace: string },
+  b: {
+    goal: string;
+    session_id: string;
+    workspace: string;
+    /** 步骤 7：权限模式。不传 = 后端默认 workspace-write */
+    mode?: "read-only" | "workspace-write" | "full-access";
+  },
   idemKey: string,
 ): Promise<TaskSnapshot> {
   return request<TaskSnapshot>(ENDPOINTS.tasks, {

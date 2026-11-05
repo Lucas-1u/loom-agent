@@ -1,4 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { SessionMode } from "../types/events";
+
+/**
+ * 权限模式选项（步骤 7）
+ *
+ * ★ 文案必须如实：`full-access` 是真的可以写宿主机任意位置，
+ *   不能写成"高级模式"这类模糊说法 —— 用户要能一眼看出风险。
+ */
+const MODE_OPTIONS: Array<{ value: SessionMode; label: string; tip: string }> = [
+  {
+    value: "read-only",
+    label: "只读",
+    tip: "只注册只读工具：模型看得到文件，但改不了、也执行不了命令",
+  },
+  {
+    value: "workspace-write",
+    label: "可写",
+    tip: "可修改工作区内文件并执行命令（默认）",
+  },
+  {
+    value: "full-access",
+    label: "完全访问",
+    tip: "不受工作区写限制，可写宿主机任意位置 —— 仅在明确需要时使用",
+  },
+];
 
 /**
  * 底部任务输入框（两种视图共用，位置固定）
@@ -13,12 +38,16 @@ export function TaskComposer({
   running,
   disabled,
   hint,
+  mode,
+  onModeChange,
 }: {
   onSubmit: (goal: string) => void;
   onStop: () => void;
   running: boolean;
   disabled?: boolean;
   hint?: string;
+  mode: SessionMode;
+  onModeChange: (m: SessionMode) => void;
 }) {
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -76,7 +105,39 @@ export function TaskComposer({
           />
 
           <div className="flex items-center justify-between gap-2 border-t border-ink-700/70 px-3 py-2">
-            <div className="flex items-center gap-3 text-[10.5px] text-slate-600">
+            <div className="flex flex-wrap items-center gap-3 text-[10.5px] text-slate-600">
+              {/* 步骤 7：权限模式切换入口（只影响下一条任务） */}
+              <div className="flex items-center gap-1" role="group" aria-label="权限模式">
+                {MODE_OPTIONS.map((opt) => {
+                  const active = opt.value === mode;
+                  const activeCls =
+                    opt.value === "full-access"
+                      ? "border-tone-red/45 bg-tone-red/15 text-tone-red"
+                      : opt.value === "read-only"
+                        ? "border-tone-cyan/45 bg-tone-cyan/15 text-tone-cyan"
+                        : "border-tone-green/45 bg-tone-green/15 text-tone-green";
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => onModeChange(opt.value)}
+                      disabled={disabled}
+                      aria-pressed={active}
+                      title={opt.tip}
+                      className={[
+                        "rounded border px-1.5 py-0.5 text-[10.5px] transition-colors",
+                        active
+                          ? activeCls
+                          : "border-ink-600 bg-ink-800 text-slate-500 hover:border-ink-500 hover:text-slate-300",
+                        disabled ? "cursor-not-allowed opacity-60" : "",
+                      ].join(" ")}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+
               <span>
                 <kbd className="rounded border border-ink-600 bg-ink-800 px-1 py-0.5 font-mono text-[10px]">
                   Ctrl
@@ -120,7 +181,7 @@ export function TaskComposer({
         </div>
 
         <p className="mt-1.5 text-center text-[10px] text-slate-600">
-          所有写操作都会先请求你的批准 · 权限判定由后端完成，前端无法绕过
+          审批已移除：模型会直接执行已注册的工具 · 边界由会话模式与沙箱决定，前端无法绕过
         </p>
       </div>
     </div>

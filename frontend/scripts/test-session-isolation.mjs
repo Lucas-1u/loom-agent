@@ -146,5 +146,66 @@ const finished = reducer(aborted, {
 eq(finished.tasks.tB.status, "done", "正常完成仍是 done");
 eq(finished.tasks.tB.end_reason, "agent_done", "正常原因码保留");
 
+// --------------------------------------------------------------------------- //
+// 步骤 7：权限模式（选择 / 实际 / 不被事件覆盖）
+// --------------------------------------------------------------------------- //
+let m = reducer(emptyStore(), {
+  type: "START_TASK",
+  task: {
+    task_id: "tM",
+    session_id: "s1",
+    goal: "看看目录",
+    status: "running",
+    model: "",
+    created_at: now,
+    updated_at: now,
+  },
+  userMessage: {
+    message_id: "mM",
+    session_id: "s1",
+    task_id: "tM",
+    role: "user",
+    content: "看看目录",
+    created_at: now,
+  },
+});
+eq(m.sessionMode, "workspace-write", "默认权限模式 workspace-write");
+eq(m.taskModes.tM, undefined, "没收到事件时没有「实际模式」");
+
+m = reducer(m, { type: "SET_SESSION_MODE", mode: "read-only" });
+eq(m.sessionMode, "read-only", "SET_SESSION_MODE 生效");
+eq(Object.keys(m.taskModes).length, 0, "★ 改选择不会凭空产生任务实际模式");
+
+const modeEv = {
+  seq: 1,
+  ts: now + 1,
+  task_id: "tM",
+  turn: 0,
+  type: "permission.mode",
+  data: { mode: "read-only", source: "api", tools: 2, enforced: true },
+};
+m = reducer(m, { type: "APPEND_EVENT", event: modeEv });
+eq(m.taskModes.tM.mode, "read-only", "permission.mode 记录到 taskModes");
+eq(m.taskModes.tM.enforced, true, "enforced 原样保留（不改写后端结论）");
+eq(m.sessionMode, "read-only", "★ 事件不覆盖用户选择（两者语义不同）");
+
+// 反向：后端报告 workspace-write 时，用户选择仍是 read-only → UI 能发现偏差
+const drifted = reducer(
+  { ...m, sessionMode: "read-only" },
+  {
+    type: "APPEND_EVENT",
+    event: { ...modeEv, seq: 2, task_id: "tM", data: { mode: "workspace-write", source: "default", tools: 7, enforced: false } },
+  },
+);
+eq(drifted.sessionMode, "read-only", "★ 用户选择保持不变");
+eq(drifted.taskModes.tM.mode, "workspace-write", "★ 实际模式如实记录（可被 UI 对比出来）");
+eq(drifted.taskModes.tM.enforced, false, "★ enforced=false 不被美化");
+
+// 演示模式进出不该重置权限选择（它属于用户偏好，不是会话数据）
+const demoed = reducer(m, { type: "ENTER_DEMO" });
+eq(demoed.sessionMode, "read-only", "★ 进演示模式保留权限选择");
+const exited = reducer(demoed, { type: "EXIT_DEMO" });
+eq(exited.sessionMode, "read-only", "★ 退出演示模式保留权限选择");
+
 console.log(`\n结果：${pass}/${pass + fail} 通过`);
 if (fail > 0) process.exitCode = 1;

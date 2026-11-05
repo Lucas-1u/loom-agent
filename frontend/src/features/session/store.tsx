@@ -6,7 +6,7 @@ import {
   type Dispatch,
   type ReactNode,
 } from "react";
-import type { EventEnvelope, TaskStatus } from "../../types/events";
+import type { EventEnvelope, PermissionModeData, SessionMode, TaskStatus } from "../../types/events";
 import type { ApprovalItem, ConnectionState, ViewMode } from "../../types/chat";
 import type { Message, Session, Task } from "./types";
 import { workspaceKey } from "./workspace";
@@ -64,6 +64,16 @@ export interface LoomStore {
   /** 与后端的粗粒度连接状态（health 的结果） */
   connection: ConnectionState;
   model: string;
+  /**
+   * 下一条任务要用的权限模式（步骤 7）。
+   *
+   * ★ 这是**用户选择**，不是当前任务的真实模式。真实模式以后端
+   *   `permission.mode` 事件为准（存在 taskModes 里）。两者分开，
+   *   才能如实显示"我选的是 X，实际跑的是 Y"。
+   */
+  sessionMode: SessionMode;
+  /** 每个任务实际生效的模式（来自 permission.mode 事件），按 task_id 索引 */
+  taskModes: Record<string, PermissionModeData>;
 
   /** 全局 SSE id 游标：去重基准 + 重连补发的 since */
   lastEventId: number;
@@ -124,7 +134,9 @@ export type LoomAction =
   | { type: "SET_APPROVAL_SUBMITTING"; approvalId: string; submitting: boolean }
   | { type: "RESOLVE_APPROVAL"; approvalId: string; status: "approved" | "rejected" | "expired" }
   | { type: "ENTER_DEMO" }
-  | { type: "EXIT_DEMO" };
+  | { type: "EXIT_DEMO" }
+  /** 步骤 7：改"下一条任务"的权限模式（不改变正在跑的任务） */
+  | { type: "SET_SESSION_MODE"; mode: SessionMode };
 
 // --------------------------------------------------------------------------- //
 // 初始状态
@@ -136,6 +148,8 @@ export function emptyStore(): LoomStore {
     streamState: "closed",
     connection: "idle",
     model: "",
+    sessionMode: "workspace-write",
+    taskModes: {},
     lastEventId: 0,
     gaps: [],
     sessions: {},
@@ -149,6 +163,34 @@ export function emptyStore(): LoomStore {
   };
 }
 
+/**
+ * 权限模式选择的本地持久化（步骤 7）
+ *
+ * ★ 为什么持久化：这是用户的"工作偏好"。每次刷新都退回 workspace-write，
+ *   会让「我上次特意选了只读」这件事静默失效 —— 而只读失效恰好是安全相关的。
+ * ★ 为什么用 try/catch：隐私模式下 localStorage 会抛异常，不能让它拖垮首屏。
+ */
+const MODE_STORAGE_KEY = "loom.sessionMode";
+const VALID_MODES: SessionMode[] = ["read-only", "workspace-write", "full-access"];
+
+function loadSessionMode(): SessionMode {
+  try {
+    const raw = window.localStorage.getItem(MODE_STORAGE_KEY);
+    if (raw && (VALID_MODES as string[]).includes(raw)) return raw as SessionMode;
+  } catch {
+    /* 存储不可用时按默认处理，不报错 */
+  }
+  return "workspace-write";
+}
+
+export function saveSessionMode(mode: SessionMode): void {
+  try {
+    window.localStorage.setItem(MODE_STORAGE_KEY, mode);
+  } catch {
+    /* 忽略：持久化失败不影响本次会话 */
+  }
+}
+
 function makeInitialState(): LoomStore {
   const q = new URLSearchParams(window.location.search);
   const view: ViewMode = q.get("view") === "execution" ? "execution" : "chat";
@@ -159,7 +201,7 @@ function makeInitialState(): LoomStore {
     return { ...emptyStore(), ...DEMO_SEED(), viewMode: view, mode: "demo", collapsedGroups: {} };
   }
 
-  return { ...emptyStore(), viewMode: view };
+  return { ...emptyStore(), viewMode: view, sessionMode: loadSessionMode() };
 }
 
 // --------------------------------------------------------------------------- //
@@ -255,12 +297,19 @@ export function reducer(state: LoomStore, action: LoomAction): LoomStore {
     case "ENTER_DEMO": {
       // ★ 演示模式与真实数据隔离：进去时**整个换掉**，不是叠加
       const seeded = DEMO_SEED();
-      return { ...emptyStore(), ...seeded, viewMode: state.viewMode, mode: "demo" };
+      // ★ 但权限模式是用户偏好，不属于"会话数据"，进出演示都不该被重置
+      return { ...emptyStore(), ...seeded, viewMode: state.viewMode, mode: "demo",
+               sessionMode: state.sessionMode };
     }
 
     case "EXIT_DEMO":
       // 退出时同样整个清空 —— 演示数据绝不带进真实模式
-      return { ...emptyStore(), viewMode: state.viewMode, mode: "checking" };
+      return { ...emptyStore(), viewMode: state.viewMode, mode: "checking",
+               sessionMode: state.sessionMode };
+
+    case "SET_SESSION_MODE":
+      // 只改"下一条任务"的选择；正在跑的任务不受影响（它的模式已经广播过了）
+      return { ...state, sessionMode: action.mode };
 
     case "SET_CONNECTION":
       return { ...state, connection: action.connection };
@@ -411,6 +460,16 @@ export function reducer(state: LoomStore, action: LoomAction): LoomStore {
               resolved: (d.status as "approved" | "rejected" | "expired") ?? undefined,
             },
           };
+        }
+      }
+
+      // 步骤 7：权限模式事件 → 记录这个任务**实际**生效的模式。
+      // ★ 不拿它覆盖 sessionMode：那是"下一条任务的用户选择"，
+      //   两者语义不同。UI 靠对比这两个值发现"我选只读但实际是 workspace-write"。
+      if (ev.type === "permission.mode") {
+        const d = ev.data as unknown as PermissionModeData;
+        if (d && typeof d.mode === "string") {
+          next.taskModes = { ...next.taskModes, [ev.task_id]: d };
         }
       }
 

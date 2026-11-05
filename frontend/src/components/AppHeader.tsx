@@ -1,4 +1,5 @@
 import type { ConnectionState, ViewMode } from "../types/chat";
+import type { PermissionModeData, SessionMode } from "../types/events";
 import { ViewSwitcher } from "./ViewSwitcher";
 
 /**
@@ -25,6 +26,8 @@ export function AppHeader({
   onModelChange,
   connection,
   demo,
+  sessionMode,
+  taskMode,
 }: {
   viewMode: ViewMode;
   onViewChange: (m: ViewMode) => void;
@@ -32,6 +35,9 @@ export function AppHeader({
   onModelChange: (m: string) => void;
   connection: ConnectionState;
   demo: boolean;
+  sessionMode: SessionMode;
+  /** 当前选中任务**实际**生效的模式（来自 permission.mode 事件）；null = 尚未收到 */
+  taskMode: PermissionModeData | null;
 }) {
   // 真实模型可能为空（演示 / 未连接），此时不伪造一个模型名
   const active = (model || "").trim();
@@ -55,8 +61,9 @@ export function AppHeader({
         <ViewSwitcher mode={viewMode} onChange={onViewChange} />
       </div>
 
-      {/* ---- 右：模型 / 状态 ---- */}
+      {/* ---- 右：权限模式 / 模型 / 状态 ---- */}
       <div className="flex shrink-0 items-center gap-3">
+        <PermissionBadge sessionMode={sessionMode} taskMode={taskMode} demo={demo} />
         <label className="flex items-center gap-1.5 text-[11px] text-slate-500">
           <span className="hidden xl:inline">模型</span>
           <select
@@ -82,6 +89,79 @@ export function AppHeader({
         <StatusBadge demo={demo} connection={connection} />
       </div>
     </header>
+  );
+}
+
+/**
+ * 权限模式徽章（步骤 7）
+ *
+ * ★ 为什么要同时显示"选择"和"实际"：
+ *   选择是用户意图，实际是后端 `permission.mode` 事件报告的结果。
+ *   两者不一致时（比如旧后端不认这个字段），必须让用户看得见 ——
+ *   只显示选择值会造成"我以为在只读，其实能写"的错觉。
+ *
+ * ★ `enforced=false` 也要显式标出来：那是后端承认"模式已记录但没强制"。
+ *   不显示就等于默许了这个缺口。
+ */
+const MODE_META: Record<SessionMode, { label: string; short: string; cls: string; tip: string }> = {
+  "read-only": {
+    label: "只读",
+    short: "RO",
+    cls: "border-tone-cyan/35 bg-tone-cyan/10 text-tone-cyan",
+    tip: "只读：写/执行工具不会注册，模型只能看不能改",
+  },
+  "workspace-write": {
+    label: "可写",
+    short: "RW",
+    cls: "border-tone-green/35 bg-tone-green/10 text-tone-green",
+    tip: "工作区可写：可改工作区内文件并执行命令",
+  },
+  "full-access": {
+    label: "完全访问",
+    short: "FA",
+    cls: "border-tone-red/35 bg-tone-red/10 text-tone-red",
+    tip: "完全访问：不受沙箱写限制，可写宿主机任意位置",
+  },
+};
+
+function PermissionBadge({
+  sessionMode,
+  taskMode,
+  demo,
+}: {
+  sessionMode: SessionMode;
+  taskMode: PermissionModeData | null;
+  demo: boolean;
+}) {
+  if (demo) return null;                       // 演示模式没有真实权限语义
+  const sel = MODE_META[sessionMode];
+  const actual = taskMode?.mode ?? null;
+  const mismatch = actual !== null && actual !== sessionMode;
+  const notEnforced = taskMode !== null && taskMode.enforced === false;
+
+  const tip = [
+    `下一条任务：${sel.label}（${sessionMode}）`,
+    actual ? `当前任务实际：${MODE_META[actual].label}（${actual}）` : "当前任务尚未报告模式",
+    mismatch ? "⚠ 选择与实际不一致" : "",
+    notEnforced ? "⚠ 后端报告该模式未强制生效" : "",
+    sel.tip,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return (
+    <span
+      className={`flex items-center gap-1.5 rounded border px-1.5 py-0.5 text-[10px] font-semibold tracking-wider ${sel.cls}`}
+      title={tip}
+    >
+      <span className="font-mono">{sel.short}</span>
+      <span className="hidden lg:inline">{sel.label}</span>
+      {(mismatch || notEnforced) && (
+        <span className="text-tone-amber" aria-label="权限模式存在偏差">
+          ⚠
+        </span>
+      )}
+    </span>
   );
 }
 

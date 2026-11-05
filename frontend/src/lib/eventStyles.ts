@@ -50,6 +50,7 @@ export const EVENT_STYLES: Record<EventType, EventVisualStyle> = {
   "approval.request":  { label: "等待审批", tone: "amber",  icon: "!", emphasis: true },
   "approval.decision": { label: "审批结果", tone: "green",  icon: "✓" },
   "approval.expired":  { label: "审批超时", tone: "red",    icon: "◷" },
+  "permission.mode":   { label: "权限模式", tone: "amber",  icon: "⚿", emphasis: true },
   reflect:             { label: "复盘",     tone: "slate",  icon: "↻" },
   final_answer:        { label: "最终回答", tone: "teal",   icon: "★", emphasis: true },
   error:               { label: "错误",     tone: "red",    icon: "✕", emphasis: true },

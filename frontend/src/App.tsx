@@ -7,6 +7,7 @@ import { TaskComposer } from "./components/TaskComposer";
 import { WorkspaceSelector } from "./components/WorkspaceSelector";
 import { BackendBanner } from "./components/BackendBanner";
 import {
+  saveSessionMode,
   useActiveEvents,
   useActiveMessages,
   useActiveSession,
@@ -228,6 +229,27 @@ export default function App() {
     [dispatch],
   );
 
+  /**
+   * 改权限模式（步骤 7）。
+   *
+   * ★ 只改「下一条任务」的选择，正在跑的任务不受影响 ——
+   *   它的模式在任务开始时就已广播到事件流，中途改前端变量不会改变后端行为。
+   *   所以这里不做"运行中禁用"，而是让文案与徽章说明清楚。
+   */
+  const handleModeChange = useCallback(
+    (mode: import("./types/events").SessionMode) => {
+      dispatch({ type: "SET_SESSION_MODE", mode });
+      saveSessionMode(mode);
+    },
+    [dispatch],
+  );
+
+  /** 当前选中任务**实际**报告的模式（没收到事件就是 null） */
+  const activeTaskMode = useMemo(
+    () => (state.activeTaskId ? state.taskModes[state.activeTaskId] ?? null : null),
+    [state.activeTaskId, state.taskModes],
+  );
+
   const handleNewSession = useCallback(async () => {
     if (state.mode !== "real") {
       const now = Date.now() / 1000;
@@ -350,7 +372,13 @@ export default function App() {
 
       try {
         const snap = await api.createTask(
-          { goal, session_id: session.session_id, workspace: session.workspace_path },
+          {
+            goal,
+            session_id: session.session_id,
+            workspace: session.workspace_path,
+            // 步骤 7：把用户选的权限模式带到后端（空 = 后端默认 workspace-write）
+            mode: state.sessionMode,
+          },
           idemKey,
         );
 
@@ -375,7 +403,7 @@ export default function App() {
         setBanner(`提交失败：${msg}`);
       }
     },
-    [dispatch, session, state.mode],
+    [dispatch, session, state.mode, state.sessionMode],
   );
 
   const handleStop = useCallback(async () => {
@@ -439,6 +467,8 @@ export default function App() {
         onModelChange={(m) => dispatch({ type: "SET_MODEL", model: m })}
         connection={state.connection}
         demo={state.mode === "demo"}
+        sessionMode={state.sessionMode}
+        taskMode={activeTaskMode}
       />
 
       {showBanner && (
@@ -513,6 +543,8 @@ export default function App() {
           onStop={() => void handleStop()}
           running={busy}
           disabled={!session}
+          mode={state.sessionMode}
+          onModeChange={handleModeChange}
           hint={
             state.mode === "demo"
               ? "演示模式 · 不会调用 Agent"

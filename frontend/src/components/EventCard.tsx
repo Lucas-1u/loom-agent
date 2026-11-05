@@ -372,6 +372,32 @@ function EventBody({
         </p>
       );
 
+    case "permission.mode": {
+      const mode = String(d.mode ?? "");
+      const source = String(d.source ?? "");
+      const enforced = Boolean(d.enforced);
+      const modeTone =
+        mode === "read-only"
+          ? "text-tone-cyan"
+          : mode === "full-access"
+            ? "text-tone-red"
+            : "text-tone-green";
+      return (
+        <div className="space-y-1 text-[12px]">
+          <p className="flex flex-wrap items-center gap-x-2">
+            <span className={`font-mono ${modeTone}`}>{mode || "?"}</span>
+            <span className="text-slate-600">
+              {source === "api" ? "调用方指定" : "默认值"}
+            </span>
+            <span className="text-slate-600">工具 {Number(d.tools ?? 0)} 个</span>
+            {!enforced && (
+              <span className="text-tone-amber">⚠ 已记录但未强制（注册表未切换）</span>
+            )}
+          </p>
+        </div>
+      );
+    }
+
     case "final_answer":
       return <Markdown text={String(d.text ?? "")} />;
 
