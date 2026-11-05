@@ -61,7 +61,7 @@ Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批�
 | 文件读 / 列目录 | ✅ | 40k 字符截断、多编码、行号、hash |
 | 文件写 / 局部改 | ✅ | 覆盖前备份、唯一匹配、`expect_hash` 防 stale、行号锚定 + 模糊匹配 |
 | Docker 沙箱命令 | ✅ | 断网 / 只读根 / 非 root / 限额，无宿主机分支 |
-| **宿主机终端** | ✅ | pwsh / Windows PS / CMD / Git Bash；**无沙箱**，靠审批 + cwd + 超时 |
+| **宿主机终端** | ✅ | pwsh / Windows PS / CMD / Git Bash；默认无沙箱（靠审批 + cwd + 超时），**可选** ACL 受限令牌沙箱（`LOOM_ACL_MODE`，见 §7.3） |
 | Policy + 人工审批 | ✅ | 七道关卡；`asyncio.Future` 真挂起，超时=拒绝 |
 | 预算 / 熔断 / 取消 | ✅ | 轮次·秒·工具数·重复·错误；取消在下一轮检查点生效 |
 | 验证闸门 + 证据分级 | ✅ | A/B/C 分级 + "零改动不得报 done" |
@@ -76,7 +76,7 @@ Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批�
 | 跨进程恢复 | 🟡 | Checkpoint 三执行点默认落盘；`load_checkpoint` 恢复入口已实现，重启自动续跑未接线 |
 | 上下文溢出存储（Spill） | ✅ | 超长上下文溢出到磁盘，head/tail 保留策略 |
 | 工具结果修剪 | ✅ | 修剪陈旧工具结果，`shadowed_tool_call_ids` 保证 replay-safe |
-| 桌面应用（Tauri） | ❌ | 只有 `.bat` 启动器 |
+| 桌面应用（Tauri） | ✅ | `src-tauri/`（Rust 壳 + Tauri 窗口，开发模式用 `node <tauri.js> dev` 起） |
 | 向量检索 | 🟡 | 已实现，默认关（`LOOM_RAG_EMBED=off`） |
 | `delete_file` | ❌ | 从未实现 |
 
@@ -132,6 +132,15 @@ cd frontend && npm install && npm run dev     # http://localhost:5173
 `loom.bat`（CLI）与 `loom-gui.bat`（GUI）：切到项目根、清代理、用 `.venv`、清掉 `PYTHONUTF8` ——
 四件事少做一件就会报错。GUI 版还会查端口、起 Vite、自动开浏览器。
 装到桌面：`python dev/install_desktop.py`。
+
+Tauri 桌面壳（`src-tauri/`）开发模式启动：
+
+```bat
+cd /d D:\path\to\loom
+node "<全局 node 路径>\@tauri-apps\cli\tauri.js" dev
+```
+
+会同时起 Vite（5173）、Rust 后端（8765）并弹出 Tauri 窗口；关窗口后端自动退出。
 
 ### 3.5 Docker 沙箱（`run_command` 用）
 
@@ -381,6 +390,29 @@ flowchart LR
 **提示词 vs 硬约束**：工作区越界、审批、沙箱、只读声明都是**后端强制**；
 "资料不是指令""不要修改 tests/"是提示 + 闸门（软），后者还能靠 `forbidden_paths` 变硬。
 
+### 7.3 Windows ACL 沙箱（`terminal` 可选）
+
+`LOOM_ACL_MODE` 打开后，`terminal` 的命令不再直接以你的身份跑，而是跑在**受限令牌**下
+——写权限由操作系统 ACL 强制，不是应用层审批。抄 DSH `dsh-sandbox-windows-acl`。
+
+| 模式 | 令牌里有什么 | 能写什么 |
+|---|---|---|
+| `read-only` | logon + Everyone + temp SID | 只能写私有 temp（Python 能启动，工作区写不了） |
+| `workspace-write` | 再加 workspace SID | 工作区 + 私有 temp |
+| `full-access` | 完整主令牌（同一用户） | 全部（仍过审批与超时） |
+
+- 机制：`CreateRestrictedToken` + `CreateProcessAsUser`（**不是** `CreateProcessWithTokenW`，
+  后者要求 `SE_IMPERSONATE` 特权、标准用户必败）；能力 SID = 路径哈希算出来的 `S-1-4-<hash>`。
+- 私有 temp：受限令牌连系统 TEMP 都写不了，每次任务自建 `sandbox/acl_tmp/<rand>/`，
+  结束撤销授权并删目录。
+- 授权登记：往目录 DACL 加的 ACE 会记进 `sandbox/acl_grants.json`，可用
+  `python -m backend.sandbox.acl --list` / `--revoke-all` / `--revoke <路径>` 撤销。
+- 超时 / 取消：非阻塞读管道（`PeekNamedPipe`）+ 父进程 `taskkill /F /T` 杀进程树，
+  超时标 `timed_out`、取消标 `cancelled`。
+- **已知限制**：Git Bash 不兼容（MSYS 运行时建命名 file mapping 被拒，明确报错而非静默放行）；
+  只限制**写**，读与网络不受限；继承 ACE 会让工作区里新建文件也带一条授权副本。
+- 默认**关闭**；不设 `LOOM_ACL_MODE` 时 `terminal` 行为与之前完全一致。
+
 ---
 
 ## 8. 检索：BM25 + 本地向量
@@ -561,6 +593,17 @@ npx tsc -p tsconfig.app.json --noEmit
 **最值钱的是"可证伪"断言**：删掉事件发射、把风险判定改成全都免审批、去掉派生上限、
 把 `rag_context_block` 置空——都会立刻让测试变红。数量本身不重要，**能失败**才重要。
 
+ACL 沙箱的验证不在 `selfcheck_*` 套件里（它是可选运行时功能），而是 `dev/` 下的独立脚本：
+
+```bash
+.venv/Scripts/python.exe dev/poc_acl_sandbox.py        # 4 用例：读/写 × 区内外
+.venv/Scripts/python.exe dev/verify_acl_shells.py     # 11 项：三种 shell × 各模式分发
+.venv/Scripts/python.exe dev/verify_acl_temp.py       # 13 项：私有 temp + 凭据隔离
+.venv/Scripts/python.exe dev/verify_acl_timeout.py    # 10 项：超时 / 取消 / 进程树 kill
+.venv/Scripts/python.exe dev/verify_acl_grants.py     # 6 项：授权登记 / 撤销闭环
+.venv/Scripts/python.exe dev/verify_acl_falsify.py    # 3 项：可证伪（关掉关键代码必须变红）
+```
+
 ---
 
 ## 14. 配置
@@ -579,6 +622,7 @@ npx tsc -p tsconfig.app.json --noEmit
 | `LOOM_MCP` / `LOOM_MCP_CONFIG` | 0 / — | MCP 开关与配置路径 |
 | `LOOM_AGENTS` / `LOOM_AGENT_MAX_DEPTH` / `LOOM_AGENT_MAX_CHILDREN` | 1 / 2 / 3 | 子任务开关与上限 |
 | `LOOM_TERMINAL` | 1 | 宿主机终端开关 |
+| `LOOM_ACL_MODE` | （空=关） | ACL 受限令牌沙箱：`read-only` / `workspace-write` / `full-access`；空=沿用旧行为 |
 | `LOOM_CHECKPOINT` / `LOOM_CKPT_MODEL` / `LOOM_CKPT_TOOL` / `LOOM_CKPT_TURN` | 1 / 1 / 1 / 1 | 跨进程恢复快照（三执行点开关） |
 | `LOOM_SPILL` / `LOOM_SPILL_MAX_INLINE` / `LOOM_SPILL_DIR` | 1 / 内联阈值 / `.loom_spill` | 上下文溢出存储开关与参数 |
 | `LOOM_PRUNE_THRESHOLD` / `LOOM_PRUNE_HEAD` / `LOOM_PRUNE_TAIL` | 修剪阈值 / head / tail 保留字符数 | 工具结果修剪策略 |
@@ -593,13 +637,14 @@ npx tsc -p tsconfig.app.json --noEmit
 - **自动续跑未接线**：Checkpoint 已落盘、`load_checkpoint` 可手动恢复 state，
   但重启后任务不会自动从最近 checkpoint 继续（`safe_to_resume` 恒 False）。
 - **并行子任务有上限**：层级 2、每父 3 个、单次派生 240s；大规模并行要等调度层改造。
-- **`terminal` 没有沙箱**：命令以你的用户身份运行，安全靠审批 + cwd + 超时；
-  审批卡里写明了这一点，不要把它当隔离环境。
+- **`terminal` 默认没有沙箱**：命令以你的用户身份运行，安全靠审批 + cwd + 超时；
+  审批卡里写明了这一点，不要把它当隔离环境。**可**开 `LOOM_ACL_MODE` 走操作系统级
+  ACL 隔离（见 §7.3），但该路径只限写、不限读与网络。
 - **MCP 只支持本地 stdio**：无远程传输、OAuth、自动重连；in-flight 调用无法取消。
 - **检索以关键词为主**：向量是可选增强，没有 reranker；同义词/改述仍可能搜不到。
 - **事件不落盘**：前端落后一个版本时，未知事件会被静默丢弃（构建期有契约测试兜底）。
 - **CMD 的引号**：`python -c "print(1)"` 在 CMD 下会被拆坏，复杂引号用 PS 或脚本文件。
-- **没有 Tauri 桌面壳**、**没有 `delete_file`**。
+- **没有 `delete_file`**。
 
 ---
 
@@ -615,8 +660,9 @@ npx tsc -p tsconfig.app.json --noEmit
 | M5 父子任务（串行 + 并行派生） | ✅ |
 | M6 展示与对比 | ✅ 混合检索、前端任务树已完成；对比报告待做 |
 | 上下文管理（Spill / 修剪 / Checkpoint） | ✅ |
+| Windows ACL 沙箱（受限令牌 / 私有 temp / 授权登记） | ✅ |
 | 自动续跑接线（从 checkpoint 恢复执行） | ⬜ |
-| Tauri 桌面外壳 | ⬜ |
+| Tauri 桌面外壳 | ✅ |
 
 ---
 
@@ -640,13 +686,14 @@ loom/
 │   ├── mcp/            config · client（每 Server 一个常驻 task）· tool
 │   ├── models/         openai_compat（三家共用）· adapter（协议 + FakeAdapter）
 │   ├── server/         app（HTTP+SSE）· scheduler · runtime · store · hub
-│   ├── sandbox/        manager（Docker 参数与生命周期）
+│   ├── sandbox/        manager（Docker 参数与生命周期）· acl（ACL 受限令牌沙箱 + 授权登记）
 │   ├── prompts/        system（系统提示 / 阶段提示 / 收尾提示）
 │   ├── cli/            main · approve · render
 │   └── selfcheck_*.py  17 套离线自检 + 3 个真实环境测试
 ├── frontend/src/       App.tsx · features/session（store · taskTree）· components · services · types
-├── dev/                Dockerfile.sandbox · 启动器构建脚本 · 测试脚本
-└── sandbox/            运行时产物（index / 模型 / 数据库 / spill / checkpoints，已 gitignore）
+├── src-tauri/          Tauri 桌面壳（Rust：子进程管理后端 + 窗口）
+├── dev/                Dockerfile.sandbox · 启动器构建脚本 · ACL 验证脚本 · PoC
+└── sandbox/            运行时产物（index / 模型 / 数据库 / spill / checkpoints / acl_tmp，已 gitignore）
 ```
 
 ---
@@ -667,6 +714,7 @@ loom/
 | `18-Spill与工具结果修剪-验收报告.md` | 上下文溢出存储、修剪 replay-safe |
 | `21-Checkpoint-验收报告.md` | 跨进程恢复快照 |
 | `23-EditFile行号锚定验收报告.md` | 编辑工具行号锚定 + 模糊匹配 |
+| `22-ACL沙箱实施交接文档.md` · `24-Windows-ACL沙箱-实施计划.md` · `25-ACL沙箱-PoC验收报告.md` | Windows ACL 受限令牌沙箱的 8 步计划、实测校正与验收 |
 
 ---
 
