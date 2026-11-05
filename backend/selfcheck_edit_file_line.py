@@ -98,12 +98,11 @@ def test_fuzzy_match_at_line():
 # 工具集成层
 # --------------------------------------------------------------------------- #
 def make_ctx(ws: str) -> ToolContext:
+    # 步骤 5：authorized / approval_id 已删（审批移除）
     return ToolContext(
         workspace=ws,
         task_id="t_test",
         turn=1,
-        authorized=True,
-        approval_id="app_test",
     )
 
 

@@ -47,9 +47,9 @@ edit_file 引入了一个新问题：**模型给的 old_string，在文件里对
 ────────────────────────────────────────────────────────────────
 安全设计（和 write_file 同一套）
 ────────────────────────────────────────────────────────────────
-① 必须已授权（ctx.authorized）—— 纵深防御，不把安全只放一层
+① 无授权闸门（步骤 5：审批已移除，安全边界由沙箱承担）
 ② 写前备份原文件到 .loom_backup/<时间戳>/，备份失败则拒绝执行
-③ 内容上限，防止把磁盘塞满 / 审批界面卡死
+③ 内容上限，防止把磁盘塞满
 ④ 敏感文件额外警示
 """
 
@@ -250,17 +250,9 @@ class EditFileTool(Tool):
     # ===================================================================== #
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         with timed() as t:
-            # ---- 0. 授权闸门（纵深防御第一层）------------------------------
-            if not ctx.authorized:
-                return ToolResult.failure(
-                    self.name,
-                    ErrorKind.PERMISSION_DENIED,
-                    "修改操作未经用户批准",
-                    hint="这是需要审批的操作。请说明修改目的，等待用户确认后重试。",
-                    duration_ms=t.ms,
-                )
-
-            # ---- 1. 参数校验 -----------------------------------------------
+            # ---- 0. 参数校验 -----------------------------------------------
+            # ★ 步骤 5：删除 ctx.authorized 授权闸门。审批已整体移除，
+            #   安全边界由沙箱（Docker / ACL）承担。
             raw_path = args.get("path", "")
             old_string = args.get("old_string")
             new_string = args.get("new_string")
@@ -561,7 +553,7 @@ class EditFileTool(Tool):
                 after_hash=after_hash,
                 removed=old_lines * replaced,
                 added=new_lines * replaced,
-                approval_id=ctx.approval_id,
+                approval_id="",  # 步骤 5：审批移除，留痕字段保留但恒空（审计链不断裂）
                 backup_path=display_path(ctx.workspace, backup_path),
             )
 

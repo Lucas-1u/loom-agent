@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from unittest import mock
 
-from backend.agent.approval import ApprovalManager
+# 步骤 5：ApprovalManager 不再使用（审批已从 Agent 循环移除）
 from backend.agent.core import AgentConfig, AgentCore
 from backend.events import EventBus, collect
 from backend.models.adapter import FakeAdapter, ModelReply, ToolCall
@@ -212,33 +212,18 @@ async def suite_security(tmp: Path, ws: str) -> None:
 # --------------------------------------------------------------------------- #
 # [D] Agent 集成
 # --------------------------------------------------------------------------- #
-async def _run_agent(ws: str, script: list, *, engine: str, decision: str = "") -> tuple:
+async def _run_agent(ws: str, script: list, *, engine: str) -> tuple:
     reg = build_default_registry(terminal=True)
     bus = EventBus()
     evs = collect(bus)
     core = AgentCore(
         FakeAdapter(script), reg,
         config=AgentConfig(max_turns=8, min_evidence=0, use_plan_phase=False,
-                           use_reflect_phase=False, orchestrator=engine,
-                           approval_timeout_s=5),
-        bus=bus, approvals=ApprovalManager(timeout_s=5),
+                           use_reflect_phase=False, orchestrator=engine),
+        bus=bus,
     )
 
-    async def decide():
-        for _ in range(400):
-            await asyncio.sleep(0.02)
-            aid = core.approvals.current()
-            if aid:
-                if decision == "approve":
-                    core.approvals.approve(aid, "测试批准")
-                else:
-                    core.approvals.reject(aid, "测试拒绝")
-                return
-
-    task = asyncio.create_task(decide()) if decision else None
     st = await core.run("检查一下环境", workspace=ws, task_id=f"task_term_{engine}")
-    if task:
-        task.cancel()
     await bus.drain()
     return st, evs
 
@@ -252,7 +237,7 @@ async def suite_agent(tmp: Path) -> None:
         st, evs = await _run_agent(ws, [
             ModelReply(tool_calls=[tc("t1", "terminal", {"command": "echo agent-ok", "shell": "cmd"})]),
             ModelReply(content="命令执行成功，输出是 agent-ok。"),
-        ], engine=engine, decision="approve")
+        ], engine=engine)
         te = st.tool_events[0] if st.tool_events else None
         check(te is not None and te.ok, f"{engine}：模型能调用 terminal 并成功执行")
         check(st.status.value == "done", f"{engine}：任务正常 done（{st.status.value}）")
@@ -266,29 +251,30 @@ async def suite_agent(tmp: Path) -> None:
         ModelReply(tool_calls=[tc("r1", "terminal", {"command": "exit 5", "shell": "cmd"})]),
         ModelReply(tool_calls=[tc("r2", "terminal", {"command": "echo fixed", "shell": "cmd"})]),
         ModelReply(content="第一次失败（exit 5），第二次通过。"),
-    ], engine="graph", decision="approve")
+    ], engine="graph")
     names = [e.tool for e in st2.tool_events]
     check(names.count("terminal") == 2, f"★ 失败后再次调用终端（{names}）")
     check(st2.tool_events[0].ok is False and st2.tool_events[1].ok is True,
           "★ 第一次失败、第二次成功（状态没被合并）")
 
-    # 审批拒绝 → 命令没有执行（用一个会留痕的命令）
-    target = os.path.join(ws, "should_not_exist.txt")
+    # 步骤 5：审批已移除，命令直接执行（此处改为验证命令真的跑了）
+    target = os.path.join(ws, "ran_directly.txt")
     st3, evs3 = await _run_agent(ws, [
         ModelReply(tool_calls=[tc("d1", "terminal",
-                                 {"command": "echo x > should_not_exist.txt", "shell": "cmd"})]),
-        ModelReply(content="没有执行。"),
-    ], engine="graph", decision="reject")
-    check(any(str(e.type) == "approval.request" for e in evs3), "★ 高风险命令进入审批")
-    check(not os.path.exists(target), "★ 审批拒绝后命令没有执行（文件不存在）")
+                                 {"command": "echo x > ran_directly.txt", "shell": "cmd"})]),
+        ModelReply(content="执行了。"),
+    ], engine="graph")
+    check(not any(str(e.type) == "approval.request" for e in evs3),
+          "★ 步骤 5：高风险命令不再进入审批")
+    check(os.path.exists(target), "★★ 命令直接执行，文件已产生（审批已移除）")
 
     # 只读命令免审批
     st4, evs4 = await _run_agent(ws, [
         ModelReply(tool_calls=[tc("ro1", "terminal", {"command": "git status --short", "shell": "cmd"})]),
         ModelReply(content="看过了。"),
-    ], engine="graph", decision="")
+    ], engine="graph")
     check(not any(str(e.type) == "approval.request" for e in evs4),
-          "★ 只读命令没有触发审批（白名单生效）")
+          "★ 只读命令没有触发审批（步骤 5 后本来就没有审批）")
     check(st4.tool_events and st4.tool_events[0].tool == "terminal", "只读命令确实执行了")
 
 

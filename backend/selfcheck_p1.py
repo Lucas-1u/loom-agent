@@ -230,13 +230,16 @@ async def main() -> int:
     # ------------------------------------------------------------------ #
     print("\n[12] 枚举取值与设计文档一致")
     # 第五批新增 context.compacted（压缩）→ 17；M3 新增 rag.retrieve/rag.result → 19
-    check(len(EventType) == 20, f"事件类型共 20 种（实际 {len(EventType)}）")
+    # M6 workflow.state → 20；步骤 6 permission.mode → 21
+    check(len(EventType) == 21, f"事件类型共 21 种（实际 {len(EventType)}）")
     check(EventType.RAG_RETRIEVE.value == "rag.retrieve"
           and EventType.RAG_RESULT.value == "rag.result",
           "★ M3 检索事件已注册（命名遵循 <域>.<动作>）")
     check(EventType.CONTEXT_COMPACTED.value == "context.compacted",
           "★ 上下文压缩事件已注册")
     check(EventType.APPROVAL_REQUEST.value == "approval.request", "审批事件命名 <域>.<动作>")
+    check(EventType.PERMISSION_MODE.value == "permission.mode",
+          "★ 步骤 6 权限模式事件已注册")
     check(EventType.TOOL_CALL.value == "tool.call", "工具事件命名 <域>.<动作>")
 
     # ------------------------------------------------------------------ #

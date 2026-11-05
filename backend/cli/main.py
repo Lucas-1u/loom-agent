@@ -34,9 +34,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.agent.approval import ApprovalManager
 from backend.agent.core import AgentConfig, AgentCore
-from backend.cli.approve import CLIApprover
 from backend.cli.console import read_line
 from backend.cli.render import C, TerminalRenderer, _enable_ansi
 from backend.config import Config, setup_logging
@@ -70,11 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=0.0, help="任务总时长上限（秒，默认 300）")
     p.add_argument("--approval-timeout", type=float, default=0.0, help="审批等待上限（秒，默认 180）")
 
-    # 审批策略
+    # 审批策略（步骤 5 起审批已移除，--yes/--no 保留仅为兼容旧脚本，不再生效）
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--yes", "-y", action="store_true", help="自动批准所有审批请求（批跑用）")
-    g.add_argument("--no", action="store_true", help="自动拒绝所有审批请求（测试拒绝路径用）")
+    g.add_argument("--yes", "-y", action="store_true", help="（已废弃）审批已移除，此参数无效果")
+    g.add_argument("--no", action="store_true", help="（已废弃）审批已移除，此参数无效果")
     p.add_argument("--readonly", action="store_true", help="只读模式：卸载所有写入工具")
+    # 步骤 6：权限模式（read-only | workspace-write | full-access）
+    p.add_argument("--mode", default="", choices=["", "read-only", "workspace-write", "full-access"],
+                   help="权限模式（默认 workspace-write）")
 
     # 阶段开关（对比实验）
     p.add_argument("--no-plan", action="store_true", help="关闭 PLAN 阶段")
@@ -121,16 +122,10 @@ async def run_one(
     )
     bus.subscribe(renderer.on_event)
 
-    # ★ 审批超时必须以命令行覆盖值为准。
-    #   坑：ApprovalManager 才是真正执行 `asyncio.wait_for(fut, timeout)` 的那个对象，
-    #   而 AgentConfig.approval_timeout_s 只是配置快照、不参与实际等待。
-    #   最初这里直接用了 cfg.budgets.approval_timeout_s，导致 `--approval-timeout 8`
-    #   对实际等待毫无影响（实测现象：CLI 提示仍是「179s 后超时」）。
+    # ★ 步骤 5：审批已整体移除（Policy 不再触发审批），
+    #   CLI 不再创建 ApprovalManager / CLIApprover，也不再等待审批输入。
+    #   --approval-timeout 参数保留仅为向后兼容，不再生效。
     approval_timeout = args.approval_timeout or cfg.budgets.approval_timeout_s
-    approvals = ApprovalManager(timeout_s=approval_timeout)
-    auto = "approve" if args.yes else ("reject" if args.no else "")
-    approver = CLIApprover(approvals, renderer=renderer, auto=auto, color=not args.no_color)
-    bus.subscribe(approver.on_event)
 
     agent_cfg = AgentConfig.from_budget_config(
         cfg.budgets,
@@ -143,24 +138,17 @@ async def run_one(
     )
 
     agent_cfg.rag_auto = bool(getattr(cfg.rag, "auto_prefetch", True)) and knowledge is not None
-    core = AgentCore(adapter, registry, config=agent_cfg, bus=bus, approvals=approvals,
+    core = AgentCore(adapter, registry, config=agent_cfg, bus=bus,
                      knowledge=knowledge)
 
-    # 审批输入与 Agent 并行运行
-    attend_task = asyncio.create_task(approver.attend())
     t0 = time.time()
     try:
-        state = await core.run(goal, workspace=workspace)
+        state = await core.run(goal, workspace=workspace, session_mode=args.mode)
     except KeyboardInterrupt:
         print()
         renderer._w(renderer._c("  ⏹ 已中止（Ctrl+C）", C.B_YELLOW))
         return 130
     finally:
-        attend_task.cancel()
-        try:
-            await attend_task
-        except asyncio.CancelledError:
-            pass
         await bus.drain()
 
     elapsed = time.time() - t0
@@ -174,8 +162,7 @@ async def run_one(
             f"  状态      {state.status.value}  （{state.end_reason}）",
             f"  耗时      {elapsed:.1f}s    轮次 {state.turn}/{state.budgets.max_turns}",
             f"  工具调用  {state.budgets.tool_calls_used} 次    证据 {len([e for e in state.evidence_summary if e.ok])} 条",
-            f"  审批      {len(state.approval_history)} 次  "
-            f"（批准 {approver.count_approved} / 拒绝 {approver.count_rejected}）",
+            f"  审批      （步骤 5 已移除）",
             f"  文件变更  {len(state.change_records)} 处",
         ]
         for r in rows:
@@ -226,11 +213,18 @@ async def amain(args) -> int:
     from backend.config import Config as _Cfg
     _rag_cfg = _Cfg.load(args.model if getattr(args, "model", "") else "").rag
     knowledge = KnowledgeBase(_rag_cfg) if _rag_cfg.usable else None
-    registry = build_default_registry(include_mutating=not args.readonly, knowledge=knowledge)
-    if args.readonly:
+    # 步骤 6：--mode read-only 与 --readonly 等价，且**真的**卸载写工具
+    # ★ CLI 的 registry 是自己构建的，所以这里可以真强制 —— 不像服务端
+    #   注册表是全局一份（per-task 切换随步骤 7 接入）。
+    readonly = bool(args.readonly or (args.mode or "") == "read-only")
+    registry = build_default_registry(include_mutating=not readonly, knowledge=knowledge)
+    if readonly:
         # 保险：即使 build 里有 bug，也强制剔除写工具
+        # ★ 步骤 5：审批已移除，needs_approval 恒 False，不能再拿它判只读。
+        #   改为按 risk 判断（READ 保留，其余剔除）。
+        from backend.agent.state import RiskLevel as _RL
         for name in list(registry.names):
-            if registry.require(name).needs_approval:
+            if registry.require(name).risk is not _RL.READ:
                 registry.unregister(name)
 
     # ---- 环境概览 ------------------------------------------------------
@@ -248,17 +242,16 @@ async def amain(args) -> int:
         print(f"{bar}{'─' * 76}{rst}")
         print(f"  工作区      {root}")
         print(f"  预算        轮次≤{eff_turns}  时长≤{eff_seconds:.0f}s  "
-              f"工具≤{cfg.budgets.max_tool_calls}  审批超时{eff_approval:.0f}s  最小证据{cfg.budgets.min_evidence}")
-        mode = "只读（无副作用）" if args.readonly else ("自动批准" if args.yes else ("自动拒绝" if args.no else "人工审批"))
-        print(f"  审批模式    {mode}")
+              f"工具≤{cfg.budgets.max_tool_calls}  最小证据{cfg.budgets.min_evidence}")
+        mode = "read-only" if readonly else (args.mode or "workspace-write")
+        print(f"  权限模式    {mode}   （无审批：步骤 5 起 Agent 自主执行）")
         if args.no_plan or args.no_reflect:
             print(f"  阶段开关    PLAN={'关' if args.no_plan else '开'}  REFLECT={'关' if args.no_reflect else '开'}")
         print(f"  可用工具    {len(registry.names)} 个")
         for d in sorted(registry.describe(), key=lambda x: x["name"]):
-            mark = "●" if d["approval"] == "需要审批" else "○"
-            print(f"    {mark} {d['name']:<12} {d['approval']:<8} {d['description'][:44]}")
-        if args.readonly:
-            print(f"    {C.DIM if not args.no_color else ''}（只读模式：写入能力已卸载）{rst}")
+            print(f"    ○ {d['name']:<12} {d['approval']:<8} {d['description'][:44]}")
+        if readonly:
+            print(f"    {C.DIM if not args.no_color else ''}（只读模式：写入与执行能力已卸载）{rst}")
         print(f"{bar}{'═' * 76}{rst}")
         print()
 

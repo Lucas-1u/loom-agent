@@ -68,6 +68,23 @@ class TerminalTool(Tool):
     # 由 make() 从 LOOM_ACL_MODE 读入，默认关闭 —— 降级优先，不改变既有行为。
     acl_mode: str | None = None
 
+    # ---- 步骤 7：任务级模式覆盖 -----------------------------------------
+    def _effective_acl_mode(self, ctx: ToolContext) -> str | None:
+        """
+        当前这次执行该用哪个 ACL 强度。
+
+        ★ 两级开关，缺一不可：
+          ① `self.acl_mode`（启动时读 LOOM_ACL_MODE）是**总开关**。
+             它为空 = OS 沙箱整体关闭，任务模式也不该偷偷打开它
+             （否则"我没开沙箱"的用户会突然被沙箱拦住，属于行为破坏）。
+          ② 总开关打开时，用**任务级 session_mode** 决定强度。
+             这就是步骤 7 的意义：同一进程里，read-only 任务和
+             workspace-write 任务可以用不同的令牌。
+        """
+        if not self.acl_mode:
+            return None
+        return str(getattr(ctx, "session_mode", "") or self.acl_mode)
+
     # ---- 动态风险：只读命令免审批（判定与现实一致，不依赖模型自述）----
     def risk_for(self, args: dict[str, Any]) -> RiskLevel:
         return RiskLevel.READ if is_readonly_command(str(args.get("command") or "")) else RiskLevel.EXEC
@@ -83,9 +100,10 @@ class TerminalTool(Tool):
             "命令在**宿主机**上执行，不受 Docker 沙箱隔离：可以访问你的文件、网络与已安装程序，"
             "拥有与你当前用户相同的权限。批准只代表同意执行这一条命令。"
         )
-        if self.acl_mode:
+        effective_acl = self._effective_acl_mode(ctx)
+        if effective_acl:
             impact += (
-                f"（ACL 受限令牌已启用：mode={self.acl_mode}；写操作由操作系统级权限限制，"
+                f"（ACL 受限令牌已启用：mode={effective_acl}；写操作由操作系统级权限限制，"
                 "但读与网络不受限。超时/取消会终止整棵进程树。）"
             )
         return {
@@ -132,7 +150,7 @@ class TerminalTool(Tool):
                 result = await run_command(
                     command, cwd=resolved.absolute, shell=shell_choice,
                     timeout=timeout, cancel_event=getattr(ctx, "cancel_event", None),
-                    acl_mode=self.acl_mode, workspace_root=str(ctx.workspace),
+                    acl_mode=self._effective_acl_mode(ctx), workspace_root=str(ctx.workspace),
                 )
             except ShellUnavailable as exc:
                 return ToolResult.failure(

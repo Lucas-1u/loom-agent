@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from backend.agent.approval import ApprovalManager
+# 步骤 5：ApprovalManager 不再使用（审批已从 Agent 循环移除）
 from backend.agent.core import AgentConfig, AgentCore
 from backend.agent.subtask import SubtaskSpawner
 from backend.events import EventBus, EventType, collect
@@ -79,7 +79,7 @@ class RouterAdapter(FakeAdapter):
         return ModelReply(content="（替身）没有对应的剧本，无法继续。")
 
 
-async def _make_parent(store, root_id, *, spawner, engine="graph", approvals=None,
+async def _make_parent(store, root_id, *, spawner, engine="graph",
                        replies=None, cancel_event=None):
     reg = build_default_registry(include_mutating=True, spawner=spawner)
     adapter = RouterAdapter({"读一下 config": [ModelReply(content="父任务直接回答。")]})
@@ -89,7 +89,7 @@ async def _make_parent(store, root_id, *, spawner, engine="graph", approvals=Non
         adapter, reg,
         config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
                            use_reflect_phase=False, orchestrator=engine),
-        bus=bus, approvals=approvals or ApprovalManager(timeout_s=5), spawner=spawner,
+        bus=bus, spawner=spawner,
     )
     if cancel_event is not None:
         core.cancel_event = cancel_event
@@ -243,7 +243,7 @@ async def suite_security(tmp: Path) -> None:
     await store.upsert_session({"session_id": "s1", "title": "t", "workspace": str(ws),
                                 "created_at": time.time(), "updated_at": time.time()})
 
-    # ---- 审批拒绝 → 子任务根本不会被创建 ----
+    # ---- 步骤 5：审批已移除，spawn_subtask 直接派生 ----
     root_id = "task_root_c1"
     await store.create_task({"task_id": root_id, "session_id": "s1", "goal": "父",
                              "status": "running", "workspace": str(ws)})
@@ -252,7 +252,6 @@ async def suite_security(tmp: Path) -> None:
                              config=AgentConfig())
     reg = build_default_registry(include_mutating=True, spawner=spawner)
     bus = EventBus(); evs = collect(bus)
-    approvals = ApprovalManager(timeout_s=5)
     parent_adapter = RouterAdapter({
         "派个生": [ModelReply(tool_calls=[tc("s1", "spawn_subtask", {"goal": "读 README 并汇报"})]),
                    ModelReply(content="派生过了。")],
@@ -260,43 +259,31 @@ async def suite_security(tmp: Path) -> None:
     core = AgentCore(parent_adapter, reg,
                      config=AgentConfig(max_turns=3, min_evidence=0, use_plan_phase=False,
                                         use_reflect_phase=False),
-                     bus=bus, approvals=approvals, spawner=spawner)
+                     bus=bus, spawner=spawner)
 
-    async def rejector():
-        for _ in range(400):
-            await asyncio.sleep(0.02)
-            aid = core.approvals.current()
-            if aid:
-                core.approvals.reject(aid, "测试拒绝")
-                return
-
-    t_rej = asyncio.create_task(rejector())
-    st = await core.run("派个生", workspace=str(ws), task_id=root_id,
-                        replies=None) if False else await core.run("派个生", workspace=str(ws), task_id=root_id)
-    t_rej.cancel()
+    st = await core.run("派个生", workspace=str(ws), task_id=root_id)
     await bus.drain()
     spawned = await store.count_children(root_id)
-    check(any(str(e.type) == "approval.request" for e in evs), "spawn_subtask 走了审批流程")
-    # 由于父 Agent 只发起了工具调用、被拒绝后不会再执行 → 不应有子任务
-    check(spawned == 0 or st.status.value != "done",
-          f"★ 审批拒绝后没有成功派生（子任务数={spawned}, 父状态={st.status.value}）")
+    check(not any(str(e.type) == "approval.request" for e in evs),
+          "★ 步骤 5：spawn_subtask 不再走审批")
+    check(spawned >= 1, f"★★ 无审批直接派生（子任务数={spawned}）")
 
-    # ---- 子任务里写文件仍需审批（不能因为"是子任务"就自动放行）----
+    # ---- 步骤 5：子任务里的写文件也直接执行（无审批）----
     root_id2 = "task_root_c2"
     await store.create_task({"task_id": root_id2, "session_id": "s1", "goal": "父2",
                              "status": "running", "workspace": str(ws)})
     child_adapter = RouterAdapter({
         "写文件": [ModelReply(tool_calls=[tc("w1", "write_file",
-                                            {"path": "pwned.txt", "content": "X"})]),
+                                            {"path": "child_ok.txt", "content": "X"})]),
                    ModelReply(content="写好了。")],
     })
     sp2 = SubtaskSpawner(store=store, adapter=child_adapter,
                          registry=build_default_registry(include_mutating=True),
-                         config=AgentConfig(), approval_timeout_s=0.5, child_max_turns=4)
+                         config=AgentConfig(), child_max_turns=4)
     res2 = await _spawn_direct(sp2, goal="写文件", parent_id=root_id2, workspace=str(ws))
-    check(not os.path.exists(ws / "pwned.txt"),
-          "★ 子任务写文件未被审批 → 文件没有产生（没有绕过审批）")
-    check(res2.status != "done", f"★ 子任务未成功完成（{res2.status}/{res2.end_reason}）")
+    check(os.path.exists(ws / "child_ok.txt"),
+          "★★ 步骤 5：子任务写文件直接执行（审批已移除）")
+    check(res2.status == "done", f"子任务成功完成（{res2.status}/{res2.end_reason}）")
 
     # ---- 数量上限 ----
     root_id3 = "task_root_c3"
@@ -418,11 +405,13 @@ async def suite_failures(tmp: Path) -> None:
 # --------------------------------------------------------------------------- #
 def suite_events() -> None:
     print("\n[E] 事件与契约")
-    check(len(list(EventType)) == 20, f"事件类型仍是 20 种（实际 {len(list(EventType))}）")
+    check(len(list(EventType)) == 21, f"事件类型仍是 21 种（实际 {len(list(EventType))}）")
     src = Path(__file__).resolve().parents[1] / "frontend" / "src" / "types" / "events.ts"
     if src.exists():
         text = src.read_text(encoding="utf-8")
-        check(text.count('  "') == 19 or '"tool.call"' in text, "前端清单未变动（仍含既有一致性）")
+        # ★ 更硬的检查：后端每一个事件名都必须在 TS 清单里出现（少一项 = SSE 帧静默丢弃）
+        missing = [e.value for e in EventType if f'"{e.value}"' not in text]
+        check(not missing, f"★ 前端清单覆盖后端全部事件（缺：{missing}）")
 
 
 # --------------------------------------------------------------------------- #

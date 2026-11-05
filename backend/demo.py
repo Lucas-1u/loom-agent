@@ -5,14 +5,14 @@ Loom Agent v0.1 · 离线演示（不需要 API Key）
 
 它用 FakeAdapter 演一段剧本，把完整事件流走一遍：
     PLAN → ACT(list_files) → OBSERVE → REFLECT
-         → ACT(write_file) → 审批询问（自动批准）→ OBSERVE → REFLECT
+         → ACT(write_file) → 直接执行（步骤 5：审批已移除）→ OBSERVE → REFLECT
          → FINAL ANSWER
 
 跑法：
     ./.venv/Scripts/python.exe -m backend.demo
 
-    # 看审批被拒绝的那条路径
-    ./.venv/Scripts/python.exe -m backend.demo --reject
+    # 看「只读模式」下写入被工具注册表拦住的那条路径
+    ./.venv/Scripts/python.exe -m backend.demo --readonly
 
     # 看预算耗尽（轮次掐断）时会发生什么
     ./.venv/Scripts/python.exe -m backend.demo --budget
@@ -29,7 +29,6 @@ import sys
 import tempfile
 
 from backend.agent.core import AgentConfig, AgentCore
-from backend.cli.approve import CLIApprover
 from backend.cli.render import C, TerminalRenderer
 from backend.events import EventBus
 from backend.models.adapter import FakeAdapter, ModelReply, ToolCall
@@ -72,18 +71,18 @@ async def demo(kind: str) -> None:
             same, same, same, same, same, same, same, same,
         ]
         cfg = AgentConfig(max_turns=6, max_same_call_repeat=2, use_reflect_phase=False, min_evidence=0)
-        approve_mode = "approve"
-    elif kind == "reject":
+        readonly = False
+    elif kind == "readonly":
         script = [
             ModelReply(content='{"steps":[{"title":"列出目录","detail":"确认项目结构"},{"title":"创建配置文件","detail":"生成 config.py"}],"note":""}'),
             ModelReply(tool_calls=[tc("c1", "list_files", {"path": "."})]),
             ModelReply(content='{"progress":"已看到 main.py / requirements.txt / README.md","next_action":"创建 config.py 存放配置","done":false}'),
             ModelReply(tool_calls=[tc("c2", "write_file", {"path": "config.py", "content": "DEBUG = True\nPORT = 8000\n"})]),
-            ModelReply(content='{"progress":"用户拒绝了写入，我不再重试","next_action":"基于只读观测给出结论","done":true}'),
-            ModelReply(content="这是一个 FastAPI 演示项目，包含 main.py、requirements.txt、README.md 三个文件。用户拒绝了创建 config.py 的请求，所以我只做了分析，没有改动任何文件。"),
+            ModelReply(content='{"progress":"写工具不在只读模式下注册，没人执行它","next_action":"基于只读观测给出结论","done":true}'),
+            ModelReply(content="这是一个 FastAPI 演示项目，包含 main.py、requirements.txt、README.md 三个文件。只读模式下写工具没有注册，所以我只做了分析，没有改动任何文件。"),
         ]
         cfg = AgentConfig(max_turns=10, min_evidence=1)
-        approve_mode = "reject"
+        readonly = True
     else:
         script = [
             # ① PLAN
@@ -95,19 +94,19 @@ async def demo(kind: str) -> None:
             # ④ ACT: read_file
             ModelReply(tool_calls=[tc("c2", "read_file", {"path": "main.py"})]),
             # ⑤ REFLECT
-            ModelReply(content='{"progress":"确认是 FastAPI 应用，有一个 /health 接口","next_action":"创建 config.py 把配置抽出来（需要用户批准）","done":false}'),
-            # ⑥ ACT: write_file（会触发审批）
+            ModelReply(content='{"progress":"确认是 FastAPI 应用，有一个 /health 接口","next_action":"创建 config.py 把配置抽出来","done":false}'),
+            # ⑥ ACT: write_file（步骤 5 后直接执行，不再审批）
             ModelReply(tool_calls=[tc("c3", "write_file", {"path": "config.py", "content": "DEBUG = True\nPORT = 8000\n"})]),
-            # ⑦ REFLECT（若被批准）
+            # ⑦ REFLECT
             ModelReply(content='{"progress":"已创建 config.py","next_action":"finish","done":true}'),
             # ⑧ 兜底正文
             ModelReply(content="这是一个 FastAPI 演示项目：main.py 提供 /health 接口，依赖见 requirements.txt。"),
         ]
         cfg = AgentConfig(max_turns=12, min_evidence=1, use_reflect_phase=True)
-        approve_mode = "approve"
+        readonly = False
 
     adapter = FakeAdapter(script)
-    registry = build_default_registry()
+    registry = build_default_registry(include_mutating=not readonly)
     bus = EventBus()
 
     renderer = TerminalRenderer(color=True, show_thinking=False)
@@ -122,18 +121,11 @@ async def demo(kind: str) -> None:
     bus.subscribe(_collect)
 
     core = AgentCore(adapter, registry, config=cfg, bus=bus)
-    approver = CLIApprover(core.approvals, renderer=renderer, auto=approve_mode)
-    bus.subscribe(approver.on_event)
 
-    attend = asyncio.create_task(approver.attend())
+    # 步骤 5：审批已移除，不再需要 CLIApprover 驱动挂起-恢复
     try:
         state = await core.run("分析这个项目并创建一份配置文件", workspace=ws)
     finally:
-        attend.cancel()
-        try:
-            await attend
-        except asyncio.CancelledError:
-            pass
         await bus.drain()
 
     # ---------------- 收尾面板 ---------------- #
@@ -145,7 +137,7 @@ async def demo(kind: str) -> None:
     print(f"  轮次         {state.turn} / {state.budgets.max_turns}")
     print(f"  工具调用     {state.budgets.tool_calls_used} / {state.budgets.max_tool_calls}")
     print(f"  证据         {len([e for e in state.evidence_summary if e.ok])} 条（门槛 {state.budgets.min_evidence}）")
-    print(f"  审批         {len(state.approval_history)} 次")
+    print(f"  审批         （步骤 5 已移除）")
     print(f"  文件变更     {len(state.change_records)} 处")
     if state.plan:
         print(f"  计划         ", end="")
@@ -187,11 +179,11 @@ async def demo(kind: str) -> None:
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Loom Agent 离线演示")
-    ap.add_argument("--reject", action="store_true", help="演示「审批被拒绝」的路径")
+    ap.add_argument("--readonly", action="store_true", help="演示「只读模式」下写工具未注册")
     ap.add_argument("--budget", action="store_true", help="演示「重复熔断 + 预算掐断」")
     args = ap.parse_args()
 
-    kind = "reject" if args.reject else ("budget" if args.budget else "normal")
+    kind = "readonly" if args.readonly else ("budget" if args.budget else "normal")
 
     await demo(kind)
     return 0

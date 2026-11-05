@@ -68,7 +68,7 @@ async def amain() -> int:
     Path(ws, "hello.py").write_text("print('from-file')\n", encoding="utf-8")
     tool = RunCommandTool(mgr)
     state = TaskState(goal="集成测试", workspace=ws, task_id="task_docker01")
-    ctx = make_context(state, authorized=True)
+    ctx = make_context(state)
 
     try:
         # ---- 1. 基本执行 ----
@@ -85,7 +85,7 @@ async def amain() -> int:
         idle = asyncio.Event()      # 永不 set
         ctx_idle = make_context(
             TaskState(goal="正常结束", workspace=ws, task_id="task_docker_ok"),
-            authorized=True, cancel_event=idle,
+            cancel_event=idle,
         )
         r = await tool.run({"command": "python", "args": ["-c", "print('ok')"]}, ctx_idle)
         check(r.ok and r.data.get("exit_code") == 0,
@@ -183,7 +183,7 @@ async def amain() -> int:
         cancel = asyncio.Event()
         ctx2 = make_context(
             TaskState(goal="取消测试", workspace=ws, task_id="task_docker_cancel"),
-            authorized=True, cancel_event=cancel,
+            cancel_event=cancel,
         )
 
         async def _fire() -> None:

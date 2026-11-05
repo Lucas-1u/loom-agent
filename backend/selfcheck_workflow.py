@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from backend.agent.approval import ApprovalManager
+# 步骤 5：ApprovalManager 不再使用（审批已从 Agent 循环移除）
 from backend.agent.core import AgentConfig, AgentCore
 from backend.events import EventBus, EventType, collect
 from backend.models.adapter import FakeAdapter, ModelReply, ToolCall
@@ -317,20 +317,10 @@ async def _run_agent(store: WorkflowStore, base: str, ws: str, engine: str) -> t
         reg,
         config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
                            use_reflect_phase=False, orchestrator=engine),
-        bus=bus, approvals=ApprovalManager(timeout_s=5),
+        bus=bus,
     )
 
-    async def approve():
-        for _ in range(400):
-            await asyncio.sleep(0.02)
-            aid = core.approvals.current()
-            if aid:
-                core.approvals.approve(aid, "测试批准")
-                return
-
-    task = asyncio.create_task(approve())
     st = await core.run("跑个工作流", workspace=ws, task_id=f"task_wf_{engine}")
-    task.cancel()
     await bus.drain()
     return st, evs
 
@@ -370,7 +360,7 @@ async def _run_agent_fail(store: WorkflowStore, base: str, ws: str) -> tuple:
         ]),
         reg, config=AgentConfig(max_turns=5, min_evidence=0, use_plan_phase=False,
                                 use_reflect_phase=False),
-        bus=bus, approvals=ApprovalManager(timeout_s=5),
+        bus=bus,
     )
 
     async def approve():

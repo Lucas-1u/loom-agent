@@ -176,16 +176,9 @@ class RunCommandTool(Tool):
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         with timed() as t:
-            # ---- 0. 授权闸门（纵深防御：Policy 之外再挡一次）---------------
-            if not ctx.authorized:
-                return ToolResult.failure(
-                    self.name,
-                    ErrorKind.PERMISSION_DENIED,
-                    "命令执行未经用户批准",
-                    hint="这是需要审批的操作。请说明要跑什么、为什么跑，等待用户确认。",
-                    duration_ms=t.ms,
-                )
-
+            # ---- 0. 参数校验 -----------------------------------------------
+            # ★ 步骤 5：删除 ctx.authorized 授权闸门。审批已整体移除，
+            #   安全边界由沙箱（Docker / ACL）承担。
             err = self.validate_args(args)
             if err:
                 return ToolResult.failure(

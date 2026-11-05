@@ -86,6 +86,52 @@ class RiskLevel(str, Enum):
 
 
 # --------------------------------------------------------------------------- #
+# 权限模式（步骤 6）
+# --------------------------------------------------------------------------- #
+# ★ 为什么放在 state.py 而不是 sandbox/acl.py：
+#   agent/ 不能 import sandbox/（依赖方向是 server → agent → tools，
+#   sandbox 与 tools 平级）。模式是**任务级状态**，天然属于 TaskState 的词汇。
+#   acl.py 里有同名的 READ_ONLY/WORKSPACE_WRITE/FULL_ACCESS 常量，
+#   两边字符串必须一致（selfcheck 里有断言守着）。
+SESSION_MODE_READ_ONLY = "read-only"
+SESSION_MODE_WORKSPACE_WRITE = "workspace-write"
+SESSION_MODE_FULL_ACCESS = "full-access"
+
+VALID_SESSION_MODES = (
+    SESSION_MODE_READ_ONLY,
+    SESSION_MODE_WORKSPACE_WRITE,
+    SESSION_MODE_FULL_ACCESS,
+)
+
+# 默认值与历史行为一致：能写工作区、能跑命令（步骤 5 之前是审批放行，之后是直接执行）
+DEFAULT_SESSION_MODE = SESSION_MODE_WORKSPACE_WRITE
+
+
+def normalize_session_mode(raw: str | None) -> str:
+    """
+    把任意输入归一成合法模式。
+
+    - 空 / None → 默认 workspace-write
+    - 合法值 → 原样返回
+    - 非法值 → **抛 ValueError**，不静默降级
+
+    ★ 为什么非法值要抛：模式决定沙箱强度。用户写错一个字母
+      （比如 "readonly" 少了连字符）却拿到 workspace-write，
+      是"以为自己在只读、实际能写"的危险错觉。宁可起任务时报错。
+    """
+    if raw is None:
+        return DEFAULT_SESSION_MODE
+    text = str(raw).strip().lower()
+    if not text:
+        return DEFAULT_SESSION_MODE
+    if text not in VALID_SESSION_MODES:
+        raise ValueError(
+            f"未知的权限模式：{raw!r}（合法值：{' | '.join(VALID_SESSION_MODES)}）"
+        )
+    return text
+
+
+# --------------------------------------------------------------------------- #
 # 预算
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -482,6 +528,12 @@ class TaskState:
     graph_trace: list[str] = field(default_factory=list)
     # 实际使用的编排引擎标识（graph | legacy）；run() 会按配置写入
     engine: str = "graph"
+    # ---- 步骤 6：权限模式 --------------------------------------------------
+    # read-only | workspace-write | full-access
+    # ★ 这是**环境配置**，不是 Policy 关卡（见 docs/22 §4.2）：
+    #   它决定 Docker 挂载方式、哪些工具注册、ACL 令牌配置。
+    #   默认 workspace-write（与历史行为一致：能写工作区）。
+    session_mode: str = "workspace-write"
     # 压缩记录（最多留最近 10 次）
     compaction_log: list[dict[str, Any]] = field(default_factory=list)
     # ---- 第六批：预算续期与耗尽原因分类 ----
@@ -892,6 +944,7 @@ class TaskState:
             "history_persist_errors": self.history_persist_errors,
             "graph_trace": self.graph_trace,
             "engine": self.engine,
+            "session_mode": self.session_mode,
             "compaction_log": self.compaction_log[-10:],
             "budget_extended": self.budget_extended,
             "budget_reason": self.budget_reason,

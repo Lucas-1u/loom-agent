@@ -17,14 +17,14 @@ write_file —— 在工作区内新建或覆盖一个文本文件。
 ────────────────────────────────────────────────────────────────
 安全设计（四条）
 ────────────────────────────────────────────────────────────────
-① **必须已授权**。ctx.authorized 由 Policy 在执行前置 True（Policy 内部走完审批）。
-   工具自己再检查一次 —— 这是「纵深防御」：万一 Policy 有 bug，
-   写工具这道闸仍然拦得住。**不许把安全校验只放在一层。**
+① **无授权闸门（步骤 5 变更）**。审批已整体移除，ctx.authorized 不存在。
+   安全边界改由沙箱承担：run_command 在 Docker 里，terminal 可选 ACL 受限令牌。
+   工具层不再做「是否获批」的检查 —— 这是用户明确拍板的取舍。
 
 ② **覆盖前备份**。原文件先复制到 `.loom_backup/<时间戳>/<相对路径>`。
    给用户后悔的机会。备份失败则**拒绝执行**（宁可不写，也不能无声覆盖）。
 
-③ **内容上限**。防止模型一次吐 500KB 把磁盘塞满 / 把审批界面卡死。
+③ **内容上限**。防止模型一次吐 500KB 把磁盘塞满。
 
 ④ **敏感文件额外警示**（命中 .env 等时在影响说明里高亮）。
 
@@ -91,17 +91,9 @@ class WriteFileTool(Tool):
     # ===================================================================== #
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         with timed() as t:
-            # ---- 0. 授权闸门（纵深防御第一层）------------------------------
-            if not ctx.authorized:
-                return ToolResult.failure(
-                    self.name,
-                    ErrorKind.PERMISSION_DENIED,
-                    "写入操作未经用户批准",
-                    hint="这是需要审批的操作。请说明修改目的，等待用户确认后重试。",
-                    duration_ms=t.ms,
-                )
-
-            # ---- 1. 参数 ---------------------------------------------------
+            # ---- 0. 参数 ---------------------------------------------------
+            # ★ 步骤 5：删除 ctx.authorized 授权闸门。审批已整体移除，
+            #   安全边界由沙箱（Docker / ACL）承担。
             raw_path = args.get("path", "")
             content = args.get("content")
             overwrite = args.get("overwrite", True)
@@ -202,7 +194,7 @@ class WriteFileTool(Tool):
                 before_hash=before_hash,
                 after_hash=sha256_text(content),
                 added=new_lines,
-                approval_id=ctx.approval_id,
+                approval_id="",  # 步骤 5：审批移除，留痕字段保留但恒空（审计链不断裂）
                 backup_path=display_path(ctx.workspace, backup_path) if backup_path else "",
             )
 

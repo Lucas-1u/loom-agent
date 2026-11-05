@@ -31,7 +31,6 @@ import os
 import time
 from typing import Any
 
-from ..agent.approval import ApprovalManager
 from ..agent.core import AgentConfig, AgentCore
 from ..agent.history_log import StoreHistorySink
 from ..events import Event, EventBus
@@ -63,6 +62,7 @@ class TaskRuntime:
         spawner: object | None = None,
         allowed_paths: list[str] | None = None,
         forbidden_paths: list[str] | None = None,
+        session_mode: str = "",
     ) -> None:
         self.task_id = task_id
         self.session_id = session_id
@@ -71,6 +71,8 @@ class TaskRuntime:
         self.model = model
         self.allowed_paths = list(allowed_paths) if allowed_paths else None
         self.forbidden_paths = list(forbidden_paths) if forbidden_paths else None
+        # 步骤 6：权限模式（空 = 默认 workspace-write，合法值在 core.run 里校验）
+        self.session_mode = str(session_mode or "")
 
         self._hub = hub
         self._store = store
@@ -79,7 +81,9 @@ class TaskRuntime:
         # ---- 每个任务独立的一套 ----
         self.bus = EventBus()
         self.bus.bind_task(task_id)
-        self.approvals = ApprovalManager(timeout_s=config.approval_timeout_s)
+        # ★ 步骤 5：审批已从 Agent 循环移除，不再创建 ApprovalManager。
+        #   /api/approvals 端点保留但 resolve_approval 恒返回 False（见下），
+        #   前端若收到旧快照里的 awaiting_approval 状态会自然超时。
 
         # Spill：溢出存储（对齐 DeepSeek Harness dsh-spill-policy）
         spill_store = None
@@ -116,7 +120,7 @@ class TaskRuntime:
             )
 
         self.core = AgentCore(
-            adapter, registry, config=config, bus=self.bus, approvals=self.approvals,
+            adapter, registry, config=config, bus=self.bus,
             # M1：消息历史随任务持久化（store.task_history）
             history_sink=StoreHistorySink(self._store),
             # M3：项目知识检索（不传则无 RAG）
@@ -191,6 +195,8 @@ class TaskRuntime:
                 forbidden_paths=self.forbidden_paths,
                 # ★ M2.1：必须用调度器的 task_id —— 否则历史/审计挂在另一个 id 下
                 task_id=self.task_id,
+                # 步骤 6：权限模式（空 = 默认 workspace-write）
+                session_mode=self.session_mode,
             )
 
             self.status = state.status.value
@@ -350,21 +356,13 @@ class TaskRuntime:
 
     async def resolve_approval(self, approval_id: str, decision: str, reason: str = "") -> bool:
         """
-        把用户的决策交回 ApprovalManager。
+        步骤 5：审批已从 Agent 循环移除，这里恒返回 False。
 
-        ★ 直接调现有 `resolve()` —— 它自带一次性消费（pop）、超时处理、
-          args_hash 校验（在执行前的 recheck 里）。服务层不重新实现任何一条。
+        ★ 为什么保留这个方法：/api/approvals/{id}/decision 端点还在，
+          直接删会让旧前端/脚本得到 500。返回 False 让调用方得到明确的
+          「这个 id 不在等待中」，而不是假装成功。
         """
-        accepted = self.approvals.resolve(approval_id, decision, reason)
-        if not accepted:
-            return False
-
-        # 状态由 _on_event 里收到 approval.decision 后改回 running，
-        # 但那条事件是 core 发出的，可能稍晚。这里先乐观改一下，
-        # 避免 200ms 内前端来查快照仍看到 awaiting_approval。
-        if self.status == "awaiting_approval":
-            self.status = "running"
-        return True
+        return False
 
     # ===================================================================== #
     # 快照

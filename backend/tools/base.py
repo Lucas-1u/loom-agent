@@ -242,13 +242,17 @@ class ToolContext:
     workspace: str                    # 工作区根目录（已 realpath 的绝对路径）
     task_id: str = ""
     turn: int = 0
-    # 由 Policy 填入本次调用的授权凭据（v0.1a 用）
-    approval_id: str = ""
-    # 是否已获授权（Policy 判定后置 True；写工具检查它）
-    authorized: bool = False
+    # ★ 步骤 5 变更：删除 approval_id / authorized 字段。
+    #   审批已整体移除，写工具不再检查授权凭据。
+    #   安全边界由沙箱（Docker / ACL 受限令牌）承担。
     # ★ 任务取消信号（AgentCore 的 cancel_event）。长耗时工具（run_command）
     #   必须在它被 set 时立刻收手，否则"用户点了停止"要等命令自己超时。
     cancel_event: Any = None
+    # ★ 步骤 7：会话权限模式（read-only / workspace-write / full-access）。
+    #   工具可以据此调整执行强度 —— 目前只有 terminal 用：
+    #   当 ACL 沙箱总开关打开时，用任务模式覆盖启动时的 LOOM_ACL_MODE。
+    #   默认 workspace-write 与历史行为一致。
+    session_mode: str = "workspace-write"
     # M5：子任务派生器（由服务端装配注入；为 None 表示当前不允许派生子任务）
     spawner: Any = None
     # M6：事件总线（工作流这类"多步并行"的工具需要自己发进度事件）
@@ -289,12 +293,11 @@ class Tool(ABC):
         """
         是否需要用户批准。
 
-        默认规则：只读不需要，其余都需要。
-        ★ 注意这里是 **工具级默认**。真正判定在 policy.py 里 ——
-          因为像 run_command 这种工具，同一条命令可能是只读（git status）
-          也可能有副作用（rm），必须按「完整命令 + 参数」逐次判定。
+        ★ 步骤 5 变更：审批已移除，此 property 保留仅为向后兼容
+        （registry.py 的工具清单展示用），恒返回 False。
+        真实判定已不存在 —— 所有工具直接执行。
         """
-        return self.risk != RiskLevel.READ
+        return False
 
     # ---- 参数校验 ----------------------------------------------------------
     def validate_args(self, args: dict[str, Any]) -> str:

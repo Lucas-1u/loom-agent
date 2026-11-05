@@ -12,18 +12,29 @@ Loom Agent v0.1 · Policy Engine（执行前校验链）
    ② 参数 JSON 可解析？   → parse_error 直接失败（invalid_arguments）
    ③ schema 校验通过？    → 失败则回灌给模型改参数
    ④ 预算还有余量？       → 超了强制收敛，不再执行任何工具
-   ⑤ 路径在工作区内？     → 越界 = 安全事件，失败且不可重试
-   ⑥ 是否需审批？         → risk != read 时走审批，拿到授权才继续
-   ⑦ 放行
+   ⑤ 重复熔断（软）      → 同参调用超限
+   ⑤b 确定性失败熔断（硬）→ 撞过一次的确定性失败再撞
+   ⑤b2 用户声明只读      → 一切写文件操作
+   ⑤c 禁止路径          → 用户显式声明的禁止范围
+   ⑤d 允许范围          → 用户显式声明的允许范围
+   ⑥ 放行
 
-为什么预算检查放在路径检查**之前**？
-  → 因为预算耗尽意味着任务该结束了。此时即便路径合法也不该再执行 —— 
-    否则一个已经超时的任务还能继续写文件，用户会以为它早停了。
+────────────────────────────────────────────────────────────────
+★ 步骤 5 变更（2026-11-05）：删除审批与白名单
+────────────────────────────────────────────────────────────────
+   已删除：
+   - allowed_tools 白名单（① 的工具范围限制）
+   - ⑥ 审批关卡（risk != read 时的人工审批挂起）
+   - recheck_after_approval（TOCTOU 复检）
+   - PolicyDecision.needs_approval / approval_id 字段
 
-为什么审批放在最后？
-  → 因为「不值得执行的调用」不该打扰用户。参数都不合法，
-    先让模型改参数，别拿一个注定失败的操作去问用户。
-    （这直接决定了用户体验：审批弹窗越少越精准越好。）
+   保留（用户拍板）：
+   - ②③ 参数格式、④ 预算、⑤ 熔断（软/硬）
+   - ⑤b2 只读意图、⑤c 禁止路径、⑤d 允许范围（用户显式声明的约束）
+
+   风险接受（用户明确拍板）：
+   - 无审批 → Agent 完全自主执行
+   - 路径越界靠沙箱物理拦（OS 级 ACL / Docker），不靠引擎拦
 
 ────────────────────────────────────────────────────────────────
 Policy 与 Tool 的分工
@@ -31,7 +42,7 @@ Policy 与 Tool 的分工
     Policy  决定「能不能调」        —— 与具体工具无关的通用规则
     Tool    决定「怎么调、调了会怎样」—— 领域细节（写文件 / 跑命令）
 
-所以 Policy 只依赖 Tool 暴露的元信息（risk / needs_approval / describe_action），
+所以 Policy 只依赖 Tool 暴露的元信息（risk / describe_action），
 不 import 任何具体工具。加新工具时 Policy 一行都不用改。
 """
 
@@ -71,14 +82,15 @@ class PolicyDecision:
     """
     Policy 的裁定。
 
-    allow=True  → 可以执行（可能附带 approval_id 表示「已获授权」）
+    allow=True  → 可以执行
     allow=False → 不执行，result 里是要回灌给模型的错误
+
+    ★ 步骤 5 变更：删除 needs_approval / approval_id / require_approval。
+      审批已整体移除，Policy 只做「放行 / 拒绝」。
     """
 
     allow: bool
     result: ToolResult | None = None      # allow=False 时的失败结果
-    needs_approval: bool = False          # 需要走审批流程
-    approval_id: str = ""                 # 已获授权的凭据
     reason: str = ""                      # 给人看的裁定理由（进日志）
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -87,12 +99,8 @@ class PolicyDecision:
         return PolicyDecision(allow=False, result=result, reason=reason)
 
     @staticmethod
-    def permit(approval_id: str = "", reason: str = "") -> "PolicyDecision":
-        return PolicyDecision(allow=True, approval_id=approval_id, reason=reason)
-
-    @staticmethod
-    def require_approval(reason: str, meta: dict[str, Any] | None = None) -> "PolicyDecision":
-        return PolicyDecision(allow=False, needs_approval=True, reason=reason, meta=meta or {})
+    def permit(reason: str = "") -> "PolicyDecision":
+        return PolicyDecision(allow=True, reason=reason)
 
 
 # --------------------------------------------------------------------------- #
@@ -106,10 +114,8 @@ class Policy:
     这样它天然可测试：造一个 TaskState 就能断言裁定结果。
     """
 
-    def __init__(self, registry: ToolRegistry, *, allowed_tools: set[str] | None = None) -> None:
+    def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry
-        # 工具白名单（None = 全开）。用于「以只读模式运行」这类降权场景。
-        self.allowed_tools = allowed_tools
 
     # ===================================================================== #
     # 主入口
@@ -122,28 +128,17 @@ class Policy:
         ctx: ToolContext,
         *,
         parse_error: str = "",
-        already_approved: str = "",
     ) -> PolicyDecision:
         """
         走完整条校验链。
 
         参数：
-            parse_error      模型给的参数 JSON 解析失败时的原因（来自 ModelAdapter）
-            already_approved 已持有的 approval_id（恢复执行时用）
+            parse_error   模型给的参数 JSON 解析失败时的原因（来自 ModelAdapter）
         """
 
-        # ---- ① 工具存在 -------------------------------------------------
-        if self.allowed_tools is not None and tool_name not in self.allowed_tools:
-            return PolicyDecision.deny(
-                ToolResult.failure(
-                    tool_name,
-                    ErrorKind.PERMISSION_DENIED,
-                    f"工具 '{tool_name}' 不在本次任务允许的范围内",
-                    hint=f"可用工具：{', '.join(sorted(self.allowed_tools))}",
-                ),
-                reason="工具不在白名单",
-            )
-
+        # ---- ① 工具存在（简化：直接 registry.get()，None 就 fail）--------
+        # ★ 步骤 5：删除 allowed_tools 白名单。工具范围不再由 Policy 限制，
+        #   模型能调任何已注册工具。安全边界由沙箱（Docker / ACL）承担。
         tool = self.registry.get(tool_name)
         if tool is None:
             return PolicyDecision.deny(
@@ -304,134 +299,10 @@ class Policy:
                         reason="超出允许修改范围",
                     )
 
-        # ---- ⑥ 审批 -----------------------------------------------------
-        # ★ M6：工具可以按**本次参数**给出更精确的风险等级（terminal 的只读白名单用）。
-        #   默认仍用工具级 risk；risk_for 的判定逻辑写死在工具里，
-        #   模型无法通过参数给自己"声明安全"。
-        risk_now = getattr(tool, "risk", RiskLevel.READ)
-        risk_for = getattr(tool, "risk_for", None)
-        if callable(risk_for):
-            try:
-                risk_now = risk_for(args)
-            except Exception:  # noqa: BLE001 —— 判定失败就退回工具级默认（保守）
-                risk_now = getattr(tool, "risk", RiskLevel.WRITE)
-        need_approval = risk_now != RiskLevel.READ
-
-        if need_approval:
-            if already_approved:
-                # 已授权 → 放行，但要把授权凭据带下去（工具自身还会再检查一次）
-                return PolicyDecision.permit(
-                    approval_id=already_approved, reason=f"{tool_name} 已获用户批准"
-                )
-
-            info = tool.describe_action(args, ctx)
-            return PolicyDecision.require_approval(
-                reason=f"{tool_name} 有副作用（risk={risk_now.value}），需用户批准",
-                meta={
-                    "tool": tool_name,
-                    "risk": risk_now.value,
-                    "action": info.get("action", ""),
-                    "target": info.get("target", ""),
-                    "impact": info.get("impact", ""),
-                    "preview": info.get("preview", ""),
-                },
-            )
-
-        # ---- ⑦ 放行 -----------------------------------------------------
-        return PolicyDecision.permit(reason="只读工具，无需审批")
-
-    # ===================================================================== #
-    # 授权后的再校验（★ TOCTOU 防护）
-    # ===================================================================== #
-    def recheck_after_approval(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        state: TaskState,
-        ctx: ToolContext,
-        pending: Any,
-    ) -> PolicyDecision:
-        """
-        用户点「批准」之后、真正执行之前，再校验一次。
-
-        ★ 为什么需要这一步？（TOCTOU = Time-of-Check to Time-of-Use）
-
-        从「发起审批」到「用户批准」之间可能过了很久（默认 180 秒）。这期间：
-
-          ① **文件可能被别人改了**。用户批准时看到的是旧内容，
-             执行时磁盘上已经是新内容 —— 直接覆盖就丢了别人的改动。
-             这个由 v0.1b 的 stale_content 检测处理，v0.1a 先用 args_hash 挡住。
-
-          ② **参数可能被换掉**。如果程序有 bug 或事件流被篡改，
-             批准时展示的是 read_file("a.py")，执行时却变成 write_file(".env")。
-             这就是 args_hash 存在的意义 —— 比对指纹，不一致直接拒绝。
-
-          ③ **工作区可能被换**。理论上不会，但检查一下成本极低。
-
-        本方法就是这三道防线。
-        """
-        from ..tools.path_safety import resolve_in_workspace, PathViolation
-        from .approval import args_fingerprint
-
-        tool = self.registry.get(tool_name)
-        if tool is None:
-            return PolicyDecision.deny(
-                ToolResult.failure(tool_name, ErrorKind.NOT_IMPLEMENTED, f"工具已不存在：{tool_name}"),
-                reason="审批期间工具被移除",
-            )
-
-        # ---- 指纹比对 ---------------------------------------------------
-        fresh_hash = args_fingerprint(tool_name, args)
-        if pending is not None and getattr(pending, "args_hash", "") and fresh_hash != pending.args_hash:
-            log.warning(
-                "审批指纹不匹配：批准时=%s 执行时=%s（tool=%s）",
-                pending.args_hash, fresh_hash, tool_name,
-            )
-            return PolicyDecision.deny(
-                ToolResult.failure(
-                    tool_name,
-                    ErrorKind.PERMISSION_DENIED,
-                    "参数在审批期间发生了变化，已拒绝执行",
-                    hint="这是安全保护。请重新发起这次操作并再次确认。",
-                ),
-                reason="args_hash 不匹配（防「批准 A 执行 B」）",
-            )
-
-        # ---- 路径重新校验（TOCTOU）-------------------------------------
-        # ★ EXEC 也要查：run_command 的 cwd 决定命令落在哪个目录。
-        #   虽然 cwd 已经在 args_hash 里（改了会被上面拦住），
-        #   这里再解析一次，防的是"审批期间工作区里那个目录被换成符号链接"。
-        if tool.risk in (RiskLevel.WRITE, RiskLevel.DELETE, RiskLevel.EXEC):
-            candidate = args.get("path") or args.get("target") or args.get("cwd")
-            if candidate:
-                try:
-                    resolve_in_workspace(state.workspace, candidate, must_exist=False)
-                except PathViolation as exc:
-                    return PolicyDecision.deny(
-                        ToolResult.failure(
-                            tool_name,
-                            ErrorKind.PATH_OUTSIDE_WORKSPACE,
-                            f"执行前复检发现路径越界：{exc}",
-                            hint="路径在审批期间变得不可信，操作已中止。",
-                        ),
-                        reason="审批后路径复检失败",
-                    )
-
-        # ---- 预算再查（审批可能等了很久，时长预算该重新算）-------------
-        violation = state.budget_violation()
-        if violation is not None:
-            kind, limit, used = violation
-            return PolicyDecision.deny(
-                ToolResult.failure(
-                    tool_name,
-                    ErrorKind.EXECUTION_ERROR,
-                    f"等待审批期间任务预算已耗尽（{kind}: {used}/{limit}）",
-                    hint="请基于已有信息给出结论。",
-                ),
-                reason=f"审批后预算耗尽：{kind}",
-            )
-
-        return PolicyDecision.permit(approval_id=getattr(pending, "approval_id", ""), reason="审批后复检通过")
+        # ---- ⑥ 放行 -----------------------------------------------------
+        # ★ 步骤 5：删除审批关卡。所有通过前面检查的工具调用直接放行。
+        #   风险边界由沙箱（Docker / ACL 受限令牌）承担，不再由人工审批承担。
+        return PolicyDecision.permit(reason=f"{tool_name} 通过校验链，直接放行")
 
 
 # --------------------------------------------------------------------------- #
@@ -440,8 +311,6 @@ class Policy:
 def make_context(
     state: TaskState,
     *,
-    approval_id: str = "",
-    authorized: bool = False,
     cancel_event: Any = None,
 ) -> ToolContext:
     """
@@ -450,6 +319,10 @@ def make_context(
     ★ 关键：ToolContext 里的配置（忽略目录、敏感名单、上限）
       从 config 读一次，注入进 context。
       工具自己不 import config —— 保证工具是纯函数式的、可单测的。
+
+    ★ 步骤 5 变更：删除 approval_id / authorized 参数。
+      审批已移除，ToolContext 不再携带授权凭据。
+      写工具的 authorized 检查也一并移除（见 base.py / mutating 工具）。
     """
     from ..config import (
         BACKUP_DIR_NAME,
@@ -463,8 +336,6 @@ def make_context(
         workspace=state.workspace,
         task_id=state.task_id,
         turn=state.turn,
-        approval_id=approval_id,
-        authorized=authorized,
         cancel_event=cancel_event,
         # M5：子任务要继承父任务的安全约束（不是子任务自己说了算）
         allowed_paths=list(state.allowed_paths) if state.allowed_paths else None,
@@ -474,4 +345,6 @@ def make_context(
         sensitive_names=frozenset(SENSITIVE_NAMES),
         sensitive_dir_parts=frozenset(SENSITIVE_DIR_PARTS),
         backup_dir_name=BACKUP_DIR_NAME,
+        # ★ 步骤 7：把任务级模式下发到工具（terminal 用它选 ACL 强度）
+        session_mode=getattr(state, "session_mode", "workspace-write"),
     )

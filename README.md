@@ -4,11 +4,21 @@
 给它一句话，它会规划、查项目、调工具、改文件、跑命令、验证结果，最后给一份**带证据**的答案。
 
 - 默认执行引擎 **Graph**（LangGraph），**Legacy** 保留为显式兜底
-- **1512** 项离线自检 · **20** 种事件 · 内置工具 + 可选 RAG / MCP / 子任务 / 工作流 / 上下文管理
-- 离线优先、审批前置：没有 API Key 也能跑演示，没有网络也不影响核心逻辑
+- **1502** 项离线自检 · **21** 种事件 · 内置工具 + 可选 RAG / MCP / 子任务 / 工作流 / 上下文管理
+- 离线优先、可审计：没有 API Key 也能跑演示，没有网络也不影响核心逻辑
 
 > 这是**学习型项目**，不是产品：架构清晰 > 功能数量，可理解性 > 代码量。
 > 所以代码里有大量"为什么这么写、踩过什么坑"的注释，也有明确写着"这个不做"的边界。
+
+> **⚠️ 2026-11-05 版本状态（读 §6 之前先看这条）**
+> 安全模型已按 `docs/22` 的 8 步计划重构完成，**步骤 1–8 全部走完**：
+> · **人工审批已移除**（步骤 5）——Agent 直接执行工具，不再有批准环节；
+> · **Policy 从 7 道关卡精简**，只保留参数/schema、预算、软硬熔断、只读意图、禁止/允许范围；
+> · **会话权限模式**（read-only / workspace-write / full-access）落地，服务端按任务切工具注册表（步骤 6–7）；
+> · **Windows ACL 受限令牌沙箱**已实现（`LOOM_ACL_MODE`，默认关闭），标准用户可用、无需管理员。
+> 因此 §6 中关于"审批挂起 / TOCTOU / 七道关卡"的描述属于**历史实现**，
+> 现状与取舍见 `docs/26`（步骤 5）、`docs/27`（步骤 6）、`docs/29`（步骤 7）、
+> `docs/30`（步骤 8：真实模型灰度，含两个实测发现）。
 
 ---
 
@@ -37,16 +47,16 @@
 
 ## 1. 这是什么
 
-Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批、可审计、可回放。
+Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审计、可回放。
 
 | 维度 | 普通 Chatbot / 单轮 API | Loom |
 |---|---|---|
-| 输入 | 一句话 | 一句话 → 任务（可取消、可被审批阻塞） |
+| 输入 | 一句话 | 一句话 → 任务（可取消、可中断；无人工审批，靠会话模式与沙箱约束） |
 | 输出 | 一段文本 | 一段**有证据**的文本 + 完整执行轨迹 |
 | 过程 | 无 | PLAN → ACT → TOOLS → REFLECT → FINAL，多轮自纠正 |
 | 副作用 | 无 | 读/写工作区、Docker 沙箱命令、宿主机终端、MCP 工具 |
-| 安全 | 无 | Policy 七道关卡 + 人工审批 + 预算熔断 + 验证闸门 |
-| 可观测 | 无 | 20 种事件经 SSE 推到时间线，可按 `task_id` 回放 |
+| 安全 | 无 | Policy 精简链 + 会话模式（只读/可写/完全访问）+ 预算熔断 + 验证闸门 |
+| 可观测 | 无 | 21 种事件经 SSE 推到时间线，可按 `task_id` 回放 |
 | 失败语义 | 编一段话 | 终态 + 原因码 + 证据等级，**绝不伪造成功** |
 
 一句话区分它和普通 Chatbot 的地方：**"说完成"不算完成，要过验证闸门**。
@@ -61,17 +71,18 @@ Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审批�
 | 文件读 / 列目录 | ✅ | 40k 字符截断、多编码、行号、hash |
 | 文件写 / 局部改 | ✅ | 覆盖前备份、唯一匹配、`expect_hash` 防 stale、行号锚定 + 模糊匹配 |
 | Docker 沙箱命令 | ✅ | 断网 / 只读根 / 非 root / 限额，无宿主机分支 |
-| **宿主机终端** | ✅ | pwsh / Windows PS / CMD / Git Bash；默认无沙箱（靠审批 + cwd + 超时），**可选** ACL 受限令牌沙箱（`LOOM_ACL_MODE`，见 §7.3） |
-| Policy + 人工审批 | ✅ | 七道关卡；`asyncio.Future` 真挂起，超时=拒绝 |
+| **宿主机终端** | ✅ | pwsh / Windows PS / CMD / Git Bash；默认无沙箱（靠 cwd + 超时），**可选** ACL 受限令牌沙箱（`LOOM_ACL_MODE`，见 §7.3） |
+| Policy 精简链 | ✅ | 参数/schema、预算、软硬熔断、只读意图、禁止/允许范围；**审批已移除**（步骤 5） |
+| 会话权限模式 | ✅ | read-only / workspace-write / full-access；服务端按任务切工具注册表，前端可切换并显示实际模式 |
 | 预算 / 熔断 / 取消 | ✅ | 轮次·秒·工具数·重复·错误；取消在下一轮检查点生效 |
 | 验证闸门 + 证据分级 | ✅ | A/B/C 分级 + "零改动不得报 done" |
 | 项目知识检索 | ✅ | FTS5 + bm25；**可选**本地向量 + RRF 融合 |
-| MCP 工具接入 | ✅ | 仅本地 stdio；默认要审批；无自动重连 |
+| MCP 工具接入 | ✅ | 仅本地 stdio；默认按写风险处理；无自动重连 |
 | 父子任务 | ✅ | 串行派生、结果信封、层级/数量/预算上限 |
 | 并行子任务 | ✅ | `spawn_parallel` 一次派生多个子任务并发执行；聚合结果 + 五类计数 |
 | 子任务树展示 | ✅ | 前端按 `parent_task_id` 构建可折叠树 |
 | **异步工作流（并行）** | ✅ | DAG 依赖调度：互不依赖的步骤真并行；http / 只读工具 / 本机命令 |
-| 事件 + SSE 时间线 | ✅ | 20 种事件，`since` 补拉 + `stream.gap` 快照恢复 |
+| 事件 + SSE 时间线 | ✅ | 21 种事件，`since` 补拉 + `stream.gap` 快照恢复 |
 | 任务持久化 | ✅ | SQLite：sessions / tasks / task_history |
 | 跨进程恢复 | 🟡 | Checkpoint 三执行点默认落盘；`load_checkpoint` 恢复入口已实现，重启自动续跑未接线 |
 | 上下文溢出存储（Spill） | ✅ | 超长上下文溢出到磁盘，head/tail 保留策略 |
@@ -94,12 +105,12 @@ python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt      # Windows
 # source .venv/bin/activate && pip install -r requirements.txt   # macOS / Linux
 
-python -m backend.demo            # 正常：规划 → 观测 → 写文件（含审批）
-python -m backend.demo --reject   # 拒绝：写操作被拒后如何收场
+python -m backend.demo            # 正常：规划 → 观测 → 写文件（直接执行）
+python -m backend.demo --readonly # 只读：写工具未注册，写入被拦住
 python -m backend.demo --budget   # 熔断：重复调用 + 轮数耗尽
 ```
 
-`demo` 会自建临时工作区、跑完整套 Agent Loop，打印**调试面板**（轮次/证据/审批/文件变更/计划打勾）、
+`demo` 会自建临时工作区、跑完整套 Agent Loop，打印**调试面板**（轮次/证据/文件变更/计划打勾）、
 **事件直方图**、**磁盘实际状态**。理解机制最快的入口。
 
 ### 3.2 接真实模型（CLI）
@@ -112,8 +123,9 @@ python -m backend.cli -w D:/some/project "分析这个项目的结构"
 
 三家都走 OpenAI 兼容协议，同一个 Adapter（`backend/models/openai_compat.py`），换供应商只改配置。
 
-常用参数：`-m bailian|deepseek|xfyun`、`--model-name`、`--readonly`、`--no-plan` / `--no-reflect`、
-`--yes` / `--no`（自动批准/拒绝）、`--dry-run`。交互模式里 `:t` 看工具、`:s` 看预算、`:q` 退出。
+常用参数：`-m bailian|deepseek|xfyun`、`--model-name`、`--mode read-only|workspace-write|full-access`、
+`--readonly`、`--no-plan` / `--no-reflect`、`--dry-run`。交互模式里 `:t` 看工具、`:s` 看预算、`:q` 退出。
+（`--yes` / `--no` 自步骤 5 起已废弃：审批整体移除，传了也不生效。）
 
 ### 3.3 起服务 + GUI
 
@@ -323,13 +335,18 @@ flowchart LR
 | ⑤b2 | 用户声明只读 | 一切写文件操作 |
 | ⑤c | 禁止路径 | 用户显式 forbidden |
 | ⑤d | 允许范围 | 范围外写入（执行前） |
-| ⑥ | 审批 | `risk != read` → `require_approval` |
+| ⑥ | ~~审批~~ | **步骤 5 起已移除**：工具直接执行，不再有人工批准环节（见 `docs/26`） |
 | ⑦ | 放行 | — |
 
 风险来自三处：工具类属性、`tool.risk_for(args)`（按参数判定，`terminal` 的只读白名单用它）、
 以及 MCP/子任务工具的配置。**模型不能给自己声明安全**。
 
-### 6.4 审批是"真挂起"
+### 6.4 审批是"真挂起"（步骤 5 起 Agent 循环已不再调用）
+
+> ⚠️ **现状**：审批已从 Agent 循环移除，`ApprovalManager` 作为独立模块保留
+> （事件类型、`/api/approvals` 端点、前端卡片都还在，只是不再被触发）。
+> 下面这段描述的是**保留模块本身的能力**，不再代表默认执行路径。
+> 取舍与失去的保护见 `docs/26-ACL沙箱-步骤5-Policy精简验收报告.md`。
 
 `ApprovalManager.request()` 建 `asyncio.Future` → `await wait_for(fut, timeout)`。
 **不是轮询**：任务真的停住，事件循环继续服务其他任务。
@@ -348,9 +365,9 @@ flowchart LR
 
 ### 6.6 事件与 SSE
 
-- 20 种事件：`task.start/end`、`plan`、`thinking`、`act`、`observe`、`tool.call/result`、
+- 21 种事件：`task.start/end`、`plan`、`thinking`、`act`、`observe`、`tool.call/result`、
   `approval.request/decision/expired`、`reflect`、`final_answer`、`error`、`budget.exceeded`、
-  `context.compacted`、`rag.retrieve/result`、**`workflow.state`**、`state.snapshot`。
+  `context.compacted`、`rag.retrieve/result`、**`workflow.state`**、**`permission.mode`**、`state.snapshot`。
 - `EventBus.emit` 同步分配全局 `seq`；`EventHub` 缓冲（3000 条 / 单条 64KB），
   订阅者队列满 → 丢最旧 + 标 `need_gap` → 前端收到 `stream.gap` 后走快照恢复。
 - **事件不落盘**；`task_history` 存的是消息级历史（append-only）。
@@ -558,34 +575,35 @@ React 19 + Vite 8 + TypeScript 6 + Tailwind 4，单一 `useReducer` store（`fea
 ## 13. 测试
 
 ```bash
-# 离线自检（不需要 API Key）—— 1512 项
-python -m backend.selfcheck_p1        #  55  契约层：事件/错误码/schema
+# 离线自检（不需要 API Key）—— 1502 项
+python -m backend.selfcheck_p1        #  56  契约层：事件/错误码/schema
 python -m backend.selfcheck_p2        #  45  模型层：候选轮换/错误分类
-python -m backend.selfcheck_agent     # 597  Agent 全链路：阶段/闸门/预算/审批/压缩/意图
-python -m backend.selfcheck_cli       #  67  CLI 渲染/审批/中文解码
+python -m backend.selfcheck_agent     # 599  Agent 全链路：阶段/闸门/预算/模式/压缩/意图
+python -m backend.selfcheck_cli       #  65  CLI 渲染/中文解码
 python -m backend.selfcheck_server    # 185  存储/Hub/运行时/调度/恢复
-python -m backend.selfcheck_sandbox   #  96  Docker 参数与控制流
-python -m backend.selfcheck_rag       # 109  索引/检索/集成/安全/闭环/混合
-python -m backend.selfcheck_mcp       #  63  MCP 连接/发现/注册/审批/超时/关闭
+python -m backend.selfcheck_sandbox   #  89  Docker 参数与控制流
+python -m backend.selfcheck_rag       # 110  索引/检索/集成/安全/闭环/混合
+python -m backend.selfcheck_mcp       #  58  MCP 连接/发现/注册/超时/关闭
 python -m backend.selfcheck_subtask   #  32  父子任务/迁移/上限/取消
-python -m backend.selfcheck_terminal  #  59  终端探测/真跑/越界/审批/双引擎
-python -m backend.selfcheck_workflow   #  41  工作流 DAG/并行/失败隔离/取消/恢复
-python -m backend.selfcheck_checkpoint #  58  Checkpoint 三执行点/落盘/恢复/裁剪
-python -m backend.selfcheck_spill      #  33  溢出存储/head-tail 策略/集成
+python -m backend.selfcheck_terminal  #  59  终端探测/真跑/越界/双引擎
+python -m backend.selfcheck_workflow   # 41  工作流 DAG/并行/失败隔离/取消/恢复
+python -m backend.selfcheck_checkpoint # 58  Checkpoint 三执行点/落盘/恢复/裁剪
+python -m backend.selfcheck_spill      # 33  溢出存储/head-tail 策略/集成
 python -m backend.selfcheck_edit_file_line # 28  行号锚定/模糊匹配
 python -m backend.selfcheck_spawn_parallel # 16  并行派生/聚合/上限
 python -m backend.selfcheck_pruner_replay  # 10  修剪 replay-safe
 python -m backend.selfcheck_orchestrator_equiv # 18  双引擎终态等价
 
 # 集成 / 真实环境（按需）
-python -m backend.server.test_live_e2e       #  51  真 HTTP/SSE/调度/审批（模型替身）
+python -m backend.server.test_live_e2e       #  56  真 HTTP/SSE/调度/模式（模型替身，5 场景）
 python -m backend.test_sandbox_docker        #  25  真实容器
 python -m backend.test_live_model            #   7  真实模型 7 场景（要 Key）
 
 cd frontend
-npm run test:events    # 34  事件契约：后端 EventType ↔ 前端清单 ↔ 样式
-npm run test:session   # 21  会话隔离 + 状态映射
+npm run test:events    # 39  事件契约：后端 EventType ↔ 前端清单 ↔ 样式
+npm run test:session   # 33  会话隔离 + 状态映射 + 权限模式
 npm run test:workspace # 26  路径规范化 / 分组
+npm run test:tasktree  # 32  子任务树构建
 npm run test:tasktree  # 32  任务树纯函数：建树/折叠/遍历/跨会话
 npx tsc -p tsconfig.app.json --noEmit
 ```

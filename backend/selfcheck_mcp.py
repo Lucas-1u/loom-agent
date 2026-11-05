@@ -42,7 +42,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from backend.agent.approval import ApprovalManager
+# 步骤 5：ApprovalManager 不再使用（审批已从 Agent 循环移除）
 from backend.agent.core import AgentConfig, AgentCore
 from backend.events import EventBus, collect
 from backend.mcp.client import McpManager
@@ -175,10 +175,11 @@ async def suite_connect(tmp: Path) -> tuple[McpManager, str, str]:
     check(isinstance(tool, McpTool), "注册进的是 Loom 的 Tool 子类")
     check(tool.source == {"kind": "mcp", "server": "demo", "tool": "echo"},
           f"★ 工具自带来源元数据（{tool.source}）")
-    check(tool.risk.value == "write" and tool.needs_approval,
-          "★ 默认风险 = write（未知风险工具必须审批）")
+    # 步骤 5：needs_approval 恒 False（审批移除），只验风险等级与只读标记
+    check(tool.risk.value == "write",
+          "★ 默认风险 = write（未知风险工具按写处理）")
     read_tool = reg.get("mcp__demo__read_note")
-    check(read_tool.risk.value == "read" and not read_tool.needs_approval,
+    check(read_tool.risk.value == "read",
           "配置里 read_tools 指定的工具按只读处理")
     check(tool.parameters.get("type") == "object" and "text" in tool.parameters.get("properties", {}),
           "inputSchema 原样保留（含 properties）")
@@ -236,74 +237,42 @@ async def suite_connect(tmp: Path) -> tuple[McpManager, str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# [H] 审批（可证伪：数 Server 侧调用次数）
+# [H] 步骤 5：审批已移除，MCP 工具直接执行
 # --------------------------------------------------------------------------- #
-async def _run_agent(reg: ToolRegistry, script: list, *, engine: str = "legacy",
-                     decision: str = "") -> tuple[Any, list, ApprovalManager]:
+async def _run_agent(reg: ToolRegistry, script: list, *, engine: str = "legacy") -> tuple[Any, list]:
     bus = EventBus()
     evs = collect(bus)
-    approvals = ApprovalManager(timeout_s=5)
     core = AgentCore(
         FakeAdapter(script), reg,
         config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
-                           use_reflect_phase=False, orchestrator=engine,
-                           approval_timeout_s=5),
-        bus=bus, approvals=approvals,
+                           use_reflect_phase=False, orchestrator=engine),
+        bus=bus,
     )
 
-    async def decide() -> None:
-        for _ in range(500):
-            await asyncio.sleep(0.02)
-            aid = core.approvals.current()
-            if aid:
-                if decision == "approve":
-                    core.approvals.approve(aid, "测试批准")
-                else:
-                    core.approvals.reject(aid, "测试拒绝")
-                return
-
-    task = asyncio.create_task(decide())
     st = await core.run("用 MCP 工具回显一句话", workspace=tempfile.mkdtemp())
-    task.cancel()
     await bus.drain()
-    return st, evs, approvals
+    return st, evs
 
 
 async def suite_approval(mgr: McpManager, counter: str, tmp: Path) -> None:
-    print("\n[H] 审批：拒绝=零执行，批准=一次执行")
+    print("\n[H] 步骤 5：审批已移除，MCP 工具直接执行")
 
-    # ---- 拒绝 ----
+    # ---- 直接执行（不再有批准/拒绝分支）----
     reg = ToolRegistry()
     register_mcp_tools(reg, mgr)
     before = _lines(counter).count("echo")
-    st, evs, _ = await _run_agent(reg, [
+    st, evs = await _run_agent(reg, [
         ModelReply(tool_calls=[tc("m1", "mcp__demo__echo", {"text": "x"})]),
-        ModelReply(content="工具没有执行。"),
-    ], decision="reject")
+        ModelReply(content="工具已经执行。"),
+    ])
     after = _lines(counter).count("echo")
-    check(after == before, f"★ 拒绝后 Server 侧零调用（{before}→{after}）")
-    check(any(str(e.type) == "approval.request" for e in evs), "发出了 approval.request")
-    check(any(str(e.type) == "approval.decision" for e in evs), "发出了审批决策")
-    req = next(e for e in evs if str(e.type) == "approval.request")
-    check(req.data.get("tool") == "mcp__demo__echo", "审批关联到正确的工具")
-    check("demo" in json.dumps(req.data, ensure_ascii=False), "★ 审批载荷里能看到 Server 来源")
-
-    # ---- 批准 ----
-    reg2 = ToolRegistry()
-    register_mcp_tools(reg2, mgr)
-    before2 = _lines(counter).count("echo")
-    st2, evs2, _ = await _run_agent(reg2, [
-        ModelReply(tool_calls=[tc("m2", "mcp__demo__echo", {"text": "y"})]),
-        ModelReply(content="已经用 MCP 回显了。"),
-    ], decision="approve")
-    after2 = _lines(counter).count("echo")
-    check(after2 == before2 + 1, f"★ 批准后 Server 恰好执行 1 次（{before2}→{after2}）")
-    check(st2.tool_events and st2.tool_events[0].ok, "工具结果 ok=True 回传 Agent")
-    check(any(str(e.type) == "tool.result" and e.data.get("ok") for e in evs2),
-          "发出 tool.result(ok=True)")
+    check(after == before + 1, f"★★ 无审批直接执行，Server 恰好调用 1 次（{before}→{after}）")
+    check(not any(str(e.type) == "approval.request" for e in evs),
+          "★★ 步骤 5：不再发出 approval.request")
+    check(st.tool_events and st.tool_events[0].ok, "工具结果 ok=True 回传 Agent")
 
     print("\n[I] 事件来源元数据")
-    call_ev = next((e for e in evs2 if str(e.type) == "tool.call"), None)
+    call_ev = next((e for e in evs if str(e.type) == "tool.call"), None)
     check(call_ev is not None, "发出 tool.call")
     if call_ev:
         src = call_ev.data.get("source") or {}
@@ -313,10 +282,10 @@ async def suite_approval(mgr: McpManager, counter: str, tmp: Path) -> None:
     print("\n[K] Graph 与 Legacy 一致")
     reg3 = ToolRegistry()
     register_mcp_tools(reg3, mgr)
-    st3, evs3, _ = await _run_agent(reg3, [
+    st3, evs3 = await _run_agent(reg3, [
         ModelReply(tool_calls=[tc("g1", "mcp__demo__echo", {"text": "g"})]),
         ModelReply(content="graph 也调用了 MCP。"),
-    ], engine="graph", decision="approve")
+    ], engine="graph")
     check(st3.engine == "graph", "引擎标注 graph")
     check(st3.tool_events and st3.tool_events[0].ok, f"graph 下 MCP 调用成功（{st3.status.value}）")
     check(any(str(e.type) == "tool.call" and (e.data.get("source") or {}).get("server") == "demo"

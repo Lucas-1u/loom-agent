@@ -65,6 +65,9 @@ class CreateTaskBody(BaseModel):
     # forbidden 里的路径会在 Policy 层直接拦下；allowed 只在事后审计里标记。
     allowed_paths: list[str] = Field(default_factory=list)
     forbidden_paths: list[str] = Field(default_factory=list)
+    # 步骤 6：权限模式（read-only / workspace-write / full-access）
+    # 空 = 默认 workspace-write；非法值在 core.run 里抛 ValueError → 任务 failed
+    mode: str = ""
 
 
 class ApprovalBody(BaseModel):
@@ -335,6 +338,7 @@ def create_app(
             idem_key=key,
             allowed_paths=body.allowed_paths or None,
             forbidden_paths=body.forbidden_paths or None,
+            mode=body.mode,
         )
         return snap
 

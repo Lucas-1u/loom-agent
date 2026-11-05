@@ -66,7 +66,7 @@ SCENARIO_TIMEOUT = 90.0
 #   事件一缺就少记一条，总项数在 50 / 49 / 16 之间跳 ——
 #   同一套代码，"通过率"却能变，等于没法横向比较。
 # 现在每个场景跑完都核对条数，少一条就补一条失败并写明原因。
-EXPECTED_COUNTS = {"s1": 12, "s2": 12, "s3": 18, "s4": 9}
+EXPECTED_COUNTS = {"s1": 17, "s2": 12, "s3": 11, "s4": 9, "s5": 7}
 
 _UNSET = object()
 
@@ -161,11 +161,15 @@ class LiveServer:
     async def start(self, adapter: RoutingAdapter, *, max_global: int = 4) -> None:
         await self.store.init()
         self.adapter = adapter
+        # ★ 步骤 7：与生产入口保持一致 —— 必须同时给只读视图，
+        #   否则 read-only 任务拿到的还是完整注册表（enforced 会是 false）。
+        full_registry = build_default_registry()
         self.scheduler = TaskScheduler(
             store=self.store,
             hub=self.hub,
             adapter=adapter,
-            registry=build_default_registry(),
+            registry=full_registry,
+            readonly_registry=full_registry.readonly_view(),
             config=AgentConfig(
                 max_turns=8,
                 max_seconds=60,
@@ -388,12 +392,14 @@ def build_adapter() -> RoutingAdapter:
       GO-READ-BETA       → 只读任务 B（用来做并发不串流）
       GO-WRITE-*         → 写文件（触发审批）
       GO-SLOW-*          → 慢任务（用来测取消）
+      GO-READONLY-*      → 试着写文件（read-only 模式下应被拦住）
     """
     return RoutingAdapter(
         {
             "GO-READ-ALPHA": read_script(),
             "GO-READ-BETA": read_script(),
             "GO-WRITE": write_script("e2e_out.txt", "hello-from-e2e"),
+            "GO-READONLY": write_script("e2e_ro_blocked.txt", "should-not-exist"),
             "GO-SLOW": slow_script(),
         },
         default=[ModelReply(content="（默认剧本）完成。")],
@@ -422,6 +428,13 @@ async def scenario_sse_realtime(srv: LiveServer) -> None:
             got_start = await sse.wait_event(lambda e: e["task_id"] == tid and e["event"]["type"] == "task.start")
             check(got_start is not None, "★ 流上收到 task.start（不是查询来的）")
 
+            # 步骤 6：权限模式事件（任务开始即广播）
+            got_mode = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "permission.mode")
+            check(got_mode is not None, "★ 流上收到 permission.mode（步骤 6）")
+            check(ev_field(got_mode, "mode") == "workspace-write",
+                  "默认模式 workspace-write", actual=ev_field(got_mode, "mode"))
+
             got_call = await sse.wait_event(
                 lambda e: e["task_id"] == tid and e["event"]["type"] == "tool.call")
             check(got_call is not None, "★ 流上收到 tool.call")
@@ -447,6 +460,19 @@ async def scenario_sse_realtime(srv: LiveServer) -> None:
             check(all(e["task_id"] == tid for e in sse.of_task(tid)), "事件都归属这个 task")
             check(all(e["session_id"] == sess["session_id"] for e in sse.of_task(tid)),
                   "事件都带对的 session_id")
+
+            # ---- 步骤 6：API 显式传 mode 必须真的落地（这条链最可能静默断掉）----
+            snap2 = await post(client, "/api/tasks",
+                               {"goal": "GO-READ-BETA 再看目录", "session_id": sess["session_id"],
+                                "workspace": srv.workspace, "mode": "read-only"})
+            tid2 = snap2["task_id"]
+            got_mode2 = await sse.wait_event(
+                lambda e: e["task_id"] == tid2 and e["event"]["type"] == "permission.mode")
+            check(got_mode2 is not None, "★★ API 传 mode 后流上收到 permission.mode")
+            check(ev_field(got_mode2, "mode") == "read-only",
+                  "显式模式落地 read-only", actual=ev_field(got_mode2, "mode"))
+            check(ev_field(got_mode2, "source") == "api",
+                  "来源标记 api（不是 default）", actual=ev_field(got_mode2, "source"))
 
 
 # --------------------------------------------------------------------------- #
@@ -512,10 +538,10 @@ async def scenario_concurrent_isolation(srv: LiveServer) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 场景 3：write_file 审批 → 磁盘文件真的生成
+# 场景 3：write_file 直接执行 → 磁盘文件真的生成（步骤 5：审批已移除）
 # --------------------------------------------------------------------------- #
 async def scenario_write_approval(srv: LiveServer) -> None:
-    print("\n[S3] write_file 审批端到端（批准 → 工具执行 → 文件落盘）")
+    print("\n[S3] write_file 端到端（步骤 5：无审批 → 工具执行 → 文件落盘）")
 
     target = Path(srv.workspace) / "e2e_out.txt"
     if target.exists():
@@ -529,44 +555,7 @@ async def scenario_write_approval(srv: LiveServer) -> None:
                                "workspace": srv.workspace})
             tid = snap["task_id"]
 
-            # ---- 等审批请求（真事件，不是查出来的）----
-            req = await sse.wait_event(
-                lambda e: e["task_id"] == tid and e["event"]["type"] == "approval.request")
-            check(req is not None, "★★ 流上收到 approval.request")
-
-            # ★ 即使没收到 request 也继续走完 —— 用空 data 兜底。
-            #   以前这里是 `if req is None: 补 16 条 + return`，靠人工数条数；
-            #   现在每条断言都无条件执行，条数由 EXPECTED_COUNTS 兜底。
-            data: dict = (req["event"]["data"] if req else {}) or {}
-            approval_id = str(data.get("approval_id") or "")
-
-            check(data.get("tool") == "write_file", "审批的工具是 write_file", actual=data.get("tool"))
-            check(data.get("risk") == "write", "风险等级 write", actual=data.get("risk"))
-            check("e2e_out.txt" in str(data.get("target", "")), "目标含文件名", actual=data.get("target"))
-            check(bool(data.get("impact")), "带影响说明")
-
-            # 审批期间：任务状态是 awaiting_approval
-            mid = await get(client, f"/api/tasks/{tid}")
-            check(mid["status"] in ("awaiting_approval", "running"),
-                  "审批期间状态合理", actual=mid["status"])
-
-            # ---- 批准 ----
-            r = None
-            if approval_id:
-                r = await client.post(f"/api/approvals/{approval_id}/decision",
-                                      json={"task_id": tid, "decision": "approved", "reason": ""},
-                                      timeout=20)
-            check(r is not None and r.status_code == 200,
-                  "批准返回 200",
-                  actual=(r.status_code if r is not None else "未提交（没拿到 approval_id）"))
-
-            # ---- 断言审批决策事件 + 工具执行 + 终态 ----
-            dec = await sse.wait_event(
-                lambda e: e["task_id"] == tid and e["event"]["type"] == "approval.decision")
-            check(dec is not None, "★★ 流上收到 approval.decision")
-            check(ev_field(dec, "approved") is True, "决策是 approved",
-                  actual=ev_field(dec, "approved"))
-
+            # ---- 断言：工具执行成功 ----
             result = await sse.wait_event(
                 lambda e: e["task_id"] == tid and e["event"]["type"] == "tool.result")
             check(result is not None, "★★ 流上收到 tool.result")
@@ -585,44 +574,39 @@ async def scenario_write_approval(srv: LiveServer) -> None:
                     None, lambda: target.read_text(encoding="utf-8"))
             check(content == "hello-from-e2e", "内容正确", actual=content[:40])
 
-            # ---- 事件顺序 ----
-            # ---- 逻辑顺序：按 seq 排（这是 core 的权威顺序）----
-            # ★ 为什么不用投递顺序？
-            #   SSE 的到达顺序会被服务端落盘 await 打乱（见阶段①报告问题 #8），
-            #   而前端 `APPEND_EVENT` 本来就按 seq 排序，所以 **seq 才对**。
+            # ---- 步骤 5：不应出现任何审批事件 ----
             by_seq = sorted(sse.of_task(tid), key=lambda e: e["event"]["seq"])
             seq_types = [e["event"]["type"] for e in by_seq]
             seq_nums = [e["event"]["seq"] for e in by_seq]
+            check("approval.request" not in seq_types,
+                  "★★ 步骤 5：流上没有 approval.request")
+            check("approval.decision" not in seq_types,
+                  "★★ 步骤 5：流上没有 approval.decision")
 
-            i_req = seq_types.index("approval.request") if "approval.request" in seq_types else -1
-            i_dec = seq_types.index("approval.decision") if "approval.decision" in seq_types else -1
-            i_res = next((i for i, x in enumerate(seq_types)
-                          if x == "tool.result" and i > i_dec), -1)
-
-            check(i_req >= 0 and i_dec > i_req and i_res > i_dec,
-                  f"★★ 逻辑顺序（按 seq）request({i_req}) → decision({i_dec}) → tool.result({i_res})")
+            # ---- 事件顺序：tool.call → tool.result → task.end ----
+            i_call = seq_types.index("tool.call") if "tool.call" in seq_types else -1
+            i_res = seq_types.index("tool.result") if "tool.result" in seq_types else -1
+            i_end = seq_types.index("task.end") if "task.end" in seq_types else -1
+            check(i_call >= 0 and i_res > i_call and i_end > i_res,
+                  f"★★ 逻辑顺序（按 seq）tool.call({i_call}) → tool.result({i_res}) → task.end({i_end})")
 
             # ★ 事件没丢的判据：seq 必须连续（1..N 无缺口）
             check(seq_nums == list(range(1, len(seq_nums) + 1)),
                   f"★★ seq 连续无缺口（{len(seq_nums)} 条：{[s for s in seq_nums]}）")
 
             # ★ 到达顺序 = seq 顺序。
-            #   以前 `_on_event` 先 await 落盘再 broadcast，落盘耗时会把到达顺序
-            #   打乱（实测 [1..5,7,8,9,10,6]）。现在广播在前、落盘在后，
-            #   这条从"诊断打印"升级成硬断言。
             deliver_order = [e["event"]["seq"] for e in sse.of_task(tid)]
             check(deliver_order == sorted(deliver_order),
                   "★★ 投递顺序与 seq 一致（没有被落盘 await 打乱）",
                   actual=deliver_order)
 
-            # ---- 二次决策必须失败（一次性消费）----
-            code: object = "未提交（没拿到 approval_id）"
-            if approval_id:
-                r2 = await client.post(f"/api/approvals/{approval_id}/decision",
-                                       json={"task_id": tid, "decision": "approved", "reason": ""},
-                                       timeout=20)
-                code = r2.status_code
-            check(code == 409, "★★ 重复决策被拒", actual=code)
+            # ---- 对不存在的审批 id 决策 → 400（不再有等待中的审批）----
+            r2 = await client.post("/api/approvals/apr_nonexistent/decision",
+                                   json={"task_id": tid, "decision": "approved", "reason": ""},
+                                   timeout=20)
+            check(r2.status_code in (400, 404, 409),
+                  "★★ 步骤 5：对任意审批 id 决策被拒（审批已移除）",
+                  actual=r2.status_code)
 
 
 # --------------------------------------------------------------------------- #
@@ -669,6 +653,48 @@ async def scenario_cancel(srv: LiveServer) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 场景 5：read-only 模式真的没有写工具（步骤 7）
+# --------------------------------------------------------------------------- #
+async def scenario_readonly_enforced(srv: LiveServer) -> None:
+    print("\n[S5] read-only 模式：写工具未注册 → 写入被真实拦住")
+
+    target = Path(srv.workspace) / "e2e_ro_blocked.txt"
+    if target.exists():
+        target.unlink()
+
+    async with httpx.AsyncClient(base_url=srv.base) as client:
+        async with SSECollector(srv.base) as sse:
+            sess = await post(client, "/api/sessions", {"title": "S5", "workspace": srv.workspace})
+            snap = await post(client, "/api/tasks",
+                              {"goal": "GO-READONLY 试着写一个文件", "session_id": sess["session_id"],
+                               "workspace": srv.workspace, "mode": "read-only"})
+            tid = snap["task_id"]
+
+            mode_ev = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "permission.mode")
+            check(mode_ev is not None, "★★ 流上收到 permission.mode")
+            check(ev_field(mode_ev, "mode") == "read-only",
+                  "模式是 read-only", actual=ev_field(mode_ev, "mode"))
+            # ★ 这条是步骤 7 的核心：服务端按任务切注册表后，enforced 必须为 True
+            check(ev_field(mode_ev, "enforced") is True,
+                  "★★ 步骤 7：服务端报告的 enforced = true（不再是'仅记录'）",
+                  actual=ev_field(mode_ev, "enforced"))
+
+            result = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "tool.result")
+            check(result is not None, "流上收到 tool.result")
+            check(ev_field(result, "ok") is False,
+                  "★★ 写入尝试失败（write_file 未注册）", actual=ev_field(result, "ok"))
+
+            end = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "task.end")
+            check(end is not None, "任务结束")
+
+            exists = await asyncio.get_event_loop().run_in_executor(None, target.exists)
+            check(not exists, f"★★ 磁盘上没有生成 {target.name}（不是静默成功）")
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 SCENARIOS: dict[str, Callable[[LiveServer], Any]] = {
@@ -676,6 +702,7 @@ SCENARIOS: dict[str, Callable[[LiveServer], Any]] = {
     "s2": scenario_concurrent_isolation,
     "s3": scenario_write_approval,
     "s4": scenario_cancel,
+    "s5": scenario_readonly_enforced,
 }
 
 

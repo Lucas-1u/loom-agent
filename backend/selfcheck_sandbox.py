@@ -32,7 +32,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from backend.agent.approval import args_fingerprint, build_pending
+# 步骤 5：args_fingerprint / build_pending 已不再需要（审批移除）
 from backend.agent.policy import Policy, make_context
 from backend.agent.state import RiskLevel, TaskState
 from backend.config import SandboxConfig
@@ -171,7 +171,7 @@ async def test_args(ws: str) -> None:
 
     docker = FakeDocker(FakeProc(code=0))
     tool, mgr = build_tool(docker)
-    ctx = make_context(TaskState(goal="g", workspace=ws), authorized=True)
+    ctx = make_context(TaskState(goal="g", workspace=ws))
 
     for bad, why in [
         ({}, "缺 command"),
@@ -209,10 +209,12 @@ async def test_args(ws: str) -> None:
     # ---- 未授权：必须在碰 docker 之前就拒绝 ----
     docker2 = FakeDocker(FakeProc(code=0))
     tool2, _ = build_tool(docker2)
-    ctx_unauthed = make_context(TaskState(goal="g", workspace=ws), authorized=False)
+    ctx_unauthed = make_context(TaskState(goal="g", workspace=ws))
     r = await tool2.run({"command": "python", "args": ["-V"]}, ctx_unauthed)
-    check(not r.ok and r.error["kind"] == "permission_denied", "★ 未授权直接拒绝")
-    check(not docker2.spawned and not docker2.calls, "★★ 未授权时没有碰 docker", docker2.calls)
+    # 步骤 5：authorized 闸门已删，run_command 不再检查授权。
+    # 这条断言改为验证「命令能正常执行」（docker 被调用）。
+    check(r.ok, "★ 步骤 5：授权闸门已删，命令直接执行")
+    check(docker2.spawned, "★★ 步骤 5：未授权时也执行（审批已移除）", docker2.calls)
 
     # ---- 超时钳制 ----
     captured: dict[str, Any] = {}
@@ -309,7 +311,7 @@ def test_argv(ws: str) -> None:
 async def test_run_flow(ws: str) -> None:
     print("\n[S3] 执行控制流：正常 / 非零 / 超时 / 取消 / 输出截断")
 
-    ctx = make_context(TaskState(goal="g", workspace=ws, task_id="task_abc12345"), authorized=True)
+    ctx = make_context(TaskState(goal="g", workspace=ws, task_id="task_abc12345"))
 
     # ---- 正常 ----
     docker = FakeDocker(FakeProc(stdout=b"2\n", code=0))
@@ -348,7 +350,7 @@ async def test_run_flow(ws: str) -> None:
     tool, mgr = build_tool(docker)
     cancel = asyncio.Event()
     ctx2 = make_context(TaskState(goal="g", workspace=ws, task_id="task_cancel01"),
-                        authorized=True, cancel_event=cancel)
+                        cancel_event=cancel)
 
     async def _trigger():
         await asyncio.sleep(0.05)
@@ -379,7 +381,7 @@ async def test_run_flow(ws: str) -> None:
     idle = asyncio.Event()          # 永不 set
     ctx_idle = make_context(
         TaskState(goal="g", workspace=ws, task_id="task_ok01"),
-        authorized=True, cancel_event=idle,
+        cancel_event=idle,
     )
     r = await tool_idle.run({"command": "python", "args": ["-c", "print(1)"]}, ctx_idle)
     check(r.ok and r.data["exit_code"] == 0 and r.data["cancelled"] is False,
@@ -400,7 +402,7 @@ async def test_run_flow(ws: str) -> None:
 async def test_no_docker(ws: str) -> None:
     print("\n[S4] Docker / 镜像不可用")
 
-    ctx = make_context(TaskState(goal="g", workspace=ws), authorized=True)
+    ctx = make_context(TaskState(goal="g", workspace=ws))
 
     docker = FakeDocker(version_ok=False)
     tool, _mgr = build_tool(docker)
@@ -442,7 +444,7 @@ async def test_no_docker(ws: str) -> None:
 # [S5] Policy / 审批 / 审批后参数变化
 # --------------------------------------------------------------------------- #
 async def test_policy(ws: str) -> None:
-    print("\n[S5] Policy 审批 / TOCTOU")
+    print("\n[S5] Policy（步骤 5：审批已移除，验证直接放行与只读子集）")
 
     reg = ToolRegistry()
     tool, _mgr = build_tool(FakeDocker())
@@ -454,28 +456,9 @@ async def test_policy(ws: str) -> None:
 
     args = {"command": "python", "args": ["-m", "pytest", "-q"], "cwd": "tests"}
     d = policy.check("run_command", args, state, ctx)
-    check(d.needs_approval is True, "★★ run_command 必须审批（不能被自动放行）")
-    check(d.meta.get("risk") == "exec", f"审批风险等级 exec（{d.meta.get('risk')}）")
-    check("pytest" in d.meta.get("target", ""), f"审批目标里是真实命令（{d.meta.get('target')}）")
-    check("不会" in d.meta.get("impact", ""), "审批影响说明写明不放宽隔离")
-
-    # ---- 审批后参数被换掉 → 拒绝 ----
-    pending = build_pending(
-        tool="run_command", args=args, risk=RiskLevel.EXEC,
-        action=d.meta["action"], target=d.meta["target"], impact=d.meta["impact"],
-    )
-    changed = {"command": "python", "args": ["-m", "pytest", "--maxfail=1"], "cwd": "tests"}
-    d2 = policy.recheck_after_approval("run_command", changed, state, ctx, pending)
-    check(not d2.allow, "★★ 审批后参数变化 → 拒绝执行")
-    check("参数" in d2.result.summary, f"提示说明参数变了（{d2.result.summary}）")
-
-    # ---- 参数没变 → 放行 ----
-    d3 = policy.recheck_after_approval("run_command", args, state, ctx, pending)
-    check(d3.allow, "参数一致 → 复检通过")
-    check(args_fingerprint("run_command", args) == pending.args_hash, "指纹同口径")
-
-    # ---- 拒绝之后不能偷偷执行 ----
-    check(policy.check("run_command", args, state, ctx, already_approved="").needs_approval, "无审批凭据仍需审批")
+    # 步骤 5：审批已删，命令直接放行
+    check(d.allow, "★★ 步骤 5：run_command 直接放行（审批已移除）")
+    check(d.reason and "直接放行" in d.reason, f"放行理由明确（{d.reason}）")
 
     # ---- 只读模式必须卸载 run_command ----
     reg_all = build_default_registry(include_mutating=False)
@@ -534,29 +517,19 @@ async def test_agent_flow(ws: str) -> None:
     core = AgentCore(
         FakeAdapter(script),
         reg,
-        config=AgentConfig(max_turns=4, max_seconds=20, approval_timeout_s=5, min_evidence=0),
+        config=AgentConfig(max_turns=4, max_seconds=20, min_evidence=0),
         bus=bus,
     )
-    task = asyncio.create_task(core.run("跑测试", workspace=ws))
-    approved = False
-    for _ in range(500):
-        ids = core.approvals.waiting_ids
-        if ids:
-            approved = core.approvals.approve(ids[0], "同意")
-            break
-        if task.done():
-            break
-        await asyncio.sleep(0.01)
-
-    # ★ core.run() 内部会自己造 TaskState，所以要接住它的返回值
-    state = await asyncio.wait_for(task, timeout=20)
+    # 步骤 5：审批已移除，直接跑（不再停下来等批准）
+    state = await asyncio.wait_for(core.run("跑测试", workspace=ws), timeout=20)
     await asyncio.sleep(0.05)
 
-    check(approved, "★★ Agent 确实停下来等审批了（不是直接执行）")
+    check(not any(e.type == "approval.request" for e in results_ev),
+          "★★ 步骤 5：不再进入审批（直接执行）")
 
     tool_results = [e for e in results_ev if e.type == "tool.result"]
     check(tool_results and tool_results[-1].data.get("ok") is False,
-          "★★ 审批通过后仍然被沙箱拦下（ok=False）")
+          "★★ 沙箱不可用 → 工具返回 ok=False（不伪造成功）")
     check(tool_results and tool_results[-1].data.get("error", {}).get("kind") == "sandbox_unavailable",
           "★★ 错误类型是 sandbox_unavailable",
           tool_results[-1].data.get("error", {}).get("kind") if tool_results else None)

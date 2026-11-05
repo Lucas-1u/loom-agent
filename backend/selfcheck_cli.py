@@ -168,7 +168,7 @@ async def main() -> int:
     check("deadbeefcafe1234" in t4, "指纹展示（便于核对）")
 
     # ================================================================== #
-    print("\n[3] CLIApprover 自动批准驱动挂起-恢复")
+    print("\n[3] 步骤 5：审批已移除，写工具直接执行（不再挂起）")
     bus5 = EventBus()
     adapter5 = FakeAdapter(
         [
@@ -178,41 +178,18 @@ async def main() -> int:
         ]
     )
     core5 = AgentCore(adapter5, build_default_registry(), config=AgentConfig(max_turns=6, min_evidence=0), bus=bus5)
-    approver5 = CLIApprover(core5.approvals, auto="approve", color=False)
-    bus5.subscribe(approver5.on_event)
-
-    attend = asyncio.create_task(approver5.attend())
+    ev5 = collect(bus5)
     st5 = await core5.run("创建 out.py", workspace=ws)
-    attend.cancel()
     await bus5.drain()
 
-    check(approver5.count_approved == 1, f"★ 自动批准生效（批准 {approver5.count_approved} 次）")
-    check(os.path.isfile(os.path.join(ws, "out.py")), "★ 文件真的被写入")
+    check(not hasattr(core5, "approvals"), "★ AgentCore 不再持有 ApprovalManager")
+    check(
+        not any(e.type == "approval.request" for e in ev5),
+        "★★ 步骤 5：不再发出 approval.request",
+    )
+    check(os.path.isfile(os.path.join(ws, "out.py")), "★★ 无审批直接写盘")
     with open(os.path.join(ws, "out.py"), encoding="utf-8") as f:
         check(f.read() == "RESULT = 42\n", "内容正确")
-
-    # ================================================================== #
-    print("\n[4] CLIApprover 自动拒绝")
-    bus6 = EventBus()
-    adapter6 = FakeAdapter(
-        [
-            ModelReply(content='{"steps":[{"title":"写文件","detail":"创建 no.py"}],"note":""}'),
-            ModelReply(tool_calls=[tc("c1", "write_file", {"path": "no.py", "content": "x\n"})]),
-            ModelReply(content="好的，我不写了。"),
-        ]
-    )
-    core6 = AgentCore(adapter6, build_default_registry(), config=AgentConfig(max_turns=6, min_evidence=0), bus=bus6)
-    approver6 = CLIApprover(core6.approvals, auto="reject", color=False)
-    bus6.subscribe(approver6.on_event)
-
-    attend6 = asyncio.create_task(approver6.attend())
-    st6 = await core6.run("创建 no.py", workspace=ws)
-    attend6.cancel()
-    await bus6.drain()
-
-    check(approver6.count_rejected == 1, f"★ 自动拒绝生效（拒绝 {approver6.count_rejected} 次）")
-    check(not os.path.exists(os.path.join(ws, "no.py")), "★ 拒绝后文件未被创建")
-    check(st6.status.value == "done", "拒绝后 Agent 仍正常收敛")
 
     # ================================================================== #
     print("\n[5] 只读模式真的卸载了写工具")

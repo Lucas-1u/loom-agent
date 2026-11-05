@@ -37,7 +37,12 @@ Loom Agent v0.1 · 审批管理器（人机协作的挂起 / 恢复）
    同一个 approval_id 只能被决策一次。防止重放攻击 / 前端 bug 导致重复 set_result。
 
 ③ **args_hash 指纹**：防止「批准 A，执行 B」
-   发起审批时算一次，执行前再算一次。见 policy.recheck_after_approval。
+   发起审批时算一次，执行前再算一次（原本由 policy.recheck_after_approval 比对）。
+
+   ★ 步骤 5 变更：审批已从 Agent 循环移除，Policy 不再调用本模块。
+     本模块（含 args_hash / pop 一次性消费）作为**独立能力**保留：
+     事件类型、API 端点、前端卡片都还在，只是不再被 AgentCore 触发。
+     若将来恢复审批，指纹机制可直接复用。
 
 ④ **路由**：resolve 返回 bool，让调用方知道「这个 id 是否有效」
    CLI 打错 id、或 id 已超时被清理，都能得到明确的 false 而不是静默成功。

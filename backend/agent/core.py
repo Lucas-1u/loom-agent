@@ -79,7 +79,7 @@ from ..models.adapter import Message, ModelAdapter, ModelError, ToolCall
 from ..tools.base import ErrorKind, ToolContext, ToolResult
 from ..tools.path_safety import normalize_root
 from ..tools.registry import ToolRegistry, execute
-from .approval import ApprovalManager, Decision, args_fingerprint, build_pending, make_record
+from .approval import args_fingerprint  # noqa: F401  # 保留导出：历史代码/测试可能引用
 from .context import ContextBuilder, TurnBuilder, phase_hint
 from .policy import Policy, make_context
 from .compaction import ContextCompactor, ContextStats, measure
@@ -89,14 +89,14 @@ from .history_log import (HistorySink, StoreHistorySink, dump_entries,
                           messages_to_entries)
 from .intent import (classify_intent, detect_risks, detect_scope_conflicts,
                      extract_scoped_allowed, extract_scoped_forbidden, grade_evidence,
-                     is_test_config_path)
+                     has_write_demand, is_test_config_path)
 from .scope import diff_tree, hits as _scope_hits, norm_rel as _scope_norm, scan_tree, within_allowed
 from .state import (
-    ApprovalStatus,
     Evidence,
     PlanStep,
     TaskState,
     TaskStatus,
+    normalize_session_mode,
 )
 
 log = logging.getLogger("loom.core")
@@ -352,8 +352,6 @@ class AgentCore:
         config: AgentConfig | None = None,
         history_sink: "HistorySink | None" = None,
         bus: EventBus | None = None,
-        approvals: ApprovalManager | None = None,
-        allowed_tools: set[str] | None = None,
         extra_rules: str = "",
         knowledge: "KnowledgeBase | None" = None,
         spawner: Any = None,
@@ -374,8 +372,7 @@ class AgentCore:
         self.registry = registry
         self.config = config or AgentConfig()
         self.bus = bus or EventBus()
-        self.approvals = approvals or ApprovalManager(timeout_s=self.config.approval_timeout_s)
-        self.policy = Policy(registry, allowed_tools=allowed_tools)
+        self.policy = Policy(registry)
         self.context = ContextBuilder()
         self.extra_rules = extra_rules
         # M1：历史落盘的抽象出口（runtime 传 StoreHistorySink；单测不传 → 不持久化）
@@ -431,8 +428,7 @@ class AgentCore:
         """请求取消当前任务（下一轮循环开始时生效）。"""
         if self._cancel_event is not None:
             self._cancel_event.set()
-        # 同时取消等待中的审批，避免它一直挂着
-        self.approvals.cancel_all("任务被取消")
+        # 步骤 5：审批已移除，不再需要 cancel_all。
 
     # ===================================================================== #
     # 主循环
@@ -446,6 +442,7 @@ class AgentCore:
         allowed_paths: list[str] | None = None,
         forbidden_paths: list[str] | None = None,
         task_id: str = "",
+        session_mode: str = "",
     ) -> TaskState:
         """
         跑一个完整任务，返回最终 TaskState。
@@ -455,6 +452,11 @@ class AgentCore:
         `allowed_paths` / `forbidden_paths`（第二批新增，相对工作区）：
           · 默认 `allowed=["."]`、`forbidden=[]` → 行为与之前完全一致
           · forbidden 会在 Policy 层**直接拦下**写入；allowed 只在事后审计里标记
+
+        `session_mode`（步骤 6）：read-only | workspace-write | full-access
+          · 空字符串 = 默认 workspace-write（与历史行为一致）
+          · 非法值 → 抛 ValueError（不静默降级，避免"以为只读实际能写"）
+          · ★ 模式是**环境配置**，不是 Policy 关卡（docs/22 §4.2）
 
         编排引擎由 <code>self.config.orchestrator</code> 决定（M1）：
           · graph（默认，M4.3 起）= LangGraph 引擎，节点与下列 AgentCore 阶段方法一一对应；
@@ -484,6 +486,14 @@ class AgentCore:
         state.engine = orch
         state.allowed_paths = list(allowed_paths) if allowed_paths else ["."]
         state.forbidden_paths = list(forbidden_paths) if forbidden_paths else []
+
+        # ---- 步骤 6：权限模式 -------------------------------------------
+        # ★ 非法值直接抛 ValueError（不静默降级）：模式决定沙箱强度，
+        #   用户写 "readonly"（少个连字符）却拿到 workspace-write，
+        #   是「以为自己在只读、实际能写」的危险错觉。宁可起任务时报错。
+        mode_raw = str(session_mode or "").strip()
+        state.session_mode = normalize_session_mode(mode_raw)
+        mode_source = "api" if mode_raw else "default"
 
         # ---- 第三批：任务意图与用户约束 -------------------------------
         # ★ 为什么在 run 开头就定：意图决定了后面每一步怎么验证
@@ -580,6 +590,32 @@ class AgentCore:
         #   没有这个基线，事后审计会把用户的改动算到 Agent 头上。
         state.baseline_files = await asyncio.to_thread(scan_tree, root)
         self.bus.task_start(state.goal, root, state.model)
+
+        # ---- 步骤 6：广播权限模式 ---------------------------------------
+        # ★ 模式是**环境配置**，不是 Policy 关卡（docs/22 §4.2）。
+        #   `enforced` 字段如实报告"这个模式在当前进程里是否真的生效"：
+        #   read-only 只有在写/执行工具都没注册时才算真生效；
+        #   注册表是全局一份、在 server 启动时构建，per-task 切换还没接（步骤 7）。
+        #   与其假装安全，不如把"记录但未强制"说出来。
+        write_tools = [
+            n for n in sorted(self.registry.names)
+            if (self.registry.get(n) is not None
+                and getattr(self.registry.get(n), "risk", None) is not None
+                and self.registry.get(n).risk.value != "read")
+        ]
+        enforced = state.session_mode != "read-only" or not write_tools
+        self.bus.permission_mode({
+            "mode": state.session_mode,
+            "source": mode_source,
+            "tools": len(self.registry.names),
+            "enforced": enforced,
+        })
+        if state.session_mode == "read-only" and write_tools:
+            log.warning(
+                "任务 %s 请求 read-only，但注册表里仍有 %d 个写/执行工具（%s）"
+                "—— 本步只记录模式，未强制；注册表切换随步骤 7 接入",
+                state.task_id, len(write_tools), ", ".join(write_tools[:5]),
+            )
         log.info("任务开始 %s：%s（工作区 %s，基线文件 %d 个）",
                  state.task_id, state.goal[:60], root, len(state.baseline_files))
 
@@ -1034,7 +1070,9 @@ class AgentCore:
         )
 
         # ---- 被拒绝 → 回灌错误 ------------------------------------------
-        if not decision.allow and not decision.needs_approval:
+        # ★ 步骤 5：审批已移除，decision 不再有 needs_approval。
+        #   拒绝就是拒绝，直接回灌。
+        if not decision.allow:
             res = decision.result or ToolResult.failure(
                 tc.name, ErrorKind.INTERNAL_ERROR, "策略拒绝但未给出原因"
             )
@@ -1057,23 +1095,7 @@ class AgentCore:
                 state.block_current_step(f"被禁止修改的路径挡住：{res.summary[:160]}")
             return res
 
-        # ---- 需要审批 ---------------------------------------------------
-        if decision.needs_approval:
-            granted = await self._approval_flow(state, tc, decision.meta)
-            if granted is None:
-                # 被拒绝 / 超时 → 构造失败结果回灌
-                return None
-            ctx = make_context(
-                state,
-                approval_id=granted,
-                authorized=True,
-                # ★ 长耗时工具（run_command）要能感知"用户点了停止"
-                cancel_event=self._cancel_event,
-            )
-            # ★ 批准后的路径会重建 ctx：能力（子任务 / 事件总线）必须一并带上，
-            #   否则"批准前能用、批准后就没了"——这类不一致极难排查。
-            ctx.spawner = self.spawner
-            ctx.bus = self.bus
+        # ---- 步骤 5：审批已移除，直接执行 --------------------------------
 
         # ---- 执行 -------------------------------------------------------
         # ★ M3：search_docs 的检索事件在这里发（工具的"开始/结束"与其它工具一致），
@@ -1157,126 +1179,6 @@ class AgentCore:
         self.bus.observe(tc.id, res.summary[:120], turn=state.turn)
 
         return res
-
-    # ===================================================================== #
-    # 审批流程
-    # ===================================================================== #
-    async def _approval_flow(
-        self,
-        state: TaskState,
-        tc: ToolCall,
-        meta: dict[str, Any],
-    ) -> str | None:
-        """
-        走一次完整审批。返回 approval_id（已批准）或 None（拒绝/超时）。
-
-        ★ 事件顺序（这个顺序很重要，前端按它渲染）：
-            approval.request  →  （Agent 挂起，用户思考）
-            approval.decision →  （恢复，继续执行）
-        """
-        from .state import RiskLevel as RL
-
-        risk_raw = str(meta.get("risk", "write"))
-        try:
-            risk = RL(risk_raw)
-        except ValueError:
-            risk = RL.WRITE
-
-        pending = build_pending(
-            tool=tc.name,
-            args=tc.arguments,
-            risk=risk,
-            action=str(meta.get("action", tc.name)),
-            target=str(meta.get("target", "")),
-            impact=str(meta.get("impact", "")),
-            preview=str(meta.get("preview", "")),
-            turn=state.turn,
-        )
-
-        state.pending_approval = pending
-        state.status = TaskStatus.AWAITING_APPROVAL
-
-        # ---- 请求（会挂起）----------------------------------------------
-        self.bus.emit(
-            Event.make(
-                EventType.APPROVAL_REQUEST,
-                pending.to_dict(),
-                task_id=state.task_id,
-                turn=state.turn,
-            )
-        )
-
-        decision: Decision = await self.approvals.request(pending)
-
-        # ---- 恢复 -------------------------------------------------------
-        state.pending_approval = None
-        state.status = TaskStatus.RUNNING
-        state.approval_history.append(make_record(pending, decision))
-
-        if decision.status is ApprovalStatus.EXPIRED:
-            self.bus.emit(
-                Event.make(
-                    EventType.APPROVAL_EXPIRED,
-                    decision.to_dict(),
-                    task_id=state.task_id,
-                    turn=state.turn,
-                )
-            )
-        else:
-            self.bus.emit(
-                Event.make(
-                    EventType.APPROVAL_DECISION,
-                    decision.to_dict(),
-                    task_id=state.task_id,
-                    turn=state.turn,
-                )
-            )
-
-        if not decision.approved:
-            # ---- 拒绝 → 回灌，让模型知道被拒 ---------------------------
-            reason_text = (
-                "用户拒绝了这次操作（等待超时）。"
-                if decision.status is ApprovalStatus.EXPIRED
-                else "用户拒绝了这次操作。"
-            )
-            res = ToolResult.failure(
-                tc.name,
-                ErrorKind.PERMISSION_DENIED,
-                reason_text + (f" 用户说明：{decision.reason}" if decision.reason else ""),
-                hint=(
-                    "不要重复发起同样的请求。请向用户说明你的意图，"
-                    "询问期望的做法，或改用只读方式完成能完成的部分。"
-                ),
-            )
-            state.record_tool_call(
-                tc.id, tc.name, tc.arguments,
-                ok=False, summary=res.summary, error_kind="approval_rejected",
-            )
-            self.bus.tool_result(
-                tc.id, tc.name, False, res.summary,
-                error=res.error, turn=state.turn,
-            )
-            return None
-
-        # ---- 批准 → 执行前复检（TOCTOU）--------------------------------
-        ctx = make_context(state)
-        ctx.spawner = self.spawner
-        ctx.bus = self.bus
-        recheck = self.policy.recheck_after_approval(tc.name, tc.arguments, state, ctx, pending)
-        if not recheck.allow:
-            res = recheck.result or ToolResult.failure(
-                tc.name, ErrorKind.PERMISSION_DENIED, "审批后复检未通过"
-            )
-            state.record_tool_call(
-                tc.id, tc.name, tc.arguments,
-                ok=False, summary=res.summary, error_kind="recheck_failed",
-            )
-            self.bus.tool_result(
-                tc.id, tc.name, False, res.summary, error=res.error, turn=state.turn
-            )
-            return None
-
-        return pending.approval_id
 
     # ===================================================================== #
     # REFLECT 阶段
@@ -2525,6 +2427,36 @@ class AgentCore:
                     "（例如测试命令与退出码），并在答复里说明为什么不需要改动。"
                 )
             return "fail", detail
+
+        # ---- ②c 明确诉求 + 零改动 + 零命令 = 没干活（步骤 8 灰度发现的缺口）----
+        # ★ 真实事故：用户要求「创建 hello.py 并运行验证」，模型只 list_files
+        #   就收尾，零改动、零命令，终态却是 done —— 用户要的交付物一件没有。
+        #   ②b 只覆盖 intent=repair，创建类诉求完全漏掉。
+        # ★ 为什么不机械要求"必须改文件"：如果任务本来就不需要动手
+        #   （文件已存在且符合要求、或用户要的产物已具备），
+        #   跑一条命令给证据即可 —— 命令一旦存在就不走这条分支。
+        # ★ 只读约束下不拦：用户明说"只读/不要改"时，write-demand 已在
+        #   has_write_demand 里被否定从句剥掉；这里再加一道约束兜底。
+        if (not state.change_records
+                and not state.command_history
+                and not state.constraints.get("read_only")):
+            demand, verb = has_write_demand(state.goal)
+            if demand:
+                detail = (
+                    f"用户要求「{verb}」，但既没有文件改动，也没有任何命令 —— 没有产生交付物。"
+                )
+                if state.verification_retries < self.config.max_verification_retries:
+                    state.verification_retries += 1
+                    return "reject", (
+                        f"[系统] 用户的要求里包含「{verb}」，但系统没有看到任何文件改动，"
+                        "也没有看到任何命令。\n"
+                        "这类任务不能只凭「我看过了 / 我说明了」就判定完成。二选一：\n"
+                        "· 真的去做：用 write_file / edit_file 产出文件，"
+                        "再用 run_command 或 terminal 跑一遍验证；\n"
+                        "· 如果确实不需要动手（目标已存在且符合要求）："
+                        "跑一条能证明现状的命令，并在答复里说明为什么不需要改动。"
+                    )
+                return "fail", detail
 
         # 没动过文件 → 观测/汇报型任务，失败命令的结果就是交付物
         if not state.change_records:

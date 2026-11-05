@@ -72,9 +72,18 @@ class EventType(str, Enum):
     TOOL_RESULT = "tool.result"        # 工具返回（含结果或错误）
 
     # ---- 审批（C4 人机协作）-------------------------------------------------
+    # ★ 步骤 5 起：Agent 循环不再触发审批（Policy 已删审批关卡），
+    #   但事件类型、服务端端点、前端卡片都保留 —— 删类型会动前端契约与
+    #   SSE 订阅清单，收益为零而爆炸半径大。历史任务快照仍可能带这些事件。
     APPROVAL_REQUEST = "approval.request"    # 请求用户批准（Agent 在此挂起）
     APPROVAL_DECISION = "approval.decision"  # 用户已决策（approved / rejected）
     APPROVAL_EXPIRED = "approval.expired"    # 等待超时，视同拒绝
+
+    # ---- 权限模式（步骤 6）--------------------------------------------------
+    # ★ 模式是**环境配置**，不是 Policy 关卡（见 docs/22 §4.2）。
+    #   它决定：Docker 挂载方式（:ro / :rw）、哪些工具注册、ACL 令牌配置。
+    #   任务开始时发一次，让前端能显示「当前跑在什么权限下」。
+    PERMISSION_MODE = "permission.mode"      # 权限模式已确定（read-only / workspace-write / full-access）
 
     # ---- 收敛与答复 ---------------------------------------------------------
     REFLECT = "reflect"                # ★ REFLECT 阶段：自评进展
@@ -397,6 +406,17 @@ class EventBus:
     def workflow_state(self, payload: dict[str, Any], turn: int = 0) -> Event:
         """工作流状态快照（包含 event 名、workflow 状态、每个 step 的状态）。"""
         return self.emit(Event.make(EventType.WORKFLOW_STATE, payload, turn=turn))
+
+    def permission_mode(self, payload: dict[str, Any], turn: int = 0) -> Event:
+        """
+        权限模式已确定（步骤 6）。
+
+        payload 约定：
+            mode       read-only | workspace-write | full-access
+            source     来源：api | env | default（便于排查"为什么是这个模式"）
+            tools      该模式下注册的工具数（read-only 会少掉写/执行工具）
+        """
+        return self.emit(Event.make(EventType.PERMISSION_MODE, payload, turn=turn))
 
     def budget_exceeded(self, kind: str, limit: Any, used: Any, turn: int = 0) -> Event:
         return self.emit(

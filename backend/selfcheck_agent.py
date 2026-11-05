@@ -174,12 +174,13 @@ async def test_tools(sb: Sandbox) -> None:
     check(r13.ok and r13.data["encoding"] == "gb18030", f"GBK 文件正确解码：encoding={r13.data.get('encoding')}")
     check("中文内容测试" in r13.data["content"], "中文内容未乱码")
 
-    # ---- 未授权时写被拒（纵深防御）----
+    # ---- 步骤 5：授权闸门已删，直接调用即可写 ----
     r14 = await reg.require("write_file").run({"path": "x.txt", "content": "hi"}, ctx)
-    check(not r14.ok and r14.error["kind"] == "permission_denied", "★ 未授权直接调 write_file 被拒（纵深防御）")
+    check(r14.ok, f"★ 步骤 5：无授权字段也能直接写入（{r14.summary[:40]}）")
+    check(sb.read("x.txt") == "hi", "★ 写入真的落盘")
 
     # ---- 已授权时写成功 ----
-    wctx = make_context_standalone(sb.dir, authorized=True, approval_id="apr_test")
+    wctx = make_context_standalone(sb.dir)
     r15 = await reg.require("write_file").run({"path": "new/hello.txt", "content": "你好\n世界\n"}, wctx)
     check(r15.ok, f"授权后写入成功：{r15.summary}")
     check(sb.read("new/hello.txt") == "你好\n世界\n", "★ 磁盘上内容正确（含中文）")
@@ -218,7 +219,13 @@ async def test_tools(sb: Sandbox) -> None:
     check("新建" in info2["impact"], "新建文件时影响说明为「新建」")
 
 
-def make_context_standalone(workspace: str, *, authorized: bool = False, approval_id: str = "") -> ToolContext:
+def make_context_standalone(workspace: str) -> ToolContext:
+    """
+    造一个测试用的 ToolContext。
+
+    ★ 步骤 5 变更：删除 authorized / approval_id 参数。
+      审批已移除，ToolContext 不再携带授权凭据。
+    """
     from backend.config import (
         BACKUP_DIR_NAME,
         IGNORED_DIR_NAMES,
@@ -229,8 +236,6 @@ def make_context_standalone(workspace: str, *, authorized: bool = False, approva
 
     return ToolContext(
         workspace=workspace,
-        authorized=authorized,
-        approval_id=approval_id,
         max_read_chars=MAX_READ_CHARS,
         ignored_dir_names=frozenset(IGNORED_DIR_NAMES),
         sensitive_names=frozenset(SENSITIVE_NAMES),
@@ -259,18 +264,20 @@ async def test_edit_file(sb: Sandbox) -> None:
     print("\n[A2] ★ edit_file（局部修改：唯一匹配 / patch 冲突 / stale 检测）")
 
     reg = build_default_registry()
-    ctx = make_context_standalone(sb.dir, authorized=True, approval_id="apr_edit")
+    ctx = make_context_standalone(sb.dir)
     tool = reg.require("edit_file")
 
     sb._write("edit_me.py", "def greet(name):\n    print('hi', name)\n\n\ndef other():\n    return 1\n")
 
-    # ---- ① 未授权必须被拒（纵深防御）----
-    naked = make_context_standalone(sb.dir)          # authorized=False
+    # ---- ① 步骤 5：授权闸门已删，直接调用即可修改 ----
+    naked = make_context_standalone(sb.dir)          # 没有任何授权字段
     r = await tool.run(
         {"path": "edit_me.py", "old_string": "return 1", "new_string": "return 2"}, naked
     )
-    check(not r.ok and r.error["kind"] == "permission_denied",
-          "★ 未授权直接调 edit_file 被拒（纵深防御）")
+    check(r.ok, f"★ 步骤 5：无授权字段也能直接修改（{r.summary[:40]}）")
+    check("return 2" in sb.read("edit_me.py"), "★ 修改真的落盘")
+    # 复原，让后续断言基于原始内容
+    sb._write("edit_me.py", "def greet(name):\n    print('hi', name)\n\n\ndef other():\n    return 1\n")
 
     # ---- ② 正常替换（唯一匹配）----
     r = await tool.run(
@@ -444,7 +451,7 @@ async def test_read_hash(sb: Sandbox) -> None:
     print("\n[A3] read_file ↔ edit_file 的 hash 口径")
 
     reg = build_default_registry()
-    ctx = make_context_standalone(sb.dir, authorized=True, approval_id="apr_hash")
+    ctx = make_context_standalone(sb.dir)
 
     sb._write("hash_me.txt", "alpha\nbeta\n")
     abs_path = sb.path("hash_me.txt")
@@ -529,7 +536,7 @@ async def test_policy(sb: Sandbox) -> None:
 
     # ① 工具存在
     d = policy.check("no_such_tool", {}, state, ctx)
-    check(not d.allow and not d.needs_approval, "工具不存在 → 直接拒绝")
+    check(not d.allow, "工具不存在 → 直接拒绝")
     check(d.result.error["kind"] == "not_implemented", "错误类型 not_implemented")
 
     # ② 参数 JSON 解析失败
@@ -542,25 +549,17 @@ async def test_policy(sb: Sandbox) -> None:
 
     # ④ 只读工具放行
     d = policy.check("read_file", {"path": "main.py"}, state, ctx)
-    check(d.allow and not d.needs_approval, "★ 只读工具直接放行")
+    check(d.allow, "★ 只读工具直接放行")
 
-    # ⑤ 写工具要求审批
+    # ⑤ 写工具：步骤 5 后直接放行（审批已移除）
     d = policy.check("write_file", {"path": "a.txt", "content": "x"}, state, ctx)
-    check(not d.allow and d.needs_approval, "★ 写工具触发审批（needs_approval=True）")
-    check(d.meta["risk"] == "write", "审批 meta 带风险等级")
-    check("preview" in d.meta, "审批 meta 带内容预览")
-    check(d.meta["target"] == "a.txt", f"审批 meta 带目标路径：{d.meta['target']}")
+    check(d.allow, "★ 步骤 5：写工具直接放行（审批已移除）")
 
-    # ⑥ 已授权时写工具放行
-    d = policy.check("write_file", {"path": "a.txt", "content": "x"}, state, ctx, already_approved="apr_1")
-    check(d.allow and d.approval_id == "apr_1", "★ 已授权 → 放行并携带 approval_id")
-
-    # ⑦ 预算耗尽
+    # ⑥ 预算耗尽
     for _ in range(5):
         state.next_turn()
     d = policy.check("read_file", {"path": "main.py"}, state, ctx)
     check(not d.allow and "预算已耗尽" in d.result.summary, "★ 预算耗尽时拒绝一切工具")
-    check(not d.needs_approval, "预算耗尽的拒绝不去打扰用户（不该弹审批）")
 
     # ⑧ 重复熔断
     from backend.agent.state import TaskState as TS
@@ -618,43 +617,138 @@ async def test_policy(sb: Sandbox) -> None:
     d = policy.check("read_file", {"path": "x.py"}, s5, ctx5)
     check(d.allow, "★ 最近一次同调用成功 → 不受更早的失败影响")
 
-    # ⑨ 白名单
-    p2 = Policy(reg, allowed_tools={"list_files"})
-    d = p2.check("read_file", {"path": "a.py"}, state, ctx)
-    check(not d.allow and "不在本次任务允许" in d.result.summary, "★ 工具白名单降权生效")
+    # ⑨ 白名单：步骤 5 已删除 allowed_tools，跳过
 
-    # ⑩ 审批后复检：args_hash 不匹配
-    from backend.agent.approval import build_pending
+    # ⑩ 审批后复检（TOCTOU）：步骤 5 已删除 recheck_after_approval，跳过
 
-    st3 = TS(goal="t", workspace=sb.dir)
-    pending = build_pending(
-        tool="write_file",
-        args={"path": "a.txt", "content": "AAA"},
-        risk=RiskLevel.WRITE,
-        action="写入文件",
-        target="a.txt",
+    # ⑪⑫ 同理跳过
+
+
+# --------------------------------------------------------------------------- #
+# [B2] 权限模式（步骤 6）
+# --------------------------------------------------------------------------- #
+async def test_session_mode(sb: Sandbox) -> None:
+    print("\n[B2] 权限模式：状态 + 事件 + 只读视图（步骤 6 / 7）")
+
+    from backend.agent.state import VALID_SESSION_MODES, normalize_session_mode
+
+    # ---- 归一化函数 ----
+    check(normalize_session_mode("") == "workspace-write", "空值 → 默认 workspace-write")
+    check(normalize_session_mode(None) == "workspace-write", "None → 默认 workspace-write")
+    check(normalize_session_mode("  READ-ONLY  ") == "read-only", "大小写/空白归一")
+    check(set(VALID_SESSION_MODES) == {"read-only", "workspace-write", "full-access"},
+          f"三种模式（{VALID_SESSION_MODES}）")
+
+    raised = False
+    try:
+        normalize_session_mode("readonly")      # 少个连字符
+    except ValueError:
+        raised = True
+    check(raised, "★★ 非法模式抛 ValueError（不静默降级成可写）")
+
+    # ---- 与 ACL 层的常量必须一致 ----
+    from backend.sandbox import acl as _acl
+    check((_acl.READ_ONLY, _acl.WORKSPACE_WRITE, _acl.FULL_ACCESS) == VALID_SESSION_MODES,
+          "★ state.py 与 sandbox/acl.py 的模式字符串一致")
+
+    # ---- 默认模式：写入 state + 发一条事件 ----
+    bus = EventBus()
+    evs = collect(bus)
+    core = AgentCore(
+        FakeAdapter([ModelReply(content="好了。")]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=2, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=bus,
     )
-    # 模拟「批准 A，执行 B」
-    d = policy.recheck_after_approval(
-        "write_file", {"path": "a.txt", "content": "BBB!"}, st3, make_context(st3), pending
-    )
-    check(not d.allow, "★ 审批后参数被换 → 拒绝执行（防「批准 A 执行 B」）")
-    check("指纹" in d.reason or "变化" in d.result.summary, f"拒绝理由明确：{d.reason}")
+    st = await core.run("随便看看", workspace=sb.dir)
+    await bus.drain()
+    check(st.session_mode == "workspace-write", f"默认模式写入状态（{st.session_mode}）")
+    pm = [e for e in evs if e.type == "permission.mode"]
+    check(len(pm) == 1, f"★ 任务开始发出一条 permission.mode（{len(pm)}）")
+    if pm:
+        check(pm[0].data.get("mode") == "workspace-write", "事件带模式")
+        check(pm[0].data.get("source") == "default", "来源标记 default")
+        check(pm[0].data.get("enforced") is True, "workspace-write 视为已生效")
+        check(isinstance(pm[0].data.get("tools"), int), "事件带工具数")
 
-    # ⑪ 审批后复检：参数未变 → 通过
-    d = policy.recheck_after_approval("write_file", pending.args, st3, make_context(st3), pending)
-    check(d.allow, "参数未变 → 复检通过")
-
-    # ⑫ 审批后复检：路径越界
-    pending2 = build_pending(
-        tool="write_file",
-        args={"path": "../../evil.txt", "content": "x"},
-        risk=RiskLevel.WRITE,
-        action="写入文件",
-        target="../../evil.txt",
+    # ---- 显式传 read-only：注册表里还有写工具 → enforced=False（如实报告）----
+    bus2 = EventBus()
+    evs2 = collect(bus2)
+    core2 = AgentCore(
+        FakeAdapter([ModelReply(content="好了。")]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=2, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=bus2,
     )
-    d = policy.recheck_after_approval("write_file", pending2.args, st3, make_context(st3), pending2)
-    check(not d.allow, "★ 审批后路径复检发现越界 → 拒绝（TOCTOU 防护）")
+    st2 = await core2.run("看看", workspace=sb.dir, session_mode="read-only")
+    await bus2.drain()
+    check(st2.session_mode == "read-only", "显式 read-only 写入状态")
+    pm2 = [e for e in evs2 if e.type == "permission.mode"]
+    check(pm2 and pm2[0].data.get("source") == "api", "来源标记 api")
+    check(pm2 and pm2[0].data.get("enforced") is False,
+          "★★ 注册表仍有写工具 → enforced=False（不假装安全）")
+
+    # ---- 只读注册表 + read-only → enforced=True ----
+    bus3 = EventBus()
+    evs3 = collect(bus3)
+    core3 = AgentCore(
+        FakeAdapter([ModelReply(content="好了。")]),
+        build_default_registry(include_mutating=False),
+        config=AgentConfig(max_turns=2, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=bus3,
+    )
+    st3 = await core3.run("看看", workspace=sb.dir, session_mode="read-only")
+    await bus3.drain()
+    pm3 = [e for e in evs3 if e.type == "permission.mode"]
+    check(pm3 and pm3[0].data.get("enforced") is True,
+          "★ 只读注册表 + read-only → enforced=True")
+
+    # ---- 非法模式在 run 阶段就炸，不产生半截任务 ----
+    core4 = AgentCore(
+        FakeAdapter([ModelReply(content="不该跑到这里。")]),
+        build_default_registry(),
+        config=AgentConfig(max_turns=2, min_evidence=0),
+        bus=EventBus(),
+    )
+    err = ""
+    try:
+        await core4.run("看看", workspace=sb.dir, session_mode="whatever")
+    except ValueError as exc:
+        err = str(exc)
+    check("未知的权限模式" in err, f"★ run() 对非法模式直接抛错（{err[:40]}）")
+
+    # ---- 步骤 7：readonly_view() 派生只读视图 ----
+    full = build_default_registry()
+    ro = full.readonly_view()
+    check("write_file" not in ro.names and "edit_file" not in ro.names,
+          f"★★ 只读视图没有写工具（{sorted(ro.names)}）")
+    check("run_command" not in ro.names and "terminal" not in ro.names,
+          "★★ 只读视图没有执行工具")
+    check("read_file" in ro.names and "list_files" in ro.names,
+          "只读工具保留")
+    check(len(ro.names) < len(full.names), f"视图确实变小（{len(full.names)} → {len(ro.names)}）")
+    # ★ 复用同一批实例：不是重建，避免 MCP/terminal 状态漂移
+    check(ro.get("read_file") is full.get("read_file"),
+          "★ 工具实例复用（不是重新构造）")
+
+    # ---- 只读视图下写工具确实不存在 → Agent 拿到的工具清单里没有它 ----
+    core5 = AgentCore(
+        FakeAdapter([ModelReply(tool_calls=[tc("w1", "write_file",
+                                               {"path": "ro.txt", "content": "x"})]),
+                     ModelReply(content="写不了。")]),
+        ro,
+        config=AgentConfig(max_turns=3, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    st5 = await core5.run("写个文件", workspace=sb.dir, session_mode="read-only")
+    check(not (Path(sb.dir) / "ro.txt").exists(),
+          "★★ 步骤 7：只读视图下 write_file 调用不落盘")
+    check(st5.tool_events and not st5.tool_events[0].ok,
+          "★ 写入尝试以失败结果回灌（工具不存在，不是静默成功）")
 
 
 # --------------------------------------------------------------------------- #
@@ -1039,14 +1133,14 @@ async def test_final_answer_synthesis(sb: Sandbox) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# [G] 审批在循环中的完整流转
+# [G] 步骤 5：审批已移除，写工具直接执行
 # --------------------------------------------------------------------------- #
 async def test_approval_in_loop(sb: Sandbox) -> None:
-    print("\n[G] 审批在 Agent 循环中：批准 / 拒绝 / 超时")
+    print("\n[G] 步骤 5：审批已移除，写工具直接执行（不再挂起）")
 
     reg = build_default_registry()
 
-    # ============ 场景 1：批准 ============
+    # ============ 场景：写文件不再触发审批 ============
     bus1 = EventBus()
     adapter1 = FakeAdapter(
         [
@@ -1058,129 +1152,23 @@ async def test_approval_in_loop(sb: Sandbox) -> None:
     core1 = AgentCore(adapter1, reg, config=AgentConfig(max_turns=6, min_evidence=0), bus=bus1)
     ev1 = collect(bus1)
 
-    async def approver() -> None:
-        # 等 Agent 挂起后点批准
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            aid = core1.approvals.current()
-            if aid:
-                core1.approvals.approve(aid, "测试批准")
-                return
-        raise AssertionError("审批请求始终未出现")
-
-    t = asyncio.create_task(approver())
     st1 = await core1.run("创建 hello.py", workspace=sb.dir)
-    await t
     await bus1.drain()
 
     t1 = [e.type for e in ev1]
-    check(EventType.APPROVAL_REQUEST.value in t1, "★ 发出 approval.request")
-    check(EventType.APPROVAL_DECISION.value in t1, "★ 发出 approval.decision")
-    dec1 = [e for e in ev1 if e.type == EventType.APPROVAL_DECISION.value][0]
-    check(dec1.data["approved"] is True, "决策 approved=True")
-    check(sb.read("hello.py") == "print('hi')\n", "★ 批准后文件真的被写入磁盘")
-    req1 = [e for e in ev1 if e.type == EventType.APPROVAL_REQUEST.value][0]
-    check(req1.data["target"] == "hello.py", f"审批展示目标：{req1.data['target']}")
-    check(bool(req1.data["args_hash"]), "★ 请求携带 args_hash 指纹")
-    check("审批" not in req1.data or True, "审批数据完整")
-    check(len(st1.approval_history) == 1, "审批历史留痕")
-    check(st1.approval_history[0].status.value == "approved", "历史状态 approved")
-    check(len(st1.change_records) == 1, f"★ 变更记录留痕（{len(st1.change_records)} 条）")
+    check(EventType.APPROVAL_REQUEST.value not in t1, "★★ 步骤 5：不再发出 approval.request")
+    check(EventType.APPROVAL_DECISION.value not in t1, "★★ 不再发出 approval.decision")
+    check(sb.read("hello.py") == "print('hi')\n", "★★ 写工具直接执行，文件真的落盘")
+    check(len(st1.approval_history) == 0, "审批历史为空（没有审批发生）")
+    check(len(st1.change_records) == 1, f"★ 变更记录仍留痕（{len(st1.change_records)} 条）")
     check(st1.change_records[0].path == "hello.py", "变更记录路径正确")
+    check(st1.status == TaskStatus.DONE, "任务正常终止")
 
-    # ============ 场景 2：拒绝 ============
-    bus2 = EventBus()
-    adapter2 = FakeAdapter(
-        [
-            ModelReply(content='{"steps":[{"title":"写","detail":"创建 bad.py"}],"note":""}'),
-            ModelReply(tool_calls=[tc("c1", "write_file", {"path": "bad.py", "content": "nope\n"})]),
-            ModelReply(content="好的，我不写这个文件了。请问你希望我怎么做？"),
-        ]
-    )
-    core2 = AgentCore(adapter2, reg, config=AgentConfig(max_turns=6, min_evidence=0), bus=bus2)
-    ev2 = collect(bus2)
+    # ============ 场景 2：审计链不断裂（approval_id 恒空）============
+    check(st1.change_records[0].approval_id == "", "★ 变更记录的 approval_id 恒空（审计字段保留）")
 
-    async def rejecter() -> None:
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            aid = core2.approvals.current()
-            if aid:
-                core2.approvals.reject(aid, "不要创建这个文件")
-                return
-        raise AssertionError("审批未出现")
-
-    t = asyncio.create_task(rejecter())
-    st2 = await core2.run("创建 bad.py", workspace=sb.dir)
-    await t
-    await bus2.drain()
-
-    check(not os.path.exists(sb.path("bad.py")), "★ 拒绝后文件未被创建（安全）")
-    dec2 = [e for e in ev2 if e.type == EventType.APPROVAL_DECISION.value][0]
-    check(dec2.data["approved"] is False, "决策 approved=False")
-    tres2 = [e for e in ev2 if e.type == EventType.TOOL_RESULT.value]
-    check(tres2 and not tres2[0].data["ok"], "★ 被拒的操作以失败结果回灌给模型")
-    check("拒绝" in tres2[0].data["summary"], f"回灌内容说明被拒：{tres2[0].data['summary'][:50]}")
-    check(len(st2.approval_history) == 1 and st2.approval_history[0].status.value == "rejected", "拒绝入历史")
-    check(st2.status == TaskStatus.DONE, "★ 拒绝后 Agent 未崩溃，正常收敛")
-
-    # ============ 场景 3：超时 ============
-    bus3 = EventBus()
-    adapter3 = FakeAdapter(
-        [
-            ModelReply(content='{"steps":[{"title":"写","detail":"timeout.py"}],"note":""}'),
-            ModelReply(tool_calls=[tc("c1", "write_file", {"path": "timeout.py", "content": "x\n"})]),
-            ModelReply(content="操作超时未获批准，任务中止。"),
-        ]
-    )
-    core3 = AgentCore(adapter3, reg, config=AgentConfig(max_turns=6, min_evidence=0), bus=bus3)
-    core3.approvals.timeout_s = 0.2      # 缩短超时便于测试
-    ev3 = collect(bus3)
-
-    st3 = await core3.run("创建 timeout.py", workspace=sb.dir)
-    await bus3.drain()
-
-    t3 = [e.type for e in ev3]
-    check(EventType.APPROVAL_EXPIRED.value in t3, "★ 超时发出 approval.expired（而非 decision）")
-    check(not os.path.exists(sb.path("timeout.py")), "★ 超时后文件未被创建")
-    check(len(st3.approval_history) == 1 and st3.approval_history[0].status.value == "expired", "历史状态 expired")
-    check(st3.status == TaskStatus.DONE, "超时后仍能收敛")
-
-    # ============ 场景 4：审批期间状态正确 ============
-    from backend.agent.state import TaskStatus as TS4
-
-    seen_states: list[str] = []
-    bus4 = EventBus()
-
-    async def watcher(ev: Event) -> None:
-        if ev.type == EventType.APPROVAL_REQUEST.value:
-            # 此刻状态必须是 awaiting_approval
-            seen_states.append(core4.state.status.value)
-
-    bus4.subscribe(watcher)
-    adapter4 = FakeAdapter(
-        [
-            ModelReply(content='{"steps":[{"title":"写","detail":"s.py"}],"note":""}'),
-            ModelReply(tool_calls=[tc("c1", "write_file", {"path": "s.py", "content": "x"})]),
-            ModelReply(content="完成。"),
-        ]
-    )
-    core4 = AgentCore(adapter4, reg, config=AgentConfig(max_turns=6, min_evidence=0), bus=bus4)
-
-    async def approver4() -> None:
-        for _ in range(200):
-            await asyncio.sleep(0.01)
-            aid = core4.approvals.current()
-            if aid:
-                core4.approvals.approve(aid)
-                return
-
-    t = asyncio.create_task(approver4())
-    st4 = await core4.run("写 s.py", workspace=sb.dir)
-    await t
-    await bus4.drain()
-
-    check(seen_states == ["awaiting_approval"], f"★ 请求审批时状态为 awaiting_approval（实际 {seen_states}）")
-    check(st4.status == TS4.DONE, "恢复后状态回到正常终止")
+    # ============ 场景 3：没有 ApprovalManager 也能跑 ============
+    check(not hasattr(core1, "approvals"), "★ AgentCore 不再持有 ApprovalManager")
 
 
 # --------------------------------------------------------------------------- #
@@ -1889,6 +1877,144 @@ async def test_repair_zero_work_gate(sb: Sandbox) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [V3] 明确诉求的"零产出"门禁（步骤 8 灰度发现的缺口）
+# --------------------------------------------------------------------------- #
+async def test_write_demand_gate(sb: Sandbox) -> None:
+    """
+    [V3] 用户明确要求「创建/修改」，但零改动 + 零命令 → 不能 done。
+
+    ★ 这条规则来自步骤 8 的真实灰度：用户要求「创建 hello.py 并运行验证」，
+      模型只 list_files 就收尾，终态却是 done —— 交付物一件没有。
+      V2 只覆盖 intent=repair，创建类诉求完全漏掉。
+
+    本组覆盖：
+      · has_write_demand 的正例 / 反例（否定从句、征询句、纯分析）
+      · 集成：明确诉求 + 零产出 → aborted
+      · 逃生口：零改动但有命令 → 允许 done
+      · 不误伤：纯分析任务 + 零产出 → 仍然 done
+    """
+    print("\n[V3] 明确诉求的零产出门禁")
+
+    from backend.agent.intent import has_write_demand
+
+    # ---- V3.1 判定函数本身 ----
+    cases_true = [
+        "请在当前目录创建 hello.py 并运行它",
+        "新建一个 config.py",
+        "把这行代码改成 return 1",
+        "删除临时文件 tmp.log",
+        "帮我在 main.py 里加一个函数",
+        "不要修改测试，但要新建 x.py",      # 否定从句只屏蔽它自己那句
+    ]
+    for g in cases_true:
+        hit, verb = has_write_demand(g)
+        check(hit, f"★ 识别为动手诉求（{verb}）：{g[:24]}")
+
+    cases_false = [
+        "不要修改任何文件，只分析项目结构",
+        "帮我看看要不要新建一个配置文件",
+        "这个项目是做什么的？",
+        "分析当前目录里有哪些文件",
+        "解释一下 main.py 是干什么的",
+        "禁止改动 tests/ 目录",
+    ]
+    for g in cases_false:
+        hit, verb = has_write_demand(g)
+        check(not hit, f"不误判为动手诉求（命中={verb}）：{g[:24]}")
+
+    # ---- V3.2 集成：明确诉求 + 零产出 → 不能 done ----
+    stub = StubRunTool([0])
+    ad = FakeAdapter([
+        ModelReply(tool_calls=[tc("w1", "list_files", {"path": "."})]),
+        ModelReply(content="我看了一下目录，准备创建。"),
+        ModelReply(content="好的，计划如上。"),
+    ])
+    bus = EventBus()
+    evs = collect(bus)
+    core = AgentCore(
+        ad, _gate_registry(stub),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=bus,
+    )
+    st = await core.run("创建 hello.py 并运行它验证输出", workspace=sb.dir)
+    await bus.drain()
+    check(st.status is TaskStatus.ABORTED,
+          f"★★ 明确诉求 + 零产出 → aborted（{st.status.value}）")
+    check(st.end_reason == "verification_failed",
+          f"★ 结束原因是 verification_failed（{st.end_reason}）")
+    check(not st.change_records and not st.command_history, "确实没有任何产出")
+    check(any(e.type == EventType.ERROR and e.data.get("kind") == "unverified_completion"
+              for e in evs), "发出了 unverified_completion 事件")
+
+    # ---- V3.3 逃生口：零改动但有命令 → 允许 done ----
+    stub2 = StubRunTool([0])
+    ad2 = FakeAdapter([
+        ModelReply(tool_calls=[tc("w2", "run_command", {"command": "dir"})]),
+        ModelReply(content="文件已经存在且符合要求，跑了一条命令确认，不需要改动。"),
+    ])
+    core2 = AgentCore(
+        ad2, _gate_registry(stub2),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=EventBus(),
+    )
+    st2 = await core2.run("创建 hello.py 并运行它验证输出", workspace=sb.dir)
+    check(st2.status is TaskStatus.DONE,
+          f"★ 零改动但有命令 → 允许 done（{st2.status.value}/{st2.end_reason}）")
+    check(len(st2.command_history) == 1, "确实跑过一条命令")
+
+    # ---- V3.4 不误伤：纯分析任务 + 零产出 → 仍然 done ----
+    stub3 = StubRunTool([0])
+    ad3 = FakeAdapter([
+        ModelReply(tool_calls=[tc("a1", "list_files", {"path": "."})]),
+        ModelReply(content="这是一个演示项目，只有 README.md。"),
+    ])
+    core3 = AgentCore(
+        ad3, _gate_registry(stub3),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=EventBus(),
+    )
+    st3 = await core3.run("分析当前目录里有哪些文件", workspace=sb.dir)
+    check(st3.status is TaskStatus.DONE,
+          f"★ 纯分析任务不受影响（{st3.status.value}/{st3.end_reason}）")
+
+    # ---- V3.5 不误伤：征询式表达 → 仍然 done ----
+    stub4 = StubRunTool([0])
+    ad4 = FakeAdapter([
+        ModelReply(tool_calls=[tc("a2", "list_files", {"path": "."})]),
+        ModelReply(content="目前只有一个 README.md，暂时不需要新建配置文件。"),
+    ])
+    core4 = AgentCore(
+        ad4, _gate_registry(stub4),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=EventBus(),
+    )
+    st4 = await core4.run("帮我看看要不要新建一个 config.py", workspace=sb.dir)
+    check(st4.status is TaskStatus.DONE,
+          f"★ 征询式表达不受影响（{st4.status.value}/{st4.end_reason}）")
+
+    # ---- V3.6 read-only 约束下不拦（用户明说不要改）----
+    core5 = AgentCore(
+        FakeAdapter([
+            ModelReply(tool_calls=[tc("a3", "list_files", {"path": "."})]),
+            ModelReply(content="按你的要求只读，没有改动任何文件。"),
+        ]),
+        _gate_registry(StubRunTool([0])),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=EventBus(),
+    )
+    st5 = await core5.run("只读检查：不要修改任何文件，创建类的操作一律不要做",
+                          workspace=sb.dir)
+    check(st5.constraints.get("read_only") is True, "识别为只读约束")
+    check(st5.status is TaskStatus.DONE,
+          f"★ 只读约束下不拦（{st5.status.value}/{st5.end_reason}）")
+
+
+# --------------------------------------------------------------------------- #
 # [S] 改动范围审计
 # --------------------------------------------------------------------------- #
 class _StubWriter(Tool):
@@ -2009,7 +2135,7 @@ async def test_scope_audit(sb: Sandbox) -> None:
     check(not d5.allow and "禁止" in (d5.result.summary if d5.result else ""),
           "★ 禁止路径在 Policy 层被拒")
     d5b = policy.check("write_file", {"path": "src/other.py", "content": "x"}, st5, ctx5)
-    check(d5b.needs_approval, "★ 没命中的路径仍按原流程走审批（不是一刀切全拦）")
+    check(d5b.allow, "★ 没命中的路径直接放行（步骤 5：审批已移除）")
 
     reg5 = ToolRegistry()
     reg5.register(build_default_registry().get("write_file"), group="mutating")
@@ -2085,6 +2211,7 @@ async def main() -> int:
         await test_edit_file(sb)
         await test_read_hash(sb)
         await test_policy(sb)
+        await test_session_mode(sb)
         await test_approval()
         await test_context(sb)
         await test_json_extract()
@@ -2095,6 +2222,7 @@ async def main() -> int:
         await test_robustness(sb)
         await test_verification_gate(sb)
         await test_repair_zero_work_gate(sb)
+        await test_write_demand_gate(sb)
         await test_plan_truth(sb)
         await test_scope_audit(sb)
         await test_intent(sb)
@@ -2211,7 +2339,7 @@ async def test_intent(sb: Sandbox) -> None:
     d3 = policy.check("write_file", {"path": "tests/t.py", "content": "x"}, st_nt, ctx)
     check(not d3.allow, "★ 说了别改测试 → 写 tests/ 被拒")
     d4 = policy.check("write_file", {"path": "app/x.py", "content": "x"}, st_nt, ctx)
-    check(d4.needs_approval, "★ 非测试路径仍按原流程走审批（不是一刀切）")
+    check(d4.allow, "★ 非测试路径直接放行（步骤 5：审批已移除）")
 
     # ---- 测试编写任务不该被自动禁测试 ----
     core_ta = AgentCore(
@@ -2843,10 +2971,10 @@ async def test_scope_consistency(sb: Sandbox) -> None:
     check(not d.allow and "允许" in (d.result.summary if d.result else ""),
           f"★ 范围外写入在执行前被拦（{d.result.summary if d.result else ''}）")
     d2 = policy.check("write_file", {"path": "pipeline/ok.py", "content": "x"}, st, ctx)
-    check(d2.needs_approval, "★ 允许范围内的写入照常走审批")
+    check(d2.allow, "★ 允许范围内的写入直接放行（步骤 5：审批已移除）")
     st.allowed_paths = ["."]
     d3 = policy.check("write_file", {"path": "docs/out.md", "content": "x"}, st, ctx)
-    check(d3.needs_approval, "★ 默认允许整个工作区 → 不拦任何写入")
+    check(d3.allow, "★ 默认允许整个工作区 → 不拦任何写入")
 
     # ---- 4. 禁止范围永远优先 ----
     st2 = TaskState(goal="x", workspace=sb.dir)
@@ -3464,24 +3592,22 @@ async def test_graph_engine(sb: Sandbox) -> None:
           f"★ 多轮工具按剧本顺序执行（{order}）")
     check(st2.status is TaskStatus.DONE, "★ 多轮任务正常完成")
 
-    # ---- 3. 高风险工具：无审批不执行 ----
+    # ---- 3. 步骤 5：写工具不再等审批，直接执行 ----
     reg3 = build_default_registry()
     core3 = AgentCore(
         FakeAdapter([
             ModelReply(content='{"steps":[{"title":"写"}],"note":""}'),
             ModelReply(tool_calls=[tc("z1", "write_file", {"path": "g_new.py", "content": "x"})]),
             ModelReply(content="写好了。"),
-            ModelReply(content="审批失败，无法写入。"),
         ]),
         reg3,
         config=AgentConfig(max_turns=6, min_evidence=0, use_reflect_phase=False,
-                           orchestrator="graph", approval_timeout_s=0.5),
+                           orchestrator="graph"),
         bus=EventBus(),
     )
     st3 = await core3.run("写一个新文件", workspace=sb.dir)
-    check(not (Path(sb.dir) / "g_new.py").exists(), "★ 高风险工具未获审批 → 文件未创建")
-    denied = [e for e in st3.tool_events if not e.ok and "approval" in (e.error_kind or "")]
-    check(bool(denied), f"★ 审批超时被拒并留痕（{str(denied[0].summary)[:50] if denied else '无'}）")
+    check((Path(sb.dir) / "g_new.py").exists(), "★★ 步骤 5：写工具无审批直接执行，文件已创建")
+    check(st3.status is TaskStatus.DONE, f"任务正常完成（{st3.status.value}）")
 
     # ---- 4. 预算耗尽 → 正确终止（无进展不续期）----
     core4 = AgentCore(
@@ -3670,7 +3796,7 @@ async def test_tool_chain_m21(sb: Sandbox) -> None:
     box127 = _FakeSandbox(exit_code=127)
     tool127 = RunCommandTool(sandbox=box127)  # type: ignore[arg-type]
     st_c = TaskState(goal="t", workspace=sb.dir)
-    ctx_c = make_context(st_c); ctx_c.authorized = True
+    ctx_c = make_context(st_c)  # 步骤 5：authorized 已删
     res127 = await tool127.run({"command": "no_such_bin", "args": []}, ctx_c)
     check(not res127.ok and res127.data and res127.data.get("exit_code") == 127,
           "★ 127 是执行结果（带 exit_code），不是参数错误")

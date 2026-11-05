@@ -61,11 +61,15 @@ class TaskScheduler:
         max_global: int = DEFAULT_MAX_GLOBAL,
         knowledge: object | None = None,
         spawner: object | None = None,
+        readonly_registry: ToolRegistry | None = None,
     ) -> None:
         self._store = store
         self._hub = hub
         self._adapter = adapter          # 无状态，可被多个任务共用
         self._registry = registry
+        # 步骤 7：read-only 会话模式用的工具子集（只含 risk=read）。
+        # 不传 = 服务端不支持按模式切换（老行为，read-only 只声明不强制）。
+        self._readonly_registry = readonly_registry
         self._config = config
         self._max_global = max_global
         # M3：项目知识库（同一进程内被所有任务共享；按 workspace 隔离数据）
@@ -76,6 +80,8 @@ class TaskScheduler:
         self._runtimes: dict[str, TaskRuntime] = {}
         self._session_of: dict[str, str] = {}
         self._scope_of: dict[str, tuple[list[str], list[str]]] = {}
+        # 步骤 6：权限模式跟着任务走（排队任务可能几秒后才启动）
+        self._mode_of: dict[str, str] = {}
         self._running: set[str] = set()
         self._queue: list[str] = []
         self._lock = asyncio.Lock()
@@ -94,6 +100,7 @@ class TaskScheduler:
         idem_key: str = "",
         allowed_paths: list[str] | None = None,
         forbidden_paths: list[str] | None = None,
+        mode: str = "",
     ) -> dict[str, Any]:
         """
         创建任务并尝试调度。
@@ -133,6 +140,8 @@ class TaskScheduler:
             # ★ 范围声明跟着任务走：排队任务可能几秒后才启动，
             #   不能依赖"提交时的局部变量"还在。
             self._scope_of[tid] = (list(allowed_paths or []), list(forbidden_paths or []))
+            # 步骤 6：模式先落表，等 _launch 时再校验（非法值在 core.run 里抛）
+            self._mode_of[tid] = str(mode or "")
             self._queue.append(tid)
 
         await self.pump()
@@ -179,6 +188,21 @@ class TaskScheduler:
 
         return None
 
+    def _registry_for(self, task_id: str) -> ToolRegistry:
+        """
+        按任务的会话模式挑注册表（步骤 7）。
+
+        read-only → 只读视图（真强制：写/执行工具根本没注册）
+        其余模式 → 完整注册表
+
+        ★ 非法模式这里不拦：它会在 core.run 里抛 ValueError，任务以 failed 收尾，
+          这样错误出现在**任务该出现的地方**（而不是调度器里静默降级）。
+        """
+        mode = (self._mode_of.get(task_id) or "").strip().lower()
+        if mode == "read-only" and self._readonly_registry is not None:
+            return self._readonly_registry
+        return self._registry
+
     async def _launch(self, task_id: str) -> None:
         """真正启动一个任务（锁外执行）。"""
         session_id = self._session_of.get(task_id, "")
@@ -198,8 +222,10 @@ class TaskScheduler:
             model=row["model"],
             allowed_paths=allowed_paths,
             forbidden_paths=forbidden_paths,
+            session_mode=self._mode_of.get(task_id, ""),
             adapter=self._adapter,
-            registry=self._registry,
+            # 步骤 7：read-only 任务拿到的是只读视图（写工具未注册）
+            registry=self._registry_for(task_id),
             config=self._config,
             hub=self._hub,
             store=self._store,

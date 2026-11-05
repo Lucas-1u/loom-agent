@@ -201,6 +201,79 @@ _PATH_TOKEN = re.compile(r"[\w./\\-]+", re.IGNORECASE)
 _PATHY_EXT = (".py", ".md", ".csv", ".json", ".txt", ".ini", ".toml", ".cfg")
 
 
+# --------------------------------------------------------------------------- #
+# 「明确的动手诉求」判定（步骤 8 灰度发现的缺口）
+# --------------------------------------------------------------------------- #
+# 创建 / 修改类动词：用户明确要求产出或改动东西
+# ★ 为什么不收「实现」「生成」这类词：
+#   "这个功能是怎么实现的" / "报告是自动生成的" 都是**描述**，不是诉求。
+#   它们收益低、误伤高，交给下面的征询词过滤也不够稳，干脆不收。
+_WRITE_DEMAND_RE = re.compile(
+    r"(创建|新建|写入|写一个|写个|写一份|写成文件|改成|修改|改动|重构|"
+    r"添加|新增|加上|加个|加一个|删除|移除|补上|替换|覆盖)"
+)
+
+# 征询 / 询问式表达：在问"怎么回事 / 要不要做"，不是"去做"
+_CONSULT_RE = re.compile(
+    r"(要不要|需不需要|是否需要|该不该|应不应该|是不是要|是否要|"
+    r"是否可以|可不可以|能否|还是说|你觉得|是否值得|"
+    r"怎么|如何|为什么|是什么|哪些|是否)"
+)
+
+_QUESTION_TAIL = ("?", "？", "吗", "呢", "吧")
+
+# 分句后再去掉句首连词："，但要新建 x" → "要新建 x"
+_CONJ_LEAD_RE = re.compile(r"^(?:但是|但|然后|接着|再|并且|并|同时|另外)[，,\s]*")
+
+
+def has_write_demand(goal: str) -> tuple[bool, str]:
+    """
+    用户是不是**明确要求动手**（创建/修改文件、产出交付物）？
+
+    返回 `(是否有诉求, 命中的动词)`。
+
+    ★ 为什么需要它（真实事故，步骤 8 灰度）
+      ────────────────────────────────────
+      用户要求「创建 hello.py 并运行验证」，模型只列了个目录就收尾，
+      终态却是 `done` —— 零改动、零命令、零交付物。
+      原有闸门只覆盖 `intent=repair`，创建类诉求漏得一干二净。
+
+    ★ 为什么不能简单查关键词
+      · 「不要修改任何文件」是**约束**不是诉求 → 先剥否定从句再判；
+      · 「帮我看看要不要新建一个配置文件」是**征询** → 跳过；
+      · 「分析一下该怎么改」会被闸门①识别成 diagnostic，本来就走不到这里，
+        但这里仍按句子过滤，避免误伤。
+
+    ★ 为什么判定粒度是句子
+      一段话里可能既有「不要动 X」又有「新建 Y」，整段判会互相污染。
+      ★ 为什么逗号也要断句：`_NEGATIVE_CLAUSE_RE` 的尾部是贪婪的
+      `[^。；\n]*`，会一路吃到句号 —— 「不要修改测试，但要新建 x.py」
+      会被整句剥光。按逗号断开 + 去掉句首连词，才能保住后半句的诉求。
+    """
+    text = _norm(goal or "")
+    if not text:
+        return False, ""
+
+    for raw in re.split(r"[。；;，,\n]", text):
+        sentence = raw.strip()
+        if not sentence:
+            continue
+        # ① 剥掉否定从句："不要修改测试" → ""
+        stripped = _NEGATIVE_CLAUSE_RE.sub(" ", sentence).strip()
+        stripped = _CONJ_LEAD_RE.sub("", stripped).strip()
+        if not stripped:
+            continue
+        # ② 征询 / 疑问句不算诉求
+        if _CONSULT_RE.search(stripped):
+            continue
+        if stripped.endswith(_QUESTION_TAIL):
+            continue
+        m = _WRITE_DEMAND_RE.search(stripped)
+        if m:
+            return True, m.group(1)
+    return False, ""
+
+
 def extract_scoped_forbidden(goal: str) -> list[str]:
     """
     抽取「禁止修改 <具体路径>」里的路径。

@@ -119,6 +119,33 @@ class ToolRegistry:
                 sub.register(self._tools[n], group="filtered")
         return sub
 
+    def readonly_view(self) -> "ToolRegistry":
+        """
+        派生一份「只读视图」：只保留 risk=read 的工具（保留原分组）。
+
+        ★ 步骤 7：read-only 会话模式用它做**服务端真强制**。
+          之前 read-only 只在事件里声明（`enforced: false`），工具注册表里
+          仍有写/执行工具，模型照样能写 —— 等于假安全。
+
+        ★ 为什么复用同一批工具实例，而不是重新 build 一份：
+          `build_default_registry` 会重建 terminal / MCP 工具。MCP 工具里
+          持有 Server 会话引用，重建虽然能用，但会多一份注册开销且容易和
+          主注册表的状态漂移。这里只做**筛选**，工具对象完全一致。
+
+        ★ 为什么按 risk 而不是按 group：
+          group 只能区分 readonly/mutating/exec/subagent/workflow，
+          而 MCP 工具与 spawn 工具的风险是**实例属性**，可能配置成 write。
+          按 risk 筛才能兜住这些「分组正确但风险高」的工具。
+        """
+        sub = ToolRegistry()
+        for group, names in self._groups.items():
+            for n in names:
+                tool = self._tools.get(n)
+                # 用 .value 比较，避免 registry 反向 import agent.state
+                if tool is not None and getattr(tool.risk, "value", "") == "read":
+                    sub.register(tool, group=group)
+        return sub
+
     # ---- 给模型 ------------------------------------------------------------
     def to_specs(self, *, only: Iterable[str] | None = None) -> list:
         """
@@ -142,7 +169,7 @@ class ToolRegistry:
                         "name": t.name,
                         "group": group,
                         "risk": t.risk.value,
-                        "approval": "需要审批" if t.needs_approval else "自动执行",
+                        "approval": "无审批",  # 步骤 5：审批已移除
                         "description": t.description.split("。")[0],
                     }
                 )

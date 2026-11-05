@@ -193,6 +193,11 @@ async def amain(args: argparse.Namespace) -> int:
     )
     registry.register(make_spawn(spawner), group="subagent")
 
+    # ★ 步骤 7：read-only 会话模式的工具子集。
+    #   用 readonly_view() 派生（复用同一批工具实例），不是重新 build —
+    #   避免 MCP 工具被注册两遍、状态漂移。
+    readonly_registry = registry.readonly_view()
+
     scheduler = TaskScheduler(
         store=store,
         hub=hub,
@@ -202,6 +207,7 @@ async def amain(args: argparse.Namespace) -> int:
         max_global=args.max_tasks,
         knowledge=knowledge,
         spawner=spawner,
+        readonly_registry=readonly_registry,
     )
 
     # ---- 工作流恢复：启动时扫一遍未终结的 Workflow ---------------------

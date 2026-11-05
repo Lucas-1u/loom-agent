@@ -182,7 +182,6 @@ class SubtaskSpawner:
         cancel_event: Any = None,
     ) -> SubtaskResult:
         from ..events import EventBus
-        from ..agent.approval import ApprovalManager
         from ..agent.core import AgentCore, AgentConfig
         from ..server.runtime import StoreHistorySink
 
@@ -258,7 +257,6 @@ class SubtaskSpawner:
             self.adapter, self.registry,
             config=child_cfg,
             bus=bus,
-            approvals=ApprovalManager(timeout_s=self.approval_timeout_s),
             history_sink=StoreHistorySink(self.store),
             spawner=self._child_spawner(session_id),
         )
