@@ -22,6 +22,10 @@ struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    // 系统原生对话框：前端"选择目录"走它（`@tauri-apps/plugin-dialog`）。
+    // ★ 能力还得在 capabilities/default.json 里开 `dialog:default`，
+    //   否则调用会被 ACL 拦掉（报 not allowed by ACL），插件装了也白装。
+    .plugin(tauri_plugin_dialog::init())
     .setup(|app| {
       // 推导 loom 项目根目录
       let loom_root = backend::find_loom_root().expect("无法定位 loom 项目根目录");

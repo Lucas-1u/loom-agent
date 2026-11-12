@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "node C:\\Users\\11196\\.workbuddy\\binaries\\node\\versions\\22.22.2-6\\node_modules\\npm\\bin\\npm-cli.js run dev --prefix D:\\Loom_agent\\loom\\frontend",
-    "beforeBuildCommand": "node C://Users//11196//.workbuddy//binaries//node//versions//22.22.2-6//node_modules//npm//bin//npm-cli.js run build --prefix D://Loom_agent//loom//frontend"
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [

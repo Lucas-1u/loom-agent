@@ -4,39 +4,58 @@ setlocal
 cd /d "%~dp0"
 
 REM ==========================================================================
-REM  Loom GUI 启动器
+REM  Loom 一键启动（后端 + 前端）
 REM
-REM  ★ 这个文件是 UTF-8 源，构建后生成 GBK 的 loom-gui.bat。
+REM  ★ 这是 UTF-8 源，构建后生成 GBK 的 loom-gui.bat。
 REM    改了它之后必须跑：python dev/build_bat.py
-REM    （原因见 dev/build_bat.py 顶部说明 —— cmd 按 GBK 逐字节读 bat）
 REM
-REM  ★ 本脚本刻意不用 enabledelayedexpansion、也不用 set /p：
-REM    · 前者会让 echo 里落单的 `!` 吞掉半行文字
-REM    · 后者分不清「用户敲回车」和「stdin 已关闭」
-REM    这两个坑在 loom.bat 上都踩过，这里直接绕开。
+REM  ★ 为什么开两个窗口，而不是一个窗口里后台跑两个？
+REM    Windows bat 没法可靠地"后台启动并记住 PID"：
+REM      · start /b 拿不到 PID，关的时候只能按进程名杀 → 会误杀别的 python/node
+REM      · wmic 在本机被安全策略禁用
+REM      · timeout /t 在输入被重定向时会直接报错退出
+REM    所以改成两个**带标题**的窗口，用窗口标题精确关停，绝不误杀别的进程。
+REM
+REM  ★ 不用 enabledelayedexpansion、不用 set /p：这两个坑在 loom.bat 上都踩过。
 REM ==========================================================================
 
 echo.
 echo ==============================================================
-echo   Loom GUI  ^|  前端界面
+echo   Loom  ^|  启动后端 + 前端
 echo ==============================================================
 echo.
 
-REM ---- 1. 检查 Node.js ---------------------------------------------------
+REM ---- 1. 检查 Python 虚拟环境 -------------------------------------------
+if not exist ".venv\Scripts\python.exe" (
+    echo   [X] 找不到 .venv\Scripts\python.exe
+    echo.
+    echo       请在 loom 目录下创建虚拟环境并装依赖：
+    echo         python -m venv .venv
+    echo         .venv\Scripts\pip install -r requirements.txt
+    goto done
+)
+echo   Python  .venv
+
+REM ---- 2. 检查 Node ------------------------------------------------------
 where node >nul 2>&1
 if errorlevel 1 (
     echo   [X] 没找到 node
+    echo       请先安装 Node.js 18 或更高版本：https://nodejs.org/
+    goto done
+)
+for /f "tokens=*" %%v in ('node -v') do set "NODEVER=%%v"
+echo   Node    %NODEVER%
+
+REM ---- 3. 检查 .env（没有 Key，后端起来也会立刻退出）----------------------
+if not exist ".env" (
     echo.
-    echo       请先安装 Node.js 18 或更高版本：
-    echo         https://nodejs.org/
-    echo       装完关掉这个窗口，重新双击本脚本。
+    echo   [X] 找不到 .env（后端需要 API Key）
+    echo       从模板复制一份并填入 key：
+    echo         copy .env.example .env
     goto done
 )
 
-for /f "tokens=*" %%v in ('node -v') do set "NODEVER=%%v"
-echo   Node  %NODEVER%
-
-REM ---- 2. 检查前端目录 ---------------------------------------------------
+REM ---- 4. 检查前端目录与依赖 ---------------------------------------------
 if not exist "frontend\package.json" (
     echo.
     echo   [X] 找不到 frontend\package.json
@@ -44,7 +63,6 @@ if not exist "frontend\package.json" (
     goto done
 )
 
-REM ---- 3. 首次运行：装依赖 -----------------------------------------------
 if not exist "frontend\node_modules" (
     echo.
     echo   首次运行，正在安装前端依赖...
@@ -57,10 +75,7 @@ if not exist "frontend\node_modules" (
     if not "%INSTALL_RC%"=="0" (
         echo.
         echo   [X] 依赖安装失败（exit=%INSTALL_RC%）
-        echo.
-        echo       常见原因：
-        echo         1. 网络不通 —— 先确认能访问 npm 源
-        echo         2. 代理拦截 —— 关掉系统代理再试
+        echo       常见原因：网络不通 / 代理拦截
         echo       也可以手动执行：cd frontend ^&^& npm install
         goto done
     )
@@ -68,49 +83,90 @@ if not exist "frontend\node_modules" (
     echo   依赖安装完成。
 )
 
-REM ---- 4. 端口检查（5173 被占时 vite 会直接报错，先给个提示）-----------
-REM  ★ 必须再筛一次 LISTENING：只匹配 ":5173" 会把 TIME_WAIT 的残留连接
-REM    也算进来 —— 服务关了但端口还在 TIME_WAIT 时，会被误判成"已被占用"。
-set "PORT_BUSY=0"
-netstat -ano | findstr ":5173 " | findstr "LISTENING" >nul 2>&1
-if not errorlevel 1 set "PORT_BUSY=1"
+REM ---- 5. 端口检查（只认 LISTENING，避免被 TIME_WAIT 骗）------------------
+set "BACKEND_UP=0"
+netstat -ano | findstr ":8765 " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 set "BACKEND_UP=1"
 
-if "%PORT_BUSY%"=="1" (
+set "FRONTEND_UP=0"
+netstat -ano | findstr ":5173 " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 set "FRONTEND_UP=1"
+
+REM ---- 6. 启动后端 -------------------------------------------------------
+if "%BACKEND_UP%"=="1" (
     echo.
-    echo   [提示] 5173 端口已被占用。
-    echo          多半是上次的窗口还开着 —— 那就直接访问：
+    echo   [提示] 8765 端口已有服务在监听，跳过启动后端。
+    goto start_frontend
+)
+
+echo.
+echo   启动后端...
+start "Loom-Backend" cmd /c ""%CD%\.venv\Scripts\python.exe" -m backend.server"
+
+echo   等待后端就绪（最多 40 秒）...
+set "WAITED=0"
+
+:wait_backend
+netstat -ano | findstr ":8765 " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 goto backend_ready
+set /a WAITED+=1
+if %WAITED% GEQ 40 (
     echo.
-    echo            http://localhost:5173
+    echo   [X] 后端 40 秒内没有起来。
+    echo       请看名为 Loom-Backend 的窗口里打印的报错。
+    echo       常见原因：.env 里的 Key 无效、端口被占、依赖缺失。
+    goto done
+)
+REM 用 ping 代替 timeout：timeout 在输入被重定向时会直接报错退出
+ping -n 2 127.0.0.1 >nul 2>&1
+goto wait_backend
+
+:backend_ready
+echo   后端就绪  http://127.0.0.1:8765
+
+REM ---- 7. 启动前端 -------------------------------------------------------
+:start_frontend
+if "%FRONTEND_UP%"=="1" (
     echo.
-    echo          如果不是，请先关掉占用 5173 的程序，再重跑本脚本。
-    echo.
-    echo   （这里不自动开浏览器：用 start 打开的话，浏览器会接管本窗口的
-    echo     输出句柄，脚本调用方会一直等到浏览器退出。手动复制更稳。）
+    echo   [提示] 5173 端口已有服务在监听，直接打开浏览器。
+    start "" "http://localhost:5173"
     goto done
 )
 
-REM ---- 5. 启动 -----------------------------------------------------------
 echo.
-echo   启动中，就绪后浏览器会自动打开
-echo     地址  http://localhost:5173
-echo     停止  Ctrl + C
-echo     视图  http://localhost:5173/?view=execution   （直接看执行流）
-echo.
-echo --------------------------------------------------------------
-echo.
-
-pushd frontend
-call npm run dev -- --open
-popd
+echo   启动前端...
+start "Loom-Frontend" cmd /c "cd /d "%CD%\frontend" && npm run dev -- --open"
 
 echo.
-echo --------------------------------------------------------------
-echo   前端服务已停止。
+echo ==============================================================
+echo   已启动，两个窗口：
+echo.
+echo     [Loom-Backend]    后端 Agent 服务（python -m backend.server）
+echo     [Loom-Frontend]   前端界面（vite，会自动打开浏览器）
+echo.
+echo   地址   http://localhost:5173
+echo   接口   http://127.0.0.1:8765/api/health
+echo.
+echo   关掉对应窗口 = 停掉对应服务。
+echo   按任意键   = 两个一起停。
+echo ==============================================================
+echo.
+pause >nul
+
+echo.
+echo   正在停止...
+taskkill /FI "WINDOWTITLE eq Loom-Backend*" /T /F >nul 2>&1
+taskkill /FI "WINDOWTITLE eq Loom-Frontend*" /T /F >nul 2>&1
+echo   已停止。
+goto end
 
 :done
 echo.
 echo --------------------------------------------------------------
-echo   Loom GUI 退出。
+echo   Loom 未能启动，请看上面的提示。
 echo --------------------------------------------------------------
 echo.
 pause
+
+:end
+endlocal
