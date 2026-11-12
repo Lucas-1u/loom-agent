@@ -8,6 +8,7 @@ import { WorkspaceSelector } from "./components/WorkspaceSelector";
 import { BackendBanner } from "./components/BackendBanner";
 import {
   saveSessionMode,
+  saveWebSearch,
   useActiveEvents,
   useActiveMessages,
   useActiveSession,
@@ -89,6 +90,10 @@ export default function App() {
       dispatch({ type: "SET_MODE", mode: "real" });
       dispatch({ type: "SET_CONNECTION", connection: "connected" });
       if (h.model) dispatch({ type: "SET_MODEL", model: h.model });
+      // 对比表 #21：后端没配搜索密钥就禁用开关（避免"勾了但搜不到"）
+      if (h.web_search) {
+        dispatch({ type: "SET_WEB_SEARCH_READY", ready: h.web_search.available });
+      }
 
       const sessions = await api.listSessions();
       dispatch({ type: "HYDRATE_SESSIONS", sessions });
@@ -137,6 +142,21 @@ export default function App() {
           }
         },
         onState: (s) => dispatch({ type: "SET_STREAM_STATE", state: s }),
+        // ★ 协议漂移：后端发了前端没声明的事件类型。
+        //   事件本身**没有丢**（已在 onEvent 里进了执行流，走兜底卡片），
+        //   这里只负责让它可见 —— 否则新事件会静默地以裸 JSON 混在时间线里。
+        onUnknownType: (type: string) => {
+          dispatch({ type: "MARK_UNKNOWN_EVENT", eventType: type });
+          setBanner(
+            `收到未声明的事件类型「${type}」：已照常显示（原始数据卡片），` +
+              "但前端清单落后于后端，建议同步 EVENT_TYPES 与 eventStyles。",
+          );
+          console.warn(
+            `[SSE] 未声明的事件类型：${type}\n` +
+              "  事件没有丢，已用兜底卡片渲染。请把它补进 " +
+              "frontend/src/types/events.ts 的 EVENT_TYPES 与 lib/eventStyles.ts 的 EVENT_STYLES。",
+          );
+        },
       },
     });
 
@@ -202,13 +222,13 @@ export default function App() {
           return;
         }
 
-        // 按全局 id 升序灌入，走和 SSE 相同的去重入口
+        // ★ 历史回填**不能**走 APPEND_STREAM_EVENT（2026-11-11 修）
+        //   那个入口先拿全局 id 游标去重：`sseId <= lastEventId` 就丢弃。
+        //   可是历史事件的 id 一定比"当前游标"小 —— 只要此刻别处有事件在流
+        //   （或之前连着跑过任务），整段历史会被判成"重复投递"，时间线永远是空的。
+        //   历史走 APPEND_EVENT：按 (task_id, seq) 去重，这才是它的语义。
         for (const rec of r.events) {
-          dispatch({
-            type: "APPEND_STREAM_EVENT",
-            sseId: rec.id,
-            event: rec.event,
-          });
+          dispatch({ type: "APPEND_EVENT", event: rec.event });
         }
       } catch (exc) {
         if (cancelled) return;
@@ -240,6 +260,21 @@ export default function App() {
     (mode: import("./types/events").SessionMode) => {
       dispatch({ type: "SET_SESSION_MODE", mode });
       saveSessionMode(mode);
+    },
+    [dispatch],
+  );
+
+  /**
+   * 联网搜索开关（对比表 #21）。
+   *
+   * ★ 同样只影响「下一条任务」：任务提交时把布尔值带给后端，
+   *   后端按它决定注册表里有没有 web_search —— 提交后再改前端变量
+   *   不会改变已提交任务的能力（服务端已固化）。
+   */
+  const handleWebSearchChange = useCallback(
+    (enabled: boolean) => {
+      dispatch({ type: "SET_WEB_SEARCH", enabled });
+      saveWebSearch(enabled);
     },
     [dispatch],
   );
@@ -378,6 +413,10 @@ export default function App() {
             workspace: session.workspace_path,
             // 步骤 7：把用户选的权限模式带到后端（空 = 后端默认 workspace-write）
             mode: state.sessionMode,
+            // 对比表 #21：联网搜索开关（false = 后端不注册 web_search）
+            // ★ 后端没配密钥时即便本地勾着也按 false 发（开关 UI 已禁用，
+            //   这里再兜一层，防止 localStorage 里的旧值造成"以为能搜"）
+            web_search: state.webSearch && state.webSearchReady,
           },
           idemKey,
         );
@@ -403,7 +442,7 @@ export default function App() {
         setBanner(`提交失败：${msg}`);
       }
     },
-    [dispatch, session, state.mode, state.sessionMode],
+    [dispatch, session, state.mode, state.sessionMode, state.webSearch, state.webSearchReady],
   );
 
   const handleStop = useCallback(async () => {
@@ -478,6 +517,7 @@ export default function App() {
           message={state.mode === "offline" ? "后端未启动" : ""}
           detail={banner}
           gaps={state.gaps.length}
+          drift={state.protocolDrift.length}
           demoAllowed={DEMO_ALLOWED}
           onRetry={() => void boot()}
           onEnterDemo={() => dispatch({ type: "ENTER_DEMO" })}
@@ -545,6 +585,9 @@ export default function App() {
           disabled={!session}
           mode={state.sessionMode}
           onModeChange={handleModeChange}
+          webSearch={state.webSearch}
+          onWebSearchChange={handleWebSearchChange}
+          webSearchReady={state.webSearchReady}
           hint={
             state.mode === "demo"
               ? "演示模式 · 不会调用 Agent"

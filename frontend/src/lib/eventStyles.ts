@@ -35,6 +35,14 @@ export interface EventVisualStyle {
   icon: string;
   /** 重要节点：时间线上用更大的实心圆点 */
   emphasis?: boolean;
+  /**
+   * 这条样式是**兜底**的（前端没为这个事件类型声明样式）。
+   *
+   * ★ 2026-11-11 起 EVENT_TYPES 不再是投递门票，未知类型会照常到达。
+   *   打上这个标记，卡片才能显式告诉用户"这不是设计成这样，是前端落后了" ——
+   *   否则一个裸 JSON 卡片混在时间线里，看起来就像"这个事件本来长这样"。
+   */
+  unknown?: boolean;
 }
 
 /** 静态映射：一种类型一套样式 */
@@ -50,6 +58,9 @@ export const EVENT_STYLES: Record<EventType, EventVisualStyle> = {
   "approval.request":  { label: "等待审批", tone: "amber",  icon: "!", emphasis: true },
   "approval.decision": { label: "审批结果", tone: "green",  icon: "✓" },
   "approval.expired":  { label: "审批超时", tone: "red",    icon: "◷" },
+  "user_input.request":  { label: "等待回答", tone: "amber", icon: "?", emphasis: true },
+  "user_input.response": { label: "用户回答", tone: "green", icon: "✓" },
+  "user_input.expired":  { label: "回答超时", tone: "red",   icon: "◷" },
   "permission.mode":   { label: "权限模式", tone: "amber",  icon: "⚿", emphasis: true },
   reflect:             { label: "复盘",     tone: "slate",  icon: "↻" },
   final_answer:        { label: "最终回答", tone: "teal",   icon: "★", emphasis: true },
@@ -79,6 +90,8 @@ export function resolveStyle(
     label: ev.type,
     tone: "slate" as Tone,
     icon: "·",
+    // ★ 兜底样式必须自报家门：未知事件照常显示，但要让人看出"前端不认识它"
+    unknown: true,
   };
   const d = (ev.data ?? {}) as Record<string, unknown>;
 

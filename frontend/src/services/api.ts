@@ -18,7 +18,7 @@
  */
 
 import { ENDPOINTS, url } from "./config";
-import type { EventEnvelope, TaskStatus } from "../types/events";
+import type { EventEnvelope, SessionMode, TaskStatus, UserInputAnswer } from "../types/events";
 import type { Message, Session, Task } from "../features/session/types";
 
 // --------------------------------------------------------------------------- //
@@ -167,6 +167,12 @@ export interface HealthInfo {
     dropped: number;
     subscribers: number;
   };
+  /**
+   * 对比表 #21：联网搜索能力。
+   * `available=false` 表示后端没配搜索密钥 → web_search 工具根本没注册，
+   * 此时前端开关不可点（不能让用户勾了却什么都搜不到）。
+   */
+  web_search?: { enabled: boolean; available: boolean; base_url?: string };
 }
 
 export function health(): Promise<HealthInfo> {
@@ -316,7 +322,12 @@ export async function createTask(
     session_id: string;
     workspace: string;
     /** 步骤 7：权限模式。不传 = 后端默认 workspace-write */
-    mode?: "read-only" | "workspace-write" | "full-access";
+    mode?: SessionMode;
+    /**
+     * 对比表 #21：联网搜索。true = 该任务的注册表里注册 web_search 工具；
+     * 不传/false = 模型看不到也调不到（服务端真强制，不是提示词层面）。
+     */
+    web_search?: boolean;
   },
   idemKey: string,
 ): Promise<TaskSnapshot> {
@@ -333,6 +344,16 @@ export interface TaskEventsResult {
   available: boolean;
   reason: string;
   note?: string;
+  /**
+   * 事件是从哪儿来的（对比表 #49）：
+   *   memory = 还在内存环形缓冲里（实时/刚结束）
+   *   disk   = 从 SQLite 的 task_events 读出来的（重启过、或被缓冲淘汰）
+   *   hybrid = 两段拼起来的
+   *   none   = 没有事件
+   */
+  source?: "memory" | "disk" | "hybrid" | "none";
+  /** 落盘的事件条数（`source` 为 disk/hybrid 时才有意义） */
+  archived?: number;
   events: Array<{
     id: number;              // 全局 SSE id
     task_id: string;
@@ -394,3 +415,38 @@ export async function decideApproval(
 // 便利：把 RawTask 转成前端的 Task
 // --------------------------------------------------------------------------- //
 export { toTask };
+
+// --------------------------------------------------------------------------- //
+// ask_user：回答 Agent 的问题
+// --------------------------------------------------------------------------- //
+export interface UserInputResult {
+  accepted: boolean;
+  /** answered = 唤醒了挂起的 Agent；late = 超时后才答，Agent 下一步才看到 */
+  status?: "answered" | "late" | "invalid";
+  reason: string;
+  note: string;
+}
+
+/**
+ * 提交对 ask_user 问题的回答。
+ *
+ * ★ 一批答案一起交（对齐 DSH）：`answers` 里每项对应一个问题；
+ *   `selected` 为空且没有 `custom` 表示"跳过这个问题"。
+ */
+export async function answerUserInput(
+  taskId: string,
+  askId: string,
+  answers: UserInputAnswer[],
+): Promise<UserInputResult> {
+  try {
+    return await request<UserInputResult>(ENDPOINTS.userInput(taskId), {
+      method: "POST",
+      body: { ask_id: askId, answers },
+    });
+  } catch (exc) {
+    if (exc instanceof ApiError && exc.status === 409) {
+      return { accepted: false, reason: "conflict", note: exc.note };
+    }
+    throw exc;
+  }
+}

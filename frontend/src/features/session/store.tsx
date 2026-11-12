@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import type { EventEnvelope, PermissionModeData, SessionMode, TaskStatus } from "../../types/events";
+import { SESSION_MODES } from "../../types/events";
 import type { ApprovalItem, ConnectionState, ViewMode } from "../../types/chat";
 import type { Message, Session, Task } from "./types";
 import { workspaceKey } from "./workspace";
@@ -74,11 +75,35 @@ export interface LoomStore {
   sessionMode: SessionMode;
   /** 每个任务实际生效的模式（来自 permission.mode 事件），按 task_id 索引 */
   taskModes: Record<string, PermissionModeData>;
+  /**
+   * 下一条任务是否允许联网搜索（对比表 #21）。
+   *
+   * ★ 与 sessionMode 同性质：这是**用户选择**，不是运行中任务的能力。
+   *   真实生效与否由后端决定（不勾选 = 注册表里根本没有 web_search，
+   *   模型看不到也调不到，纯服务端强制）。
+   */
+  webSearch: boolean;
+  /**
+   * 后端是否真的具备联网搜索能力（来自 /api/health 的 web_search.available）。
+   *
+   * ★ 默认 true：离线/演示模式不该把开关锁死，否则用户以为是自己配错了。
+   *   只有后端明确回 available=false 才禁用。
+   */
+  webSearchReady: boolean;
 
   /** 全局 SSE id 游标：去重基准 + 重连补发的 since */
   lastEventId: number;
   /** 收到的缺口通知（stream.gap），UI 据此提示"事件不完整" */
   gaps: GapInfo[];
+  /**
+   * 服务端发来过、但本地 `EVENT_TYPES` 没声明的事件类型（协议漂移）。
+   *
+   * ★ 和 `gaps` 的区别：gaps 是"没收到"，drift 是"收到了但我不认识"。
+   *   后者**不会丢**（事件照常进执行流，走兜底卡片），这条只是让用户/开发者
+   *   知道"前端清单落后于后端，该同步了"。
+   *   没有它的话，新事件会静默地以丑陋的 JSON 卡片混在时间线里，没人会去查。
+   */
+  protocolDrift: string[];
 
   // ---- 数据 ----
   sessions: Record<string, Session>;
@@ -131,12 +156,16 @@ export type LoomAction =
   | { type: "HYDRATE_SESSIONS"; sessions: Session[] }
   | { type: "MARK_GAP"; gap: GapInfo }
   | { type: "CLEAR_GAPS" }
+  /** 记录一种"后端发了、前端没声明"的事件类型（去重，只留最近 20 种） */
+  | { type: "MARK_UNKNOWN_EVENT"; eventType: string }
   | { type: "SET_APPROVAL_SUBMITTING"; approvalId: string; submitting: boolean }
   | { type: "RESOLVE_APPROVAL"; approvalId: string; status: "approved" | "rejected" | "expired" }
   | { type: "ENTER_DEMO" }
   | { type: "EXIT_DEMO" }
   /** 步骤 7：改"下一条任务"的权限模式（不改变正在跑的任务） */
-  | { type: "SET_SESSION_MODE"; mode: SessionMode };
+  | { type: "SET_SESSION_MODE"; mode: SessionMode }
+  | { type: "SET_WEB_SEARCH"; enabled: boolean }
+  | { type: "SET_WEB_SEARCH_READY"; ready: boolean };
 
 // --------------------------------------------------------------------------- //
 // 初始状态
@@ -150,8 +179,11 @@ export function emptyStore(): LoomStore {
     model: "",
     sessionMode: "workspace-write",
     taskModes: {},
+    webSearch: false,
+    webSearchReady: true,
     lastEventId: 0,
     gaps: [],
+    protocolDrift: [],
     sessions: {},
     tasks: {},
     messages: {},
@@ -171,12 +203,14 @@ export function emptyStore(): LoomStore {
  * ★ 为什么用 try/catch：隐私模式下 localStorage 会抛异常，不能让它拖垮首屏。
  */
 const MODE_STORAGE_KEY = "loom.sessionMode";
-const VALID_MODES: SessionMode[] = ["read-only", "workspace-write", "full-access"];
+// ★ 直接用类型模块里的运行时清单，不在这里另抄一份 ——
+//   抄一份就等于有第二个真相：补 desktop 时这里忘了改，刷新后选择会被静默重置。
+const VALID_MODES: readonly string[] = SESSION_MODES;
 
 function loadSessionMode(): SessionMode {
   try {
     const raw = window.localStorage.getItem(MODE_STORAGE_KEY);
-    if (raw && (VALID_MODES as string[]).includes(raw)) return raw as SessionMode;
+    if (raw && VALID_MODES.includes(raw)) return raw as SessionMode;
   } catch {
     /* 存储不可用时按默认处理，不报错 */
   }
@@ -191,6 +225,30 @@ export function saveSessionMode(mode: SessionMode): void {
   }
 }
 
+/**
+ * 联网搜索开关的本地持久化（对比表 #21）
+ *
+ * ★ 与权限模式同理，这是工作偏好。默认 **关**：不勾选时后端注册表里
+ *   根本没有 web_search 工具，与历史行为一致（不偷偷往外发请求）。
+ */
+const WEB_SEARCH_STORAGE_KEY = "loom.webSearch";
+
+function loadWebSearch(): boolean {
+  try {
+    return window.localStorage.getItem(WEB_SEARCH_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function saveWebSearch(enabled: boolean): void {
+  try {
+    window.localStorage.setItem(WEB_SEARCH_STORAGE_KEY, enabled ? "1" : "0");
+  } catch {
+    /* 忽略：持久化失败不影响本次会话 */
+  }
+}
+
 function makeInitialState(): LoomStore {
   const q = new URLSearchParams(window.location.search);
   const view: ViewMode = q.get("view") === "execution" ? "execution" : "chat";
@@ -198,10 +256,16 @@ function makeInitialState(): LoomStore {
   // ★ 默认永远是"检查中"的空状态 —— 要不要进演示模式由用户点，不由代码决定。
   //   `?demo=1` 留给截图/离线预览用（仍算"手动"）。
   if (q.get("demo") === "1" && DEMO_ALLOWED) {
-    return { ...emptyStore(), ...DEMO_SEED(), viewMode: view, mode: "demo", collapsedGroups: {} };
+    return {
+      ...emptyStore(), ...DEMO_SEED(), viewMode: view, mode: "demo",
+      collapsedGroups: {}, webSearch: loadWebSearch(),
+    };
   }
 
-  return { ...emptyStore(), viewMode: view, sessionMode: loadSessionMode() };
+  return {
+    ...emptyStore(), viewMode: view,
+    sessionMode: loadSessionMode(), webSearch: loadWebSearch(),
+  };
 }
 
 // --------------------------------------------------------------------------- //
@@ -294,6 +358,16 @@ export function reducer(state: LoomStore, action: LoomAction): LoomStore {
     case "CLEAR_GAPS":
       return { ...state, gaps: [] };
 
+    case "MARK_UNKNOWN_EVENT": {
+      // ★ 去重：同一种类型只记一次（SSE 层已经按会话去重，这里再兜一层 —— reducer 是纯函数，
+      //   可能被别处直接 dispatch，不能假设上游已经去过重）。
+      if (state.protocolDrift.includes(action.eventType)) return state;
+      return {
+        ...state,
+        protocolDrift: [...state.protocolDrift, action.eventType].slice(-20),
+      };
+    }
+
     case "ENTER_DEMO": {
       // ★ 演示模式与真实数据隔离：进去时**整个换掉**，不是叠加
       const seeded = DEMO_SEED();
@@ -310,6 +384,14 @@ export function reducer(state: LoomStore, action: LoomAction): LoomStore {
     case "SET_SESSION_MODE":
       // 只改"下一条任务"的选择；正在跑的任务不受影响（它的模式已经广播过了）
       return { ...state, sessionMode: action.mode };
+
+    case "SET_WEB_SEARCH":
+      // 同上：只影响下一条任务
+      return { ...state, webSearch: action.enabled };
+
+    case "SET_WEB_SEARCH_READY":
+      // 后端能力探测结果（available=false → 开关禁用）
+      return { ...state, webSearchReady: action.ready };
 
     case "SET_CONNECTION":
       return { ...state, connection: action.connection };

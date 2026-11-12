@@ -55,11 +55,15 @@ function taskA1Events(taskId: string, base: number): EventEnvelope[] {
       workspace: "D:\\Loom_agent\\loom",
       model: "qwen3.7-plus",
     }),
-    ev(taskId, "thinking", {
-      text: "先看目录结构，再读入口文件和 README，最后决定补哪一节。",
-      phase: "plan",
-      done: true,
-    }),
+    // ★ 这里故意拆成多条 delta：真实后端把推理流按 0.15s / 80 字符节流
+    //   （backend/agent/core.py::_call_model），一次模型调用会发几十条十几字的
+    //   thinking。前端把相邻的合并成一段可折叠的卡 —— 演示数据要长得像真流量，
+    //   否则"合并"这件事在演示里根本看不出来。
+    ev(taskId, "thinking", { text: "先看目录结构，", phase: "act", done: false }),
+    ev(taskId, "thinking", { text: "再读入口文件和 README，", phase: "act", done: false }),
+    ev(taskId, "thinking", { text: "最后决定补哪一节。\n", phase: "act", done: false }),
+    ev(taskId, "thinking", { text: "注意 README 已经有一节「安装」，别重复。", phase: "act", done: false }),
+    ev(taskId, "thinking", { text: "", phase: "act", done: true }),
     ev(taskId, "plan", {
       steps: [
         { title: "查看项目根目录", detail: "list_files 拿到顶层结构", status: "done" },
@@ -99,6 +103,11 @@ function taskA1Events(taskId: string, base: number): EventEnvelope[] {
       },
       duration_ms: 3,
     }, 2),
+    // ★ 工具失败之后又想的这一小段：因为中间隔着 tool.call / tool.result，
+    //   它会**另起一张思考卡**，而不是并进第一段 —— 这正是要验证的分段语义。
+    ev(taskId, "thinking", { text: "路径写错了。", phase: "act", done: false }),
+    ev(taskId, "thinking", { text: "README 应该在根目录，刚才多写了一层 docs/。", phase: "act", done: false }),
+    ev(taskId, "thinking", { text: "", phase: "act", done: true }),
     ev(taskId, "act", { intent: "路径写错了，README 在根目录", tool: "read_file" }, 2),
     ev(taskId, "tool.call", { call_id: "call_3", tool: "read_file", args: { path: "README.md" } }, 2),
     ev(taskId, "tool.result", {

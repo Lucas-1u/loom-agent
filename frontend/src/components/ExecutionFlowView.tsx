@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EventEnvelope } from "../types/events";
 import type { Task } from "../features/session/types";
 import { buildTaskTree } from "../features/session/taskTree";
+import { mergeThinkingEvents } from "../features/events/mergeThinking";
 import { sameWorkspace } from "../features/session/workspace";
 import { EventTimeline } from "./EventTimeline";
 import { TaskTree } from "./TaskTree";
@@ -38,8 +39,27 @@ export function ExecutionFlowView({
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const [newSinceLeave, setNewSinceLeave] = useState(0);
-  const lastCount = useRef(events.length);
   const [expandedPicker, setExpandedPicker] = useState(false);
+
+  /**
+   * 渲染用的时间线：**相邻的思考 delta 先合并成一段**（见 mergeThinkingEvents）。
+   *
+   * ★ 在这里算而不是在 EventTimeline 里算：下面的自动滚动、"+N 条"计数
+   *   都要用"卡片条数"而不是"原始事件条数" —— 否则一次思考会跳 5 次，
+   *   用户看到的是 "+37" 这种没法解读的数字。
+   * ★ 原始事件一条不少，仍在 `events` 里；这里只是派生出**另一种计数口径**。
+   */
+  const timeline = useMemo(() => mergeThinkingEvents(events), [events]);
+  /** 原始事件被折掉多少条（只用于底部那行说明，如实告知合并了什么） */
+  const folded = events.length - timeline.length;
+  const thinkSegments = useMemo(
+    () => timeline.filter((e) => e.type === "thinking").length,
+    [timeline],
+  );
+  /** 上一次渲染的**卡片**条数（不是事件条数）—— 用于算"错过了几条" */
+  const lastCount = useRef(timeline.length);
+  /** 已经为哪个任务做过"定位到底部"（见下面的定位 effect） */
+  const positionedFor = useRef<string | null>(null);
 
   const activeTask = useMemo(
     () => tasks.find((t) => t.task_id === activeTaskId) ?? null,
@@ -70,15 +90,27 @@ export function ExecutionFlowView({
     new URLSearchParams(window.location.search).get("scroll") === "top" ? "top" : "bottom",
   );
 
-  // 首帧 / 切换任务时定位到底部
+  /**
+   * 首帧 / 切换任务时定位到底部。
+   *
+   * ★ 这个 effect 以前把 `events.length` 写进依赖，于是**每来一条事件都会执行一次**：
+   *   强制拉回底部（用户往上翻根本翻不住）+ 每次 `setAtBottom(true)`
+   *   → 下面那个"回到最新"按钮永远不出现。注释写的是"首帧/切任务"，代码却在每帧跑。
+   *   现在用 `positionedFor` 这个 ref 做闸门：同一个任务只定位一次；
+   *   依赖列表仍然完整（lint 不用关规则），行为才是注释说的那个意思。
+   */
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+    const key = activeTaskId ?? "";
+    if (positionedFor.current === key) return; // 这个任务已经定位过，不要抢用户的滚动
+    positionedFor.current = key;
+
     el.scrollTop = initialScroll.current === "top" ? 0 : el.scrollHeight;
-    lastCount.current = events.length;
+    lastCount.current = timeline.length;
     setAtBottom(true);
     setNewSinceLeave(0);
-  }, [activeTaskId, events.length]);
+  }, [activeTaskId, timeline.length]);
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -91,19 +123,24 @@ export function ExecutionFlowView({
 
   useEffect(() => {
     const el = scrollRef.current;
-    const grew = events.length - lastCount.current;
-    lastCount.current = events.length;
+    const grew = timeline.length - lastCount.current;
+    lastCount.current = timeline.length;
 
     if (!el || grew <= 0) return;
 
     if (atBottom) {
+      /* ★ 跟随新事件用**瞬时**滚动，不用 smooth。
+       *   smooth 动画期间 scroll 事件里的 distance 还很大，会把 atBottom 翻成 false
+       *   → 下一条事件就不跟了，用户卡在半路看到"回到最新 +N"。
+       *   日志型界面本来就是"贴着底走"，瞬时更稳也更跟得上。
+       *   （按钮上的"回到最新"仍然用 smooth —— 那是用户主动的一次位移。） */
       requestAnimationFrame(() => {
-        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        el.scrollTop = el.scrollHeight;
       });
     } else {
       setNewSinceLeave((n) => n + grew);
     }
-  }, [events.length, atBottom]);
+  }, [timeline.length, atBottom]);
 
   const scrollToBottom = useCallback(() => {
     const el = scrollRef.current;
@@ -176,12 +213,18 @@ export function ExecutionFlowView({
             className="h-full overflow-y-auto overscroll-contain px-4 py-4"
           >
             <div className="mx-auto max-w-[860px]">
-              <EventTimeline events={events} onApprovalResolve={onApprovalResolve} />
+              <EventTimeline items={timeline} onApprovalResolve={onApprovalResolve} />
 
               <div className="flex items-center gap-2 pl-8 pt-1">
                 <span className="h-1.5 w-1.5 rounded-full bg-ink-700" />
                 <span className="text-[10px] text-slate-600">
                   共 {events.length} 条事件 · 全部来自后端事件流
+                  {/* ★ 合并了就要说出来，不能让"少了几十条"变成没人解释的谜 */}
+                  {folded > 0 && (
+                    <span className="text-slate-700">
+                      （思考合并为 {thinkSegments} 段，省下 {folded} 张卡片）
+                    </span>
+                  )}
                 </span>
               </div>
             </div>

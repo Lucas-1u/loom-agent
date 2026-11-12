@@ -1,8 +1,9 @@
 import { useState } from "react";
-import type { EventEnvelope } from "../types/events";
+import type { EventEnvelope, UserInputAnswer } from "../types/events";
 import { resolveStyle, TONE } from "../lib/eventStyles";
 import { Markdown } from "./Markdown";
 import { ApprovalCard } from "./ApprovalCard";
+import { UserInputCard } from "./UserInputCard";
 
 /**
  * 单个事件卡片
@@ -23,6 +24,11 @@ export function EventCard({
   const style = resolveStyle(ev);
   const tone = TONE[style.tone];
   const dotSize = style.emphasis ? "h-3.5 w-3.5 left-[2px]" : "h-2.5 w-2.5 left-[4px]";
+
+  // 思考卡是**合并段**：seq 区间由 mergeThinkingEvents 写在 data 里。
+  // 其它事件没有这两个键 → 退回单条 seq，行为不变。
+  const seqFrom = Number((ev.data as Record<string, unknown>)?.seq_from ?? ev.seq);
+  const seqTo = Number((ev.data as Record<string, unknown>)?.seq_to ?? ev.seq);
 
   return (
     <div className="loom-enter relative pb-3 pl-8">
@@ -45,19 +51,28 @@ export function EventCard({
           <span className={`text-[11.5px] font-medium tracking-wide ${tone.text}`}>
             {style.label}
           </span>
+          {/* ★ 前端没声明过这个事件类型：照常显示，但明确标出来（否则裸 JSON 看着像"本来就长这样"） */}
+          {style.unknown && (
+            <span
+              className="rounded bg-tone-violet/15 px-1 py-px text-[9.5px] text-tone-violet"
+              title="前端 EVENT_TYPES / EVENT_STYLES 里没有这个类型，已用兜底样式渲染"
+            >
+              未声明
+            </span>
+          )}
           {ev.turn > 0 && (
             <span className="rounded bg-ink-800 px-1 py-px font-mono text-[9.5px] text-slate-500">
               t{ev.turn}
             </span>
           )}
           <span className="ml-auto font-mono text-[9.5px] text-slate-600">
-            #{ev.seq}
+            {seqTo > seqFrom ? `#${seqFrom}–${seqTo}` : `#${ev.seq}`}
           </span>
         </div>
 
         {/* 内容 */}
         <div className="px-3 py-2">
-          <EventBody ev={ev} onApprovalResolve={onApprovalResolve} />
+          <EventBody ev={ev} isLast={isLast} onApprovalResolve={onApprovalResolve} />
         </div>
       </div>
     </div>
@@ -69,9 +84,12 @@ export function EventCard({
 // --------------------------------------------------------------------------- //
 function EventBody({
   ev,
+  isLast,
   onApprovalResolve,
 }: {
   ev: EventEnvelope;
+  /** 是否是时间线最后一条 —— 思考卡据此决定"边写边展开" */
+  isLast: boolean;
   onApprovalResolve?: (id: string, approved: boolean) => void;
 }) {
   const d = ev.data as Record<string, unknown>;
@@ -127,8 +145,12 @@ function EventBody({
     }
 
     case "thinking": {
+      // ★ 这里的 data 已经是 mergeThinkingEvents 的产物：text 是多条 delta 拼起来的，
+      //   parts 说明它吸收了多少条原始事件；seq 区间由卡片头部显示。
       const text = String(d.text ?? "");
-      return <Collapsible text={text} mono={false} maxHeight={120} />;
+      const parts = Number(d.parts ?? 1);
+      const done = Boolean(d.done);
+      return <ThinkingBlock text={text} parts={parts} live={isLast && !done} />;
     }
 
     case "act":
@@ -372,6 +394,84 @@ function EventBody({
         </p>
       );
 
+    case "user_input.request":
+      return <UserInputCard data={d} />;
+
+    case "user_input.response": {
+      const answers = Array.isArray(d.answers) ? (d.answers as UserInputAnswer[]) : [];
+      const late = Boolean(d.late);
+      return (
+        <div className="space-y-1 text-[12px]">
+          <div className="flex items-center gap-1.5">
+            <span className="text-tone-green">用户回答</span>
+            {late && (
+              <span
+                className="rounded bg-tone-amber/15 px-1 py-px text-[9.5px] text-tone-amber"
+                title="这条回答是在 Agent 等待超时之后才提交的，Agent 会在下一步看到"
+              >
+                补答
+              </span>
+            )}
+          </div>
+          {answers.length === 0 ? (
+            <p className="text-slate-300">{String(d.answer ?? "")}</p>
+          ) : (
+            <ul className="space-y-0.5">
+              {answers.map((a, i) => {
+                const sel = a.selected ?? [];
+                const custom = String(a.custom ?? "").trim();
+                return (
+                  <li key={`${a.id}-${i}`} className="flex flex-wrap items-baseline gap-1.5">
+                    <span className="font-mono text-[10px] text-slate-600">{a.id}</span>
+                    {sel.map((s) => (
+                      <span
+                        key={s}
+                        className="rounded bg-tone-cyan/10 px-1.5 py-px text-[11px] text-tone-cyan"
+                      >
+                        {s}
+                      </span>
+                    ))}
+                    {custom && (
+                      <span
+                        className="rounded bg-tone-violet/10 px-1.5 py-px text-[11px] text-tone-violet"
+                        title="用户自己填写的内容"
+                      >
+                        {custom}
+                      </span>
+                    )}
+                    {sel.length === 0 && !custom && (
+                      <span className="text-[11px] text-slate-600">（跳过）</span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      );
+    }
+
+    case "user_input.expired": {
+      const pending = Boolean(d.pending);
+      // pending = 前台等待超时但问题没作废：直接长出一张可操作卡片，
+      // 否则「仍然可以回答」只是一句话，用户还得往上翻原卡片。
+      if (pending) {
+        return (
+          <div className="space-y-1.5">
+            <p className="text-[11.5px] text-tone-amber">
+              前台等待超时（不是拒绝、不是跳过）——Agent 已继续，但你仍可以回答
+            </p>
+            <UserInputCard data={d} />
+          </div>
+        );
+      }
+      return (
+        <p className="text-[12px] text-tone-red">
+          用户未在超时时间内回答（{String(d.question ?? "").slice(0, 60)}）
+        </p>
+      );
+    }
+
     case "permission.mode": {
       const mode = String(d.mode ?? "");
       const source = String(d.source ?? "");
@@ -379,9 +479,12 @@ function EventBody({
       const modeTone =
         mode === "read-only"
           ? "text-tone-cyan"
-          : mode === "full-access"
-            ? "text-tone-red"
-            : "text-tone-green";
+          : mode === "desktop"
+            ? // 桌面操控是唯一的"物理动作"档，配色跟 full-access 同红但加粗提示
+              "text-tone-red font-semibold"
+            : mode === "full-access"
+              ? "text-tone-red"
+              : "text-tone-green";
       return (
         <div className="space-y-1 text-[12px]">
           <p className="flex flex-wrap items-center gap-x-2">
@@ -558,6 +661,85 @@ function ArgSummary({ args }: { args: Record<string, unknown> }) {
       )}
     </div>
   );
+}
+
+/**
+ * 思考段（多条 delta 合并后的一段推理）
+ *
+ * ★ 折叠规则（这是本次改造的重点，改之前先想清楚为什么这么定）：
+ *   · **只有"正在写的那一段"默认展开** —— 流式观感保留，用户仍然能看模型在想什么
+ *   · 段一旦结束（收到 done 标记 / 后面来了工具调用）就**自动收起成两行预览**
+ *     → 一次任务跑完，时间线上留下的是「思考 1 段、工具 1 次、思考 1 段」的结构，
+ *       而不是几十张十几字的卡片
+ *   · 用户点过之后**以用户为准**（override 粘住），不再跟着 live 变
+ *     —— 否则正在读的段落突然自己收起来，比不折叠更烦
+ *
+ * ★ 展开态的高度策略：
+ *   live 时不设上限（内容随流增长，外层自动滚动能跟上）；
+ *   回看历史段时才套 `max-h` + 内部滚动（避免一屏被一段超长推理占满）。
+ */
+function ThinkingBlock({
+  text,
+  parts,
+  live,
+}: {
+  text: string;
+  parts: number;
+  live: boolean;
+}) {
+  const [override, setOverride] = useState<boolean | null>(null);
+  const open = override ?? live;
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOverride(true)}
+        className="group block w-full text-left"
+        title="展开这段思考的完整内容"
+      >
+        <p className="line-clamp-2 text-[12px] leading-relaxed text-slate-500 group-hover:text-slate-300">
+          {previewOf(text) || "（空）"}
+        </p>
+        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-slate-600 group-hover:text-slate-500">
+          <span>▸ 展开</span>
+          {parts > 1 && <span>合并 {parts} 段</span>}
+          <span>{text.length} 字</span>
+        </div>
+      </button>
+    );
+  }
+
+  return (
+    <div>
+      <pre
+        className={`selectable whitespace-pre-wrap break-words text-[11.5px] leading-relaxed text-slate-400 ${
+          live ? "" : "max-h-[360px] overflow-auto rounded border border-ink-700 bg-ink-950/40 px-2 py-1.5"
+        }`}
+      >
+        {text}
+      </pre>
+      <button
+        type="button"
+        onClick={() => setOverride(false)}
+        className="mt-1 flex items-center gap-1.5 text-[10.5px] text-slate-600 transition-colors hover:text-tone-cyan"
+      >
+        <span>▾ 收起</span>
+        {(parts > 1 || !live) && (
+          <span className="text-slate-700">
+            {parts > 1 ? `${parts} 段 · ` : ""}
+            {text.length} 字
+          </span>
+        )}
+      </button>
+    </div>
+  );
+}
+
+/** 收起态的一行预览：压掉换行、截断（中文按字符算，别用 CSS 之外的单位猜） */
+function previewOf(text: string, max = 160): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
 /**

@@ -50,6 +50,9 @@ export const ENDPOINTS = {
   // ---- 审批 ----
   approvalDecision: (id: string) => `/api/approvals/${id}/decision`,
 
+  // ---- 询问用户（ask_user）----
+  userInput: (taskId: string) => `/api/tasks/${taskId}/user-input`,
+
   // ---- SSE ----
   stream: "/api/stream",
 } as const;

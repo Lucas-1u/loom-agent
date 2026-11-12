@@ -122,6 +122,12 @@ const MODE_META: Record<SessionMode, { label: string; short: string; cls: string
     cls: "border-tone-red/35 bg-tone-red/10 text-tone-red",
     tip: "完全访问：不受沙箱写限制，可写宿主机任意位置",
   },
+  desktop: {
+    label: "桌面操控",
+    short: "DT",
+    cls: "border-tone-red/50 border-dashed bg-tone-red/15 text-tone-red",
+    tip: "桌面操控：可截屏、移动鼠标、点击与输入，直接操作当前桌面",
+  },
 };
 
 function PermissionBadge({

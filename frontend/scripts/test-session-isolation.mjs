@@ -207,5 +207,46 @@ eq(demoed.sessionMode, "read-only", "★ 进演示模式保留权限选择");
 const exited = reducer(demoed, { type: "EXIT_DEMO" });
 eq(exited.sessionMode, "read-only", "★ 退出演示模式保留权限选择");
 
+
+// --------------------------------------------------------------------------- //
+// 历史事件回填：不能被全局游标吞掉（对比表 #49 的配套修复）
+// --------------------------------------------------------------------------- //
+{
+  const thinkEv = (seq) => ({
+    seq,
+    ts: now + seq,
+    task_id: "tH",
+    turn: 1,
+    type: "thinking",
+    data: { text: `片段${seq}`, phase: "act", done: false },
+  });
+
+  const st0 = reducer(emptyStore(), { type: "START_TASK", task: task("tH", "s1", "历史回填"), userMessage: userMsg("u", "s1", "tH", "历史回填") });
+
+  // 模拟"此刻别处有事件在流"：游标已经跑到 100
+  let ahead = reducer(st0, {
+    type: "APPEND_STREAM_EVENT",
+    sseId: 100,
+    event: { ...thinkEv(1), task_id: "tOther" },
+  });
+  eq(ahead.lastEventId, 100, "游标已推进到 100（别的任务在流）");
+
+  // 对照组：用 STREAM 入口回填历史 → 被当成重复投递丢掉（这就是修之前的 bug）
+  const wrong = reducer(ahead, { type: "APPEND_STREAM_EVENT", sseId: 2, event: thinkEv(2) });
+  eq((wrong.events.tH ?? []).length, 0, "★ 对照组：历史走 STREAM 入口会被游标吞掉（bug 是真的）");
+
+  // 正确做法：历史走 APPEND_EVENT（按 (task_id, seq) 去重，不看全局游标）
+  let right = ahead;
+  for (const seq of [1, 2, 3]) {
+    right = reducer(right, { type: "APPEND_EVENT", event: thinkEv(seq) });
+  }
+  eq((right.events.tH ?? []).map((e) => e.seq), [1, 2, 3], "★★ 历史走 APPEND_EVENT 三条都在");
+  eq(right.lastEventId, 100, "★ 回填历史不改全局游标（SSE 补发基准不能被动）");
+
+  // 幂等：同一批历史再灌一次不会翻倍
+  const again = reducer(right, { type: "APPEND_EVENT", event: thinkEv(2) });
+  eq((again.events.tH ?? []).length, 3, "★ 重复回填按 seq 去重");
+}
+
 console.log(`\n结果：${pass}/${pass + fail} 通过`);
 if (fail > 0) process.exitCode = 1;

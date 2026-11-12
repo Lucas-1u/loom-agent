@@ -9,6 +9,7 @@ import type { AppMode } from "../features/session/store";
  *   offline  → 「后端未启动」+ 重试 + 查看演示数据   （琥珀/红）
  *   demo     → 「演示数据」+ 退出演示               （琥珀，常驻）
  *   gap      → 「事件流有缺口」                     （琥珀，可关）
+ *   drift    → 「未声明事件 ×N」                    （紫，提醒协议漂移；事件本身没丢）
  *   message  → 操作结果的临时提示                   （红/蓝，可关）
  *
  * ★ 为什么不用 toast？
@@ -21,6 +22,7 @@ export function BackendBanner({
   message,
   detail,
   gaps,
+  drift,
   demoAllowed,
   onRetry,
   onEnterDemo,
@@ -32,6 +34,8 @@ export function BackendBanner({
   message: string;
   detail: string;
   gaps: number;
+  /** 收到了但本地没声明的事件类型数（协议漂移，事件没丢） */
+  drift: number;
   demoAllowed: boolean;
   onRetry: () => void;
   onEnterDemo: () => void;
@@ -89,7 +93,7 @@ export function BackendBanner({
   const disconnected = streamState === "closed";
 
   return (
-    <Bar tone={gaps > 0 || disconnected ? "amber" : reconnecting ? "slate" : "red"}>
+    <Bar tone={gaps > 0 || drift > 0 || disconnected ? "amber" : reconnecting ? "slate" : "red"}>
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
         <div className="flex flex-wrap items-center gap-2">
           {reconnecting && (
@@ -98,6 +102,14 @@ export function BackendBanner({
           {gaps > 0 && (
             <span className="shrink-0 rounded bg-tone-amber/20 px-1.5 py-px text-[10px] text-tone-amber">
               事件流缺口 ×{gaps}
+            </span>
+          )}
+          {drift > 0 && (
+            <span
+              className="shrink-0 rounded bg-tone-violet/20 px-1.5 py-px text-[10px] text-tone-violet"
+              title="这些事件照常显示了，只是前端没有为它们定义中文标签与配色"
+            >
+              未声明事件 ×{drift}
             </span>
           )}
           {disconnected && (
