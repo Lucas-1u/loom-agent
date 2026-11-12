@@ -145,14 +145,31 @@ cd frontend && npm install && npm run dev     # http://localhost:5173
 四件事少做一件就会报错。GUI 版还会查端口、起 Vite、自动开浏览器。
 装到桌面：`python dev/install_desktop.py`。
 
-Tauri 桌面壳（`src-tauri/`）开发模式启动：
+Tauri 桌面壳（`src-tauri/`）：
 
 ```bat
 cd /d D:\path\to\loom
-node "<全局 node 路径>\@tauri-apps\cli\tauri.js" dev
+tauri dev                              :: 开发：起 Vite + 弹窗，热更新
+tauri build --no-bundle                :: 出 release exe（不打扰安装器）
 ```
 
-会同时起 Vite（5173）、Rust 后端（8765）并弹出 Tauri 窗口；关窗口后端自动退出。
+- `tauri` CLI 来自 `npm i -g @tauri-apps/cli`（本机已装；国内用 `--registry=https://registry.npmmirror.com`）。
+- 构建钩子在 `tauri.conf.json` 里写的是 `npm run dev` / `npm run build`。
+  **实测工作目录是 `frontend/`（不是仓库根）** —— Tauri 把 `frontendDist: "../frontend/dist"`
+  的上一级当前端目录，所以钩子里直接写 npm 就行，别写绝对路径（换机器会断）。
+- `tauri build` 会把 `frontend/dist` **编译进 exe**，所以改完前端必须重新 build，
+  否则窗口里还是旧的 UI。
+- 产物 `src-tauri/target/release/loom-agent.exe` 双击即用：它自己拉起后端，关窗口后端自动退出。
+  ★ 但如果你**已经**在跑 `loom-gui.bat`（8765 被占用），它会**复用**那个后端，退出时**不会**杀掉它。
+- 仍然是"跑仓库里的代码"：要求 `<仓库>/.venv` 和源码目录在。exe 挪走后靠
+  「从 exe 逐级向上找 `backend/server/__main__.py`」定位；实在找不到就设
+  `LOOM_ROOT=D:\Loom_agent\loom`。
+- **选工作目录走系统原生对话框**（`tauri-plugin-dialog`）：
+  Rust 侧 `.plugin(tauri_plugin_dialog::init())`，能力在 `capabilities/default.json` 里开 `dialog:default`，
+  前端在 `services/native.ts` 里收敛成一个 `pickDirectory()`。
+  浏览器开发模式没有这个能力 → 退回 `prompt()` 手输（不是"没做"）。
+  ★ 前端不能静态 import 那个插件：要 `isTauri()` + 动态 import，否则浏览器模式下白挂。
+- 打包成能发给别人的安装包还没做（缺 Python 运行时 + `find_loom_root` 对安装路径的适配）。
 
 ### 3.5 Docker 沙箱（`run_command` 用）
 
