@@ -17,6 +17,17 @@
       "trust": "prompt",
       "read_tools": ["read_note"],
       "timeout_s": 30
+    },
+    {
+      "_说明": "Computer Use：Vercel Labs agent-desktop（纯 Windows UIA 树感知，不截图、不需要视觉模型）。需 npm 全局安装 agent-desktop。观察类工具列进 read_tools 自动放行；点击/输入/拖拽等默认 WRITE。",
+      "id": "agent_desktop",
+      "command": "agent-desktop",
+      "args": ["mcp"],
+      "enabled": true,
+      "trust": "prompt",
+      "read_tools": ["desktop_snapshot", "desktop_find", "desktop_get", "desktop_is",
+                      "desktop_list_windows", "desktop_list_displays", "desktop_list_apps"],
+      "timeout_s": 60
     }
   ]
 }

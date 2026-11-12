@@ -25,11 +25,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 import uuid
 from typing import Any
 
+from ..agent.checkpoint import LocalDiskCheckpointStore, plan_resume
 from ..agent.core import AgentConfig
 from ..models.adapter import ModelAdapter
 from ..tools.registry import ToolRegistry
@@ -62,6 +65,7 @@ class TaskScheduler:
         knowledge: object | None = None,
         spawner: object | None = None,
         readonly_registry: ToolRegistry | None = None,
+        no_desktop_registry: ToolRegistry | None = None,
     ) -> None:
         self._store = store
         self._hub = hub
@@ -70,6 +74,9 @@ class TaskScheduler:
         # 步骤 7：read-only 会话模式用的工具子集（只含 risk=read）。
         # 不传 = 服务端不支持按模式切换（老行为，read-only 只声明不强制）。
         self._readonly_registry = readonly_registry
+        # ★ desktop 模式接入：剔除桌面工具（computer 组 + desktop_* MCP 工具）的注册表，
+        #   workspace-write / full-access 使用。不传 = 不支持剔除（老行为）。
+        self._no_desktop_registry = no_desktop_registry
         self._config = config
         self._max_global = max_global
         # M3：项目知识库（同一进程内被所有任务共享；按 workspace 隔离数据）
@@ -82,6 +89,10 @@ class TaskScheduler:
         self._scope_of: dict[str, tuple[list[str], list[str]]] = {}
         # 步骤 6：权限模式跟着任务走（排队任务可能几秒后才启动）
         self._mode_of: dict[str, str] = {}
+        # 对比表 #21：联网搜索开关跟着任务走（每个任务可独立决定是否允许搜索）
+        self._web_search_of: dict[str, bool] = {}
+        # Checkpoint 恢复：待续跑的现场（launch 时取出并清空）
+        self._resume_of: dict[str, Any] = {}
         self._running: set[str] = set()
         self._queue: list[str] = []
         self._lock = asyncio.Lock()
@@ -101,6 +112,7 @@ class TaskScheduler:
         allowed_paths: list[str] | None = None,
         forbidden_paths: list[str] | None = None,
         mode: str = "",
+        web_search: bool = False,
     ) -> dict[str, Any]:
         """
         创建任务并尝试调度。
@@ -142,6 +154,8 @@ class TaskScheduler:
             self._scope_of[tid] = (list(allowed_paths or []), list(forbidden_paths or []))
             # 步骤 6：模式先落表，等 _launch 时再校验（非法值在 core.run 里抛）
             self._mode_of[tid] = str(mode or "")
+            # 对比表 #21：联网搜索开关先落表（_registry_for 在 launch 时读）
+            self._web_search_of[tid] = bool(web_search)
             self._queue.append(tid)
 
         await self.pump()
@@ -190,18 +204,197 @@ class TaskScheduler:
 
     def _registry_for(self, task_id: str) -> ToolRegistry:
         """
-        按任务的会话模式挑注册表（步骤 7）。
+        按任务的会话模式 + 联网搜索开关挑注册表。
 
-        read-only → 只读视图（真强制：写/执行工具根本没注册）
-        其余模式 → 完整注册表
+        read-only            → 只读视图（真强制：写/执行工具根本没注册）
+        workspace-write / full-access → 剔除桌面工具的注册表
+        desktop              → 完整注册表（含桌面工具；用户显式授权的桌面操控模式）
+
+        ★ 联网搜索开关（对比表 #21）：web_search 工具默认注册在 readonly 组
+          （risk=READ），但任务级开关决定它是否可见——关闭时从注册表里剔除
+          （服务端真强制，模型看不到这个工具，不会去调）。
 
         ★ 非法模式这里不拦：它会在 core.run 里抛 ValueError，任务以 failed 收尾，
           这样错误出现在**任务该出现的地方**（而不是调度器里静默降级）。
         """
         mode = (self._mode_of.get(task_id) or "").strip().lower()
         if mode == "read-only" and self._readonly_registry is not None:
-            return self._readonly_registry
-        return self._registry
+            reg = self._readonly_registry
+        elif mode == "desktop":
+            reg = self._registry
+        elif self._no_desktop_registry is not None:
+            reg = self._no_desktop_registry
+        else:
+            reg = self._registry
+
+        # ---- 联网搜索开关：关闭时剔除 web_search 工具 ----
+        # ★ 用 without()（保留分组与工具实例），不用 filter()：
+        #   filter 会把幸存工具全塞进 group="filtered"，丢掉 readonly/exec 语义。
+        if not self._web_search_of.get(task_id, False) and "web_search" in reg.names:
+            reg = reg.without("web_search")
+        return reg
+
+    # ===================================================================== #
+    # Checkpoint 恢复（2026-11-11 接线）
+    # ===================================================================== #
+    def _checkpoint_store_for(self, workspace: str):
+        """按工作区定位 checkpoint 目录（口径与 TaskRuntime 内部一致）。"""
+        cfg = getattr(self._config, "checkpoint", None)
+        if not cfg or not getattr(cfg, "enabled", False):
+            return None
+        base = os.path.join(workspace, getattr(cfg, "dir_name", ".loom_checkpoints"))
+        return LocalDiskCheckpointStore(base)
+
+    async def inspect_resume(self, task_id: str) -> tuple[Any, Any]:
+        """
+        装配恢复现场 —— **只读**：不改状态、不入队、不发事件。
+
+        返回 `(plan, report)`；plan 为 None 时看 report.reasons 就知道为什么不能续。
+        """
+        from ..agent.checkpoint import ResumeReport
+
+        row = await self._store.get_task(task_id)
+        if row is None:
+            rep = ResumeReport(task_id=task_id)
+            rep.reasons.append("任务不存在")
+            return None, rep
+
+        cfg = getattr(self._config, "checkpoint", None)
+        max_age = float(getattr(cfg, "resume_max_age_s", 0.0) or 0.0)
+        entries = await self._store.load_history(task_id)
+        store = self._checkpoint_store_for(row["workspace"])
+        return plan_resume(
+            store, task_id, entries,
+            workspace=row["workspace"], max_age_s=max_age,
+        )
+
+    async def resume(self, task_id: str) -> dict[str, Any]:
+        """
+        续跑一个中断的任务：装配现场 → 重新入队（优先插队）。
+
+        ★ 返回结构与其他控制接口一致：`accepted` 表示"请求被接受"，
+          不代表任务已经跑完；真正的结果看后续事件/快照。
+        """
+        rt = self._runtimes.get(task_id)
+        if rt is not None and rt.status not in TERMINAL:
+            return {"accepted": False, "state": rt.status, "note": "任务正在运行，无需恢复"}
+
+        row = await self._store.get_task(task_id)
+        if row is None:
+            return {"accepted": False, "state": "missing", "note": "任务不存在"}
+
+        plan, report = await self.inspect_resume(task_id)
+        if plan is None:
+            return {
+                "accepted": False,
+                "state": "not_resumable",
+                "note": "；".join(report.reasons) or "不可恢复",
+                "report": report.to_dict(),
+            }
+
+        async with self._lock:
+            self._session_of[task_id] = row["session_id"]
+            # ★ 模式与范围沿用快照：换成这次的默认值等于偷偷放宽/收紧权限
+            self._mode_of[task_id] = plan.state.session_mode
+            self._scope_of[task_id] = (
+                list(plan.state.allowed_paths), list(plan.state.forbidden_paths),
+            )
+            self._web_search_of.setdefault(task_id, False)
+            self._resume_of[task_id] = plan
+            if task_id in self._queue:
+                self._queue.remove(task_id)
+            self._queue.insert(0, task_id)  # 恢复任务优先于新任务
+
+        # 状态回到 created：真正变 running 由 launch 负责（前端看到"重新受理"）
+        # ★ 快照里的 status 也要一起改成 created —— 否则摘要列说 created、
+        #   state_json 里还是 running（"列表与快照不一致"是既有审计明确禁止的）。
+        snapshot = plan.state.to_dict()
+        snapshot["status"] = "created"
+        await self._store.save_task(task_id, status="created", state=snapshot)
+        log.info(
+            "任务 %s 排入恢复队列（checkpoint #%d，第 %d 轮，历史 %d 条）",
+            task_id, report.checkpoint_seq, report.resumed_from_turn, report.loaded_messages,
+        )
+        await self.pump()
+        return {
+            "accepted": True,
+            "state": "queued",
+            "note": "已排入恢复队列",
+            "report": report.to_dict(),
+        }
+
+    async def recover_interrupted(self) -> dict[str, Any]:
+        """
+        服务启动时处理「看起来还在跑」的任务（running / awaiting_approval / created）。
+
+        ★ 与旧实现的区别（这就是本次要修的债）：
+          旧逻辑 `mark_orphans_failed` 一刀切标 failed —— 明明有 checkpoint 也不看，
+          任务永远没有第二次机会。现在的顺序是：**先判能不能续，再决定怎么收尾**。
+          · 判定通过 + 开了自动恢复 → 重新入队续跑；
+          · 判定不通过 → 标 aborted + 把 ResumeReport 写进快照（说明为什么不能续）。
+
+        ★ checkpoint 关闭时退回旧行为（标 failed），不静默改变语义。
+        """
+        cfg = getattr(self._config, "checkpoint", None)
+        ckpt_on = bool(cfg and getattr(cfg, "enabled", False))
+        if not ckpt_on:
+            fixed = await self._store.mark_orphans_failed("server_restarted")
+            return {"scanned": len(fixed), "resumed": [], "marked": fixed, "checkpoint": False}
+
+        rows = await self._store.list_unfinished()
+        auto = bool(getattr(cfg, "auto_resume", False))
+        summary: dict[str, Any] = {
+            "scanned": len(rows), "resumed": [], "marked": [], "checkpoint": True,
+        }
+
+        for row in rows:
+            tid = row["task_id"]
+            plan, report = await self.inspect_resume(tid)
+
+            if plan is not None and auto:
+                try:
+                    result = await self.resume(tid)
+                    if result.get("accepted"):
+                        summary["resumed"].append({
+                            "task_id": tid,
+                            "checkpoint_seq": report.checkpoint_seq,
+                            "turn": report.resumed_from_turn,
+                        })
+                        continue
+                    report.reasons.append(str(result.get("note") or "入队被拒绝"))
+                except Exception as exc:  # noqa: BLE001 —— 单个任务恢复失败不能拖垮启动
+                    log.warning("任务 %s 自动恢复失败：%s: %s", tid, type(exc).__name__, exc)
+                    report.reasons.append(f"自动恢复失败：{type(exc).__name__}: {exc}")
+
+            # ---- 不可恢复（或未开自动恢复）：诚实收尾，并留下原因 ----
+            try:
+                st = json.loads(row.get("state_json") or "{}")
+            except (TypeError, ValueError):
+                st = {}
+            if not isinstance(st, dict):
+                st = {}
+            now = time.time()
+            st["status"] = "aborted"
+            st["end_reason"] = "interrupted"
+            st["ended_at"] = now
+            st["pending_approval"] = None
+            st["resume_report"] = report.to_dict()
+            await self._store.save_task(
+                tid, status="aborted", state=st,
+                end_reason="interrupted", ended_at=now,
+            )
+            summary["marked"].append({"task_id": tid, "report": report.to_dict()})
+            log.info(
+                "任务 %s 标记为 interrupted（不可续：%s）",
+                tid, "；".join(report.reasons) or "未开启自动恢复",
+            )
+
+        if summary["resumed"] or summary["marked"]:
+            log.info(
+                "启动恢复：扫描 %d 个中断任务，续跑 %d 个，收尾 %d 个",
+                summary["scanned"], len(summary["resumed"]), len(summary["marked"]),
+            )
+        return summary
 
     async def _launch(self, task_id: str) -> None:
         """真正启动一个任务（锁外执行）。"""
@@ -231,6 +424,8 @@ class TaskScheduler:
             store=self._store,
             knowledge=self._knowledge,
             spawner=self._spawner,
+            # Checkpoint 恢复：非空 = 接着断掉的现场继续跑（一次性）
+            resume_plan=self._resume_of.pop(task_id, None),
         )
         self._runtimes[task_id] = rt
 
@@ -365,6 +560,43 @@ class TaskScheduler:
 
         return {"accepted": True, "reason": "", "note": "决策已提交"}
 
+    async def resolve_user_input(
+        self,
+        task_id: str,
+        ask_id: str,
+        answers: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """
+        提交用户对 ask_user 问题的回答。
+
+        ★ 两层校验：
+           ① 任务必须在内存里且未在终态
+           ② ask_id 必须真的属于这个任务（UserInputManager.resolve 一次性消费）
+
+        ★ 三种结果（对应 DSH 的 answered / late / invalid）：
+           · answered —— 有人正挂着 await，回答后立刻继续
+           · late     —— 当时超时了（pending），答案作为补充回答送进 Agent 下一步
+           · invalid  —— 不存在 / 已回答 / pending 也过期
+        """
+        rt = self._runtimes.get(task_id)
+        if rt is None:
+            return {"accepted": False, "reason": "task_not_running",
+                    "note": "任务不在运行中（可能已结束或服务重启过）"}
+
+        if rt.status in TERMINAL:
+            return {"accepted": False, "reason": "task_finished",
+                    "note": f"任务已结束（{rt.status}），无法回答"}
+
+        status = await rt.resolve_user_input(ask_id, answers)
+        if status == "answered":
+            return {"accepted": True, "status": "answered", "reason": "",
+                    "note": "回答已提交，Agent 已恢复执行"}
+        if status == "late":
+            return {"accepted": True, "status": "late", "reason": "",
+                    "note": "已收到。Agent 当时没等到这条回答，会在下一步看到它"}
+        return {"accepted": False, "status": "invalid", "reason": "ask_id_invalid",
+                "note": "该问题已被回答、已超时过期或不存在"}
+
     # ===================================================================== #
     # 查询
     # ===================================================================== #
@@ -399,6 +631,13 @@ class TaskScheduler:
             pos = self._queue.index(task_id) + 1 if in_queue else 0
 
         base = row.get("state") or {}
+        # ★ 事件可用性（对比表 #49）：内存里没有不等于"丢了"——
+        #   落盘之后要问一句库。只问一条 SQL，describe 不是热路径。
+        archived = 0
+        try:
+            archived = await self._store.events_count(task_id)
+        except Exception:  # noqa: BLE001 —— 统计失败不该让快照接口 500
+            archived = 0
         snap = {
             **base,
             "task_id": row["task_id"],
@@ -414,22 +653,34 @@ class TaskScheduler:
             "result": row["result"],
             "queued": in_queue,
             "queue_position": pos,
-            # ★ 不在内存 = 已结束或服务重启过。此时事件只可能还在 hub 缓冲里，
-            #   没了就是没了 —— 明确告诉前端，不能假装完整。
-            "events_available": self._hub.has_events_for(task_id),
+            # ★ 不在内存 = 已结束或服务重启过。事件**可能**还在 hub 缓冲，
+            #   也可能只存在于磁盘（重启后就是这样）。两边都算"有"。
             "events_buffered": len(self._hub.buffered_for_task(task_id)),
+            "events_archived": archived,
+            "events_available": self._hub.has_events_for(task_id) or archived > 0,
         }
         return snap
 
     async def list_tasks(self, session_id: str | None = None) -> list[dict[str, Any]]:
         """任务摘要列表（不含 state_json）。"""
         rows = await self._store.list_tasks(session_id)
+        # 事件条数一次查完（避免每个任务一条 SQL）
+        try:
+            counts = await asyncio.to_thread(
+                self._store.event_counts_sync, [r["task_id"] for r in rows]
+            )
+        except Exception:  # noqa: BLE001
+            counts = {}
         out = []
         for r in rows:
             rt = self._runtimes.get(r["task_id"])
             item = dict(r)
             item["queued"] = r["task_id"] in self._queue
-            item["events_available"] = self._hub.has_events_for(r["task_id"])
+            archived = counts.get(r["task_id"], 0)
+            item["events_archived"] = archived
+            item["events_available"] = (
+                self._hub.has_events_for(r["task_id"]) or archived > 0
+            )
             if rt is not None:
                 # 内存里的状态更新（可能刚变，还没来得及落盘）
                 item["status"] = rt.status

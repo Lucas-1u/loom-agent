@@ -360,8 +360,12 @@ async def amain() -> int:
         reg = ToolRegistry()
         from backend.tools.registry import build_default_registry
         base = build_default_registry(include_mutating=False)
-        check(set(base.names) == {"list_files", "read_file"},
-              f"不注入 MCP 时工具清单不变（{sorted(base.names)}）")
+        # 2026-11-11：清单里多了 load_skill（技能机制，对比表 #24）。
+        # ★ 这个断言的用途是"注入 MCP 不应该改变内置工具清单"，所以内置工具
+        #   增删时**必须同步这里** —— 否则会变成"昨天还好好的，今天红了"。
+        check(set(base.names) == {"list_files", "read_file", "capture_screen",
+                                  "ask_user", "load_skill"},
+              f"不注入 MCP 时工具清单不变（内置={sorted(base.names)}；vision_look 仅配置视觉模型时出现）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

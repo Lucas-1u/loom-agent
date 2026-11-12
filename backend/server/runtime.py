@@ -63,6 +63,7 @@ class TaskRuntime:
         allowed_paths: list[str] | None = None,
         forbidden_paths: list[str] | None = None,
         session_mode: str = "",
+        resume_plan: Any = None,
     ) -> None:
         self.task_id = task_id
         self.session_id = session_id
@@ -73,6 +74,8 @@ class TaskRuntime:
         self.forbidden_paths = list(forbidden_paths) if forbidden_paths else None
         # 步骤 6：权限模式（空 = 默认 workspace-write，合法值在 core.run 里校验）
         self.session_mode = str(session_mode or "")
+        # Checkpoint 恢复现场（None = 全新执行）。构造时由调度器装配好传进来。
+        self.resume_plan = resume_plan
 
         self._hub = hub
         self._store = store
@@ -197,6 +200,8 @@ class TaskRuntime:
                 task_id=self.task_id,
                 # 步骤 6：权限模式（空 = 默认 workspace-write）
                 session_mode=self.session_mode,
+                # 恢复现场：非空 = 接着 checkpoint 里断掉的现场继续跑
+                resume=self.resume_plan,
             )
 
             self.status = state.status.value
@@ -363,6 +368,17 @@ class TaskRuntime:
           「这个 id 不在等待中」，而不是假装成功。
         """
         return False
+
+    async def resolve_user_input(self, ask_id: str, answers: list[dict]) -> str:
+        """用户回答 ask_user 的问题。调 core 的 UserInputManager.resolve。
+
+        返回 `answered`（有人正在等，已唤醒）/ `late`（前台已超时，答案以补充回答送达）
+        / `invalid`（不存在、已回答过、pending 也过期了）。
+        """
+        manager = getattr(self.core, "_user_input", None)
+        if manager is None:
+            return "invalid"
+        return manager.resolve(ask_id, answers)
 
     # ===================================================================== #
     # 快照

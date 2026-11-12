@@ -141,6 +141,45 @@ class LocalDiskCheckpointStore:
         except OSError:
             return False
 
+    # ---- 基线快照（每个任务一份，不随 checkpoint 滚动清理）-----------------
+    #
+    # ★ 为什么要单独存：`baseline_files` 是「任务开始时的文件快照」，用于事后
+    #   审计"哪些改动是 Agent 干的"。它体量大（整棵树），而且**必须和任务的
+    #   第一天一致** —— 塞进滚动 checkpoint 会在第 21 个快照后随旧文件一起被删掉，
+    #   续跑时就再也算不出正确的改动范围。
+    def _baseline_path(self, task_id: str) -> str:
+        return os.path.join(self.base_dir, f"{task_id}_baseline.json")
+
+    def has_baseline(self, task_id: str) -> bool:
+        return os.path.exists(self._baseline_path(task_id))
+
+    def save_baseline(self, task_id: str, files: dict[str, Any]) -> bool:
+        """写基线快照。已存在则不覆盖（第一次的最准）。失败返回 False，不抛。"""
+        path = self._baseline_path(task_id)
+        if os.path.exists(path):
+            return True
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"task_id": task_id, "files": files, "ts": time.time()},
+                          f, ensure_ascii=False, default=str)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            return False
+
+    def load_baseline(self, task_id: str) -> dict[str, Any] | None:
+        path = self._baseline_path(task_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        files = data.get("files")
+        return files if isinstance(files, dict) else None
+
 
 def load_checkpoint(store: CheckpointStore, ref: CheckpointRef) -> dict[str, Any] | None:
     """从存储中加载一个 checkpoint。"""

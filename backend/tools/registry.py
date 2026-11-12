@@ -119,6 +119,26 @@ class ToolRegistry:
                 sub.register(self._tools[n], group="filtered")
         return sub
 
+    def without(self, name: str) -> "ToolRegistry":
+        """
+        派生一份「剔除单个工具」的注册表，**保留原分组与工具实例**。
+
+        ★ 用途：任务级能力开关（如联网搜索关闭时剔除 web_search）。
+          与 `filter()` 的区别：filter 会把幸存工具全塞进 group="filtered"，
+          丢掉 readonly/mutating/exec 这些语义；这里原样保留。
+        ★ 不修改自身：返回新实例，主注册表不受影响（多任务并发共用一份注册表，
+          就地删工具会让开关失效）。
+        """
+        sub = ToolRegistry()
+        for group, names in self._groups.items():
+            for n in names:
+                if n == name:
+                    continue
+                tool = self._tools.get(n)
+                if tool is not None:
+                    sub.register(tool, group=group)
+        return sub
+
     def readonly_view(self) -> "ToolRegistry":
         """
         派生一份「只读视图」：只保留 risk=read 的工具（保留原分组）。
@@ -190,13 +210,21 @@ def build_default_registry(
     workflow: Any = None,
     workflow_allow_local: bool = False,
     workflow_parallel: int = 3,
+    vision: Any = None,
+    search: Any = None,
+    skills: bool = True,
 ) -> ToolRegistry:
     """
     构建默认工具集。
 
-        readonly : list_files, read_file (+ search_docs 仅在注入知识库时可用)
-        mutating : write_file, edit_file       （需审批）
-        exec     : run_command                 （需审批 + Docker 沙箱）
+        readonly : list_files, read_file, capture_screen, load_skill
+                   (+ vision_look 仅配置了 LOOM_VISION_MODEL 时)
+                   (+ desktop_locate 仅配置视觉模型时注册)
+                   (+ search_docs 仅在注入知识库时可用)
+                   (+ web_search 仅在注入 search 且已配置 key 时可用)
+        mutating : write_file, edit_file, delete_file       （无审批，安全边界由沙箱承担）
+        exec     : run_command, terminal                     （Docker 沙箱 / 宿主机 shell）
+        computer : desktop_click（agent-desktop 在线时注册）
 
     参数 include_mutating 允许「只读模式」：实验时可一键关掉所有写/执行能力。
     sandbox 允许外部注入 SandboxManager（服务端统一管理容器生命周期；
@@ -205,6 +233,11 @@ def build_default_registry(
     这样离线演示、单测、没开 RAG 的部署里，工具清单与以前完全一致。
     mcp 允许注入 MCP 管理器（M4.1）：**不传就不注册任何 MCP 工具**。
     spawner 允许注入子任务派生器（M5）：**不传就不注册 spawn_subtask**。
+    vision 允许注入视觉模型配置：**不配置就不注册 vision_look / desktop_locate**。
+    search 允许注入联网搜索配置（对比表 #21）：**不注入或未配 key 就不注册 web_search**。
+    skills 控制是否注册 load_skill（对比表 #24）：LOOM_SKILLS=0 时传 False。
+      ★ 这里只决定"有没有这个入口"，具体能看到哪些技能是**按任务工作区**扫描的
+        （library 挂在 ToolContext 上），所以注册表不必为每个任务重建。
     """
     from .readonly.list_files import make as make_list
     from .readonly.read_file import make as make_read
@@ -212,9 +245,44 @@ def build_default_registry(
     reg = ToolRegistry()
     reg.register(make_list(), group="readonly")
     reg.register(make_read(), group="readonly")
+    # ★ Skill：按名载入技能正文（只读；read-only 任务也该能用）
+    if skills:
+        from .readonly.skill import make as make_skill
+        reg.register(make_skill(), group="readonly")
+    # ★ Computer-Use 方案2：本地截屏（纯观察，默认常开）
+    from .readonly.capture_screen import make as make_capture
+    reg.register(make_capture(), group="readonly")
+    # ★ ask_user：Agent 主动向用户提问（通用能力，read-only 也能用）
+    from .readonly.ask_user import make as make_ask
+    reg.register(make_ask(), group="readonly")
+    # ★ Computer-Use 方案2：视觉问答读图（不配置视觉模型就不注册，
+    #   工具清单与之前完全一致）
+    if vision is not None and getattr(vision, "usable", False):
+        from .readonly.vision_query import make as make_vision
+        make_v = make_vision(vision)
+        if make_v is not None:
+            reg.register(make_v, group="readonly")
+    # ★ Computer-Use 方案2：桌面定位（视觉模型找坐标，纯只读；
+    #   视觉未配置时不注册。
+    if vision is not None and getattr(vision, "usable", False):
+        from .computer.locate import make as make_locate
+        make_l = make_locate(vision)
+        if make_l is not None:
+            reg.register(make_l, group="computer")
+
     if knowledge is not None and getattr(knowledge, "usable", False):
         from .readonly.search_docs import make as make_search
         reg.register(make_search(knowledge), group="readonly")
+
+    # ★ 对比表 #21：联网搜索（DeepSeek Search API）。
+    #   不注入 / 未开总开关 / 未配 key → 不注册，工具清单与历史完全一致。
+    if search is not None and getattr(search, "enabled", False) and getattr(search, "api_key", ""):
+        from .readonly.web_search import make as make_web_search
+        make_ws = make_web_search(
+            base_url=search.base_url, api_key=search.api_key, timeout=search.timeout,
+        )
+        if make_ws is not None:
+            reg.register(make_ws, group="readonly")
 
     if spawner is not None:
         # M5：父子任务（不传 spawner 就没有这个工具，行为与 M4 完全一致）
@@ -233,16 +301,24 @@ def build_default_registry(
             import logging
             logging.getLogger("loom.mcp").warning("跳过 %d 个 MCP 工具：%s",
                                                   len(report["skipped"]), report["skipped"])
+        # ★ Computer-Use 方案2：像素点击工具（agent-desktop 在线时注册）
+        from .computer.click_pixel import make as make_click
+        make_c = make_click(mcp)
+        if make_c is not None:
+            reg.register(make_c, group="computer")
 
     if include_mutating:
         from .exec.run_command import make as make_run
         from .mutating.edit_file import make as make_edit
+        from .mutating.delete_file import make as make_delete
         from .mutating.write_file import make as make_write
 
         # ★ 注册顺序不影响模型看到的顺序（to_specs 会按名字排序），
         #   这里 write 在前只是因为它是先写的。
         reg.register(make_write(), group="mutating")
         reg.register(make_edit(), group="mutating")
+        # delete_file：删除前自动备份，只删文件不删目录。
+        reg.register(make_delete(), group="mutating")
         # ★ run_command 单独分组：它的风险不在"改文件"，而在"能执行任意程序"，
         #   安全边界是 Docker 容器（见 backend/sandbox/manager.py）。
         reg.register(make_run(sandbox), group="exec")

@@ -3,9 +3,17 @@ SQLite 持久化层
 
 ★ 存什么、不存什么
 ────────────────────────────────────────────────────────────────
-  存：Session、Task（含完整 TaskState 快照）、幂等键
-  不存：AgentEvent（体积大、价值随时间衰减；重启后明确告知不可用）
-         Message（从 Task 派生：goal → user，result → assistant，存两份必不同步）
+  存：Session、Task（含完整 TaskState 快照）、幂等键、消息历史、**事件流**（#49）
+  不存：Message（从 Task 派生：goal → user，result → assistant，存两份必不同步）
+
+★ 事件流为什么也要存（2026-11-11，对比表 #49）
+────────────────────────────────────────────────────────────────
+  以前事件只活在 `EventHub` 的内存环形缓冲里，重启即丢 —— 界面上表现为
+  "任务的事件历史不可用（empty）"，执行流时间线是空的，只剩一句结论。
+  现在落进 `task_events` 表：
+    · 写入不进 emit 热路径（`EventArchive` 收进队列，后台批量写，见 archive.py）
+    · 读的时候内存优先、磁盘兜底，两侧按 seq 合并去重
+    · 保留策略见 `prune_events_sync`（默认 30 天，0 = 永不清理）
 
 ★ 并发与线程安全（这是选 SQLite 而不是 JSON 的核心原因）
 ────────────────────────────────────────────────────────────────
@@ -46,6 +54,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -55,7 +64,11 @@ IDEM_TTL_S = 24 * 3600
 IDEM_MAX_ROWS = 1000
 
 # M5：tasks 增加 parent_task_id（子任务指向父任务；根任务为 NULL）
-SCHEMA_VERSION = 2
+# v3：新增 task_events（事件流落盘，#49）
+SCHEMA_VERSION = 3
+
+# 导出文件格式标识（改结构就换它，导入端据此拒绝旧文件）
+EXPORT_FORMAT = "loom.task.v1"
 
 # --------------------------------------------------------------------------- #
 # 进程级数据库锁
@@ -70,6 +83,31 @@ SCHEMA_VERSION = 2
 # 代价：所有读写被串行化。本应用的写频率是「每任务 3~5 次」，
 #       单次 0.6ms，串行化完全不是瓶颈；换来的是不再有连接生命周期竞争。
 _DB_LOCK = threading.RLock()
+
+# --------------------------------------------------------------------------- #
+# 事件流建表语句（v3）
+# --------------------------------------------------------------------------- #
+# ★ 为什么单独抽成常量：初始化、迁移、以及"老库补表"三条路径都用同一段 SQL。
+#   抄三份的下场是改一处漏两处 —— task_history 当年就是这么丢的。
+#
+# ★ 主键为什么是 (task_id, seq) 而不是 (task_id, id)：
+#   前端按 seq 排序去重（`mergeEvents`），seq 才是"事件在任务内的位置"这一语义。
+#   id 是全局 SSE 游标（重连补发用），只存不约束。
+#   ⚠️ 由此推出一条硬约束：**续跑时 seq 必须接着涨**，否则新事件会覆盖旧事件。
+#      这件事由 EventHub 统一归一化（见 hub.publish），不指望调用方自觉。
+EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS task_events (
+  id        INTEGER NOT NULL,              -- 全局 SSE id（跨重启单调，启动时由 MAX(id) 播种）
+  task_id   TEXT    NOT NULL,
+  seq       INTEGER NOT NULL,              -- 任务内序号（前端排序/去重靠它）
+  ts        REAL    NOT NULL,              -- 事件发生时间
+  turn      INTEGER NOT NULL DEFAULT 0,
+  type      TEXT    NOT NULL,              -- 事件类型（thinking / tool.call / …）
+  data_json TEXT    NOT NULL DEFAULT '{}', -- 载荷 JSON
+  PRIMARY KEY (task_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_task_events_id ON task_events(id);
+"""
 
 
 class StoreError(RuntimeError):
@@ -184,6 +222,307 @@ class TaskStore:
     async def load_history(self, task_id: str) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.load_history_sync, task_id)
 
+    # ------------------------------------------------------------------ #
+    # 事件流（#49）：append-only，按 (task_id, seq) 幂等
+    # ------------------------------------------------------------------ #
+    def append_events_sync(self, rows: list[dict[str, Any]]) -> int:
+        """
+        批量写入事件（一个事务）。每行：`{id, task_id, seq, ts, turn, type, data}`。
+
+        ★ `INSERT OR REPLACE`：队列重放、续跑补写、导入重号都不会炸。
+          重复的 (task_id, seq) 以后写的为准 —— 语义是"这个位置的事件就是它"。
+        """
+        if not rows:
+            return 0
+        with self._tx() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO task_events"
+                " (id, task_id, seq, ts, turn, type, data_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        int(r.get("id") or 0),
+                        str(r["task_id"]),
+                        int(r["seq"]),
+                        float(r.get("ts") or 0.0),
+                        int(r.get("turn") or 0),
+                        str(r.get("type") or ""),
+                        json.dumps(r.get("data") or {}, ensure_ascii=False, default=str),
+                    )
+                    for r in rows
+                ],
+            )
+        return len(rows)
+
+    async def append_events(self, rows: list[dict[str, Any]]) -> int:
+        return await asyncio.to_thread(self.append_events_sync, rows)
+
+    def load_events_sync(
+        self,
+        task_id: str,
+        *,
+        since_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """按 seq 升序读某任务的事件（`since_id` 按全局 id 过滤，和内存侧同义）。"""
+        sql = (
+            "SELECT id, task_id, seq, ts, turn, type, data_json"
+            " FROM task_events WHERE task_id = ?"
+        )
+        args: list[Any] = [task_id]
+        if since_id is not None:
+            sql += " AND id > ?"
+            args.append(int(since_id))
+        sql += " ORDER BY seq ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+
+        with self._tx() as conn:
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        return [_event_row_to_dict(r) for r in rows]
+
+    async def load_events(self, task_id: str, **kw: Any) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self.load_events_sync, task_id, **kw)
+
+    def events_count_sync(self, task_id: str) -> int:
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    async def events_count(self, task_id: str) -> int:
+        return await asyncio.to_thread(self.events_count_sync, task_id)
+
+    def event_counts_sync(self, task_ids: list[str]) -> dict[str, int]:
+        """一次查出多个任务各有几条事件（列表接口用，避免 N+1）。"""
+        ids = [t for t in task_ids if t]
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"SELECT task_id, COUNT(*) AS n FROM task_events"
+                f" WHERE task_id IN ({marks}) GROUP BY task_id",
+                tuple(ids),
+            ).fetchall()
+        return {r["task_id"]: int(r["n"]) for r in rows}
+
+    def max_event_id_sync(self) -> int:
+        """库里最大的全局事件 id —— 启动时用它给 hub 播种，保证 id 跨重启单调。"""
+        with self._tx() as conn:
+            row = conn.execute("SELECT MAX(id) AS m FROM task_events").fetchone()
+        return int(row["m"]) if row and row["m"] is not None else 0
+
+    async def max_event_id(self) -> int:
+        return await asyncio.to_thread(self.max_event_id_sync)
+
+    def max_event_seq_sync(self) -> dict[str, int]:
+        """
+        每个任务已经落盘的最大 seq。
+
+        ★ 用途只有一个：**续跑时接上 seq**。
+          续跑会新建一条 EventBus，它的 seq 又从 1 开始；如果直接写库，
+          (task_id, 1) 会把第一次运行的第 1 条事件覆盖掉 —— 时间线会被搅乱。
+          EventArchive 启动时把这张表读进内存，hub 每发一条问它一次（纯字典查）。
+        """
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT task_id, MAX(seq) AS m FROM task_events GROUP BY task_id"
+            ).fetchall()
+        return {r["task_id"]: int(r["m"]) for r in rows}
+
+    def prune_events_sync(self, before_ts: float) -> int:
+        """
+        保留策略：删掉"创建时间早于 before_ts 且已终态"的任务的事件。
+
+        ★ 只删终态任务：运行中/排队中的任务事件一定还要用（续跑要接 seq）。
+        ★ 顺带清理孤儿事件（任务行已经没了的事件）——
+          `sessions` 删除是 ON DELETE CASCADE，tasks 会跟着删，
+          但 task_events 没有外键（跨表级联会让写入变慢），所以会留下孤儿。
+        """
+        with self._tx() as conn:
+            cur = conn.execute(
+                "DELETE FROM task_events WHERE task_id IN ("
+                "  SELECT task_id FROM tasks"
+                "   WHERE created_at < ? AND status IN ('done', 'aborted', 'failed')"
+                ")",
+                (float(before_ts),),
+            )
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            cur2 = conn.execute(
+                "DELETE FROM task_events"
+                " WHERE task_id NOT IN (SELECT task_id FROM tasks)"
+            )
+            if cur2.rowcount and cur2.rowcount > 0:
+                deleted += cur2.rowcount
+        return deleted
+
+    async def prune_events(self, before_ts: float) -> int:
+        return await asyncio.to_thread(self.prune_events_sync, before_ts)
+
+    # ------------------------------------------------------------------ #
+    # 导出 / 导入（一个任务的全套材料：行 + 快照 + 历史 + 事件）
+    # ------------------------------------------------------------------ #
+    def export_task_sync(self, task_id: str) -> dict[str, Any] | None:
+        """
+        导出一个任务。
+
+        ★ 为什么连 session 一起导：任务行有 `session_id` 外键，
+          导到别人的库里如果会话不存在，插入会被外键拒掉。
+        """
+        row = self.get_task_sync(task_id, with_state=True)
+        if row is None:
+            return None
+        return {
+            "format": EXPORT_FORMAT,
+            "schema_version": SCHEMA_VERSION,
+            "exported_at": time.time(),
+            "session": self.get_session_sync(row["session_id"]),
+            "task": row,
+            "history": self.load_history_sync(task_id),
+            "events": self.load_events_sync(task_id),
+        }
+
+    async def export_task(self, task_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self.export_task_sync, task_id)
+
+    def import_task_sync(self, payload: dict[str, Any], *, task_id: str = "") -> dict[str, Any]:
+        """
+        把 `export_task` 的产物写回库。返回 `{task_id, source_task_id, events, history}`。
+
+        ★ 撞号策略：默认保留原 task_id；库里已经有了就换一个新 id（导入不是"覆盖"）。
+          想强制指定就用参数 `task_id`。
+        ★ 事件 id 重新编号（从库里 MAX(id)+1 起），因为 id 是**全局**游标，
+          两个库混在一起时旧 id 可能和别人重复。
+        """
+        if not isinstance(payload, dict) or payload.get("format") != EXPORT_FORMAT:
+            raise StoreError(f"不是 Loom 任务导出文件（缺少 format={EXPORT_FORMAT}）")
+
+        src = payload.get("task") or {}
+        if not src.get("task_id"):
+            raise StoreError("导出文件里没有 task.task_id")
+
+        target_id = task_id or str(src["task_id"])
+        auto_renamed = False
+        with self._tx() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ?", (target_id,)
+            ).fetchone()
+        if exists:
+            if task_id:
+                raise StoreError(f"任务已存在：{target_id}（换一个 task_id 或先删掉）")
+            target_id = _make_import_id(str(src["task_id"]))
+            auto_renamed = True
+
+        session = payload.get("session") or {}
+        session_id = str(src.get("session_id") or session.get("session_id") or "")
+        if not session_id:
+            raise StoreError("导出文件里没有 session_id")
+
+        state = src.get("state") or {}
+        if isinstance(state, dict) and state.get("task_id"):
+            state = {**state, "task_id": target_id}
+
+        now = time.time()
+        with self._tx() as conn:
+            # 会话不存在就补一个：任务行的外键指着它
+            if not conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone():
+                conn.execute(
+                    "INSERT INTO sessions (session_id, title, workspace, created_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        session.get("title") or "导入的会话",
+                        session.get("workspace") or "",
+                        session.get("created_at") or now,
+                        session.get("updated_at") or now,
+                    ),
+                )
+
+            conn.execute(
+                "INSERT INTO tasks"
+                " (task_id, session_id, parent_task_id, goal, status, model, workspace,"
+                "  created_at, started_at, ended_at, end_reason, result, turn, state_json)"
+                " VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    target_id,
+                    session_id,
+                    str(src.get("goal") or "(导入的任务)"),
+                    str(src.get("status") or "done"),
+                    str(src.get("model") or ""),
+                    str(src.get("workspace") or ""),
+                    float(src.get("created_at") or now),
+                    src.get("started_at"),
+                    src.get("ended_at"),
+                    str(src.get("end_reason") or ""),
+                    str(src.get("result") or ""),
+                    int(src.get("turn") or 0),
+                    json.dumps(state, ensure_ascii=False, default=str) if state else "",
+                ),
+            )
+
+            history = payload.get("history") or []
+            if history:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO task_history"
+                    " (task_id, seq, role, content, reasoning, tool_call_id, tool_name,"
+                    "  tool_calls_json, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            target_id,
+                            int(h.get("seq") or 0),
+                            str(h.get("role") or ""),
+                            str(h.get("content") or ""),
+                            str(h.get("reasoning") or ""),
+                            str(h.get("tool_call_id") or ""),
+                            str(h.get("tool_name") or ""),
+                            str(h.get("tool_calls_json") or ""),
+                            float(h.get("created_at") or now),
+                        )
+                        for h in history
+                    ],
+                )
+
+            events = payload.get("events") or []
+            if events:
+                base = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+                ).fetchone()["m"]
+                conn.executemany(
+                    "INSERT OR REPLACE INTO task_events"
+                    " (id, task_id, seq, ts, turn, type, data_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            int(base) + i + 1,
+                            target_id,
+                            int(e.get("seq") or 0),
+                            float(e.get("ts") or 0.0),
+                            int(e.get("turn") or 0),
+                            str(e.get("type") or ""),
+                            json.dumps(e.get("data") or {}, ensure_ascii=False, default=str),
+                        )
+                        for i, e in enumerate(events)
+                    ],
+                )
+
+        return {
+            "task_id": target_id,
+            "source_task_id": str(src["task_id"]),
+            "events": len(payload.get("events") or []),
+            "history": len(payload.get("history") or []),
+            # true 只表示"因为撞号**自动**改名"；显式指定 id 不算改名
+            "renamed": auto_renamed,
+        }
+
+    async def import_task(self, payload: dict[str, Any], *, task_id: str = "") -> dict[str, Any]:
+        return await asyncio.to_thread(self.import_task_sync, payload, task_id=task_id)
+
     def close_sync(self) -> None:
         """
         关闭连接（进程退出 / 测试清理时调用）。
@@ -261,6 +600,11 @@ class TaskStore:
                     );
                     """
                 )
+                # ★ 新库这条路径**必须**也建事件表：下面那些"任何版本都跑一次"的
+                #   补齐语句在 `return` 之后，走不到。少了这一句，全新安装的第一启动
+                #   会在 `EventArchive.load_seq_cache_sync()` 直接
+                #   `sqlite3.OperationalError: no such table: task_events`。
+                conn.executescript(EVENTS_DDL)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
 
@@ -280,6 +624,11 @@ class TaskStore:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)"
                 )
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+            # ---- v3 迁移：事件流落盘（#49）-----------------------------------
+            if ver < 3:
+                conn.executescript(EVENTS_DDL)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
             # ---- 补齐历史表（任何版本都跑一次）--------------------------------
@@ -304,6 +653,11 @@ class TaskStore:
                 );
                 """
             )
+
+            # ---- 补齐事件表（同样任何版本都跑一次）----------------------------
+            # v3 才加的表；老库可能停在 v2，迁移分支只在"当时没跑过"时生效，
+            # 所以这里也无条件补一次（成本为零，`IF NOT EXISTS`）。
+            conn.executescript(EVENTS_DDL)
 
     async def init(self) -> None:
         await asyncio.to_thread(self.init_sync)
@@ -587,6 +941,26 @@ class TaskStore:
     async def mark_orphans_failed(self, reason: str = "server_restarted") -> list[str]:
         return await asyncio.to_thread(self.mark_orphans_failed_sync, reason)
 
+    def list_unfinished_sync(self) -> list[dict[str, Any]]:
+        """
+        列出「看起来还在跑」的任务（服务重启后要逐个决定：续跑还是收尾）。
+
+        ★ 与 mark_orphans_failed 的分工：那个是"一刀切标失败"的旧策略；
+          现在先由调度器用 checkpoint 判断能不能续（recover_interrupted），
+          判不了的才退回标失败。
+        """
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT task_id, session_id, goal, workspace, model, status, turn, state_json "
+                "  FROM tasks "
+                " WHERE status IN ('running', 'awaiting_approval', 'created') "
+                " ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    async def list_unfinished(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self.list_unfinished_sync)
+
     # ===================================================================== #
     # 幂等键清理
     # ===================================================================== #
@@ -634,6 +1008,33 @@ def _loads(s: str) -> Any:
         return json.loads(s)
     except (ValueError, TypeError):
         return None
+
+
+def _event_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """事件行 → API/导出用的形状（data_json 在这里解回 dict）。"""
+    raw = row["data_json"] or "{}"
+    return {
+        "id": int(row["id"]),
+        "task_id": row["task_id"],
+        "seq": int(row["seq"]),
+        "ts": row["ts"],
+        "turn": int(row["turn"]),
+        "type": row["type"],
+        "data": _loads(raw) or {},
+        # 载荷字节数（只用于展示；内存路径里是整条记录的序列化长度）
+        "size": len(raw.encode("utf-8")),
+    }
+
+
+def _make_import_id(source_id: str) -> str:
+    """
+    导入撞号时的新 id。
+
+    ★ 保留原 id 前缀：一眼能看出"它是从哪个任务导出来的"，
+      排查时比 `task_9f3a1c` 这种纯随机 id 有用得多。
+    """
+    base = source_id[:40] if len(source_id) > 40 else source_id
+    return f"{base}_imp{uuid.uuid4().hex[:6]}"
 
 
 def _task_row_to_dict(row: sqlite3.Row, *, with_state: bool = True) -> dict[str, Any]:

@@ -170,6 +170,15 @@ class AgentConfig:
         # ---- 项目知识检索（M3）：任务开始时是否自动检索用户目标 ----------
         # 关掉后只剩 search_docs 工具（模型按需调用），用于 A/B 对比。
         rag_auto: bool = True,
+        # ---- Checkpoint（P0）：跨进程恢复策略 ----
+        # ★ 以前这里**没有**这个字段：TaskRuntime 用 getattr(config, "checkpoint", None)
+        #   读它，永远拿到 None → 服务端 checkpoint 一次都没落过盘
+        #   （比"只写不读"更糟：连写都没发生）。显式声明 + 由 __main__ 注入。
+        checkpoint: Any = None,
+        # ---- Skill 技能（对比表 #24）：三级渐进披露 ------------------------
+        # ★ 与 checkpoint 同一个坑：不显式声明，调用方传了也白传
+        #   （getattr(cfg, "skills", None) 恒为 None → 技能永远为空）。
+        skills: Any = None,
     ) -> None:
         self.max_turns = max_turns
         self.max_seconds = max_seconds
@@ -192,6 +201,8 @@ class AgentConfig:
         self.budget_extend_enabled = budget_extend_enabled
         self.orchestrator = orchestrator
         self.rag_auto = rag_auto
+        self.checkpoint = checkpoint
+        self.skills = skills
 
     @classmethod
     def from_budget_config(cls, b: Any, **overrides: Any) -> "AgentConfig":
@@ -381,6 +392,12 @@ class AgentCore:
         self.knowledge = knowledge
         # M5：子任务派生器（不传 = 不能派生子任务；由 TaskRuntime 注入）
         self.spawner = spawner
+        # ask_user：用户输入挂起-恢复管理器（per-task，每个任务一个）
+        from .user_input import UserInputManager
+        self._user_input = UserInputManager(timeout_s=self.config.approval_timeout_s)
+        # Skill：按工作区扫描的技能库（run() 里构建；这里先占位，
+        #   否则"没走到 run 就被调用"的路径会 AttributeError）
+        self._skills: Any = None
         # Spill：溢出存储 + 工具结果修剪（对齐 DeepSeek Harness dsh-spill-policy）
         from .spill import SpillPolicyConfig, apply_spill
         from .tool_result_pruner import PrunerConfig, prune_messages
@@ -406,6 +423,8 @@ class AgentCore:
         )
         self._ckpt_save = _ckpt_save
         self._checkpoint_count = 0  # 统计本任务保存了几次 checkpoint（测试用）
+        # 恢复来源的 checkpoint 序号（0 = 新任务）。用于"别重规划/别重置现场"这类判断。
+        self._resumed_from = 0
 
         # 运行期状态（每次 run 重置）
         self._state: TaskState | None = None
@@ -443,6 +462,7 @@ class AgentCore:
         forbidden_paths: list[str] | None = None,
         task_id: str = "",
         session_mode: str = "",
+        resume: Any = None,
     ) -> TaskState:
         """
         跑一个完整任务，返回最终 TaskState。
@@ -457,6 +477,12 @@ class AgentCore:
           · 空字符串 = 默认 workspace-write（与历史行为一致）
           · 非法值 → 抛 ValueError（不静默降级，避免"以为只读实际能写"）
           · ★ 模式是**环境配置**，不是 Policy 关卡（docs/22 §4.2）
+
+        `resume`（2026-11-11）：`checkpoint.ResumePlan` 或 None。
+          · 非空 = **接着中断现场跑**：状态/计划/历史/基线全部来自 checkpoint，
+            不再重新分类意图、不重置预算用量、不重跑已执行过的工具；
+          · 只有 `plan_resume()` 判定 `safe_to_resume=True` 时才应该传进来 ——
+            本方法信任调用方已经过了安全闸门（core 不重新判一遍，避免两处口径漂移）。
 
         编排引擎由 <code>self.config.orchestrator</code> 决定（M1）：
           · graph（默认，M4.3 起）= LangGraph 引擎，节点与下列 AgentCore 阶段方法一一对应；
@@ -477,77 +503,57 @@ class AgentCore:
         # ★ M2.1：task_id 可以由调用方（TaskRuntime）指定。
         #   不指定时自生成 —— 但那样历史会挂在另一个 id 下，
         #   与 tasks 表 / 前端 / 事件里的 task_id 对不上（真实事故：7 条历史成了孤儿）。
-        state = TaskState(
-            goal=goal.strip(),
-            workspace=root,
-            model=model_label or getattr(self.adapter, "model", "") or self.adapter.name,
-            **({"task_id": task_id} if task_id else {}),
-        )
-        state.engine = orch
-        state.allowed_paths = list(allowed_paths) if allowed_paths else ["."]
-        state.forbidden_paths = list(forbidden_paths) if forbidden_paths else []
+        # ---- 初始化：新建 vs 从 checkpoint 恢复 ---------------------------
+        resumed = resume is not None
+        if resumed:
+            # ★ 恢复路径（2026-11-11）：不在 run 里重建任何"任务输入"，
+            #   直接接管快照里的现场 —— 重算 intent/scope 会把原始约束
+            #   （例如"只许改 src/"）覆盖成调用方这次的默认值，等于偷偷放宽权限。
+            state = resume.state
+            if normalize_root(state.workspace) != root:
+                raise ValueError(
+                    f"恢复现场的工作区（{state.workspace}）与本次工作区（{root}）不一致"
+                )
+            state.engine = orch
+            mode_source = "resume"
+            log.info(
+                "任务 %s 从 checkpoint #%s 恢复（第 %d 轮，历史 %d 条，停机 %.0fs）",
+                state.task_id, resume.report.checkpoint_seq, state.turn,
+                len(resume.messages), resume.downtime_s,
+            )
+        else:
+            state = TaskState(
+                goal=goal.strip(),
+                workspace=root,
+                model=model_label or getattr(self.adapter, "model", "") or self.adapter.name,
+                **({"task_id": task_id} if task_id else {}),
+            )
+            state.engine = orch
+            state.allowed_paths = list(allowed_paths) if allowed_paths else ["."]
+            state.forbidden_paths = list(forbidden_paths) if forbidden_paths else []
 
-        # ---- 步骤 6：权限模式 -------------------------------------------
-        # ★ 非法值直接抛 ValueError（不静默降级）：模式决定沙箱强度，
-        #   用户写 "readonly"（少个连字符）却拿到 workspace-write，
-        #   是「以为自己在只读、实际能写」的危险错觉。宁可起任务时报错。
-        mode_raw = str(session_mode or "").strip()
-        state.session_mode = normalize_session_mode(mode_raw)
-        mode_source = "api" if mode_raw else "default"
+            # ---- 步骤 6：权限模式 ---------------------------------------
+            # ★ 非法值直接抛 ValueError（不静默降级）：模式决定沙箱强度，
+            #   用户写 "readonly"（少个连字符）却拿到 workspace-write，
+            #   是「以为自己在只读、实际能写」的危险错觉。宁可起任务时报错。
+            mode_raw = str(session_mode or "").strip()
+            state.session_mode = normalize_session_mode(mode_raw)
+            mode_source = "api" if mode_raw else "default"
 
-        # ---- 第三批：任务意图与用户约束 -------------------------------
-        # ★ 为什么在 run 开头就定：意图决定了后面每一步怎么验证
-        #   （诊断任务不该被"测试失败"拦，修复任务不能只凭 exit_code=0 收尾）。
-        #   分类只用**用户写的文字**，不看文件变化 —— 后者是结果不是原因。
-        verdict = classify_intent(state.goal, forbidden_paths=state.forbidden_paths)
-        state.intent = verdict.intent
-        state.intent_confidence = verdict.confidence
-        state.intent_reasons = verdict.reasons
-        state.constraints = verdict.constraints
-        if state.intent != "unknown":
-            log.info("任务 %s 意图判定：%s（%s）%s", state.task_id, state.intent,
-                     state.intent_confidence, verdict.reasons)
+            # ---- 第三批：任务意图与用户约束 -----------------------------
+            self._init_intent_scope(state, allowed_paths)
 
-        # ★ 用户说了"别改测试"而调用方没传 forbidden_paths → 自动补上，
-        #   复用现有 Policy 机制，不另建一套审批。
-        #   测试编写任务例外：那时改测试正是用户要的交付物。
-        if state.constraints.get("no_test_modification") and state.intent != "test_authoring":
-            for p in ("tests/", "conftest.py", "pytest.ini", "tox.ini"):
-                if not _scope_hits(p, state.forbidden_paths):
-                    state.forbidden_paths.append(p)
-            state.intent_reasons.append("用户要求不改测试 → 已自动加入禁止修改范围")
-        # ★ 「不许修改 <具体路径>」→ 路径约束（第四批：不再误判成全局只读）
-        for p in verdict.scoped_forbidden:
-            if not _scope_hits(p, state.forbidden_paths):
-                state.forbidden_paths.append(p)
-                state.intent_reasons.append(f"用户禁止修改 {p} → 已加入禁止范围")
-        # ★ 「其余只许改 <路径>」→ 允许范围（超出即越界，会被审计标记）
-        #   ★ 取**交集**而不是并集：调用方给的 allowed 是外层硬边界，
-        #   用户原话里的范围更具体 → 生效范围是两者中更严的那个。
-        #   （并集 = 放宽权限，正是第五批要避免的事。）
-        api_allowed = list(allowed_paths) if allowed_paths else []
-        goal_allowed = verdict.scoped_allowed
-        if goal_allowed:
-            effective = [p for p in goal_allowed
-                         if not api_allowed or within_allowed(p, api_allowed)]
-            if effective:
-                state.allowed_paths = effective
-                state.intent_reasons.append(f"用户限定只许改 {', '.join(effective)} → 生效允许范围")
-            else:
-                state.intent_reasons.append(
-                    "用户原话的范围与调用方给的允许范围无交集 → 按更严的调用方范围执行")
+        # ---- ask_user：迟到的回答往哪送 -----------------------------------
+        # ★ 超时（pending）之后用户仍可能作答，但那一刻 ask_user 的工具协程
+        #   早就返回了 —— 没有 await 可以唤醒。唯一可行的通道是把答案当成
+        #   一条用户消息塞进对话历史，让模型在**下一步**自然看到。
+        #   `_active_state` 用来判断"任务是不是还活着"，防止往已结束的任务里投。
+        self._active_state = state
+        self._user_input.on_late_answer = self._on_late_answer
 
-        # ---- 范围冲突检测（目标 vs 权限）--------------------------------
-        # ★ 只检测、只披露，**不自动放开权限**。
-        state.scope_conflicts = detect_scope_conflicts(
-            state.goal,
-            allowed_paths=state.allowed_paths,
-            forbidden_paths=state.forbidden_paths,
-        )
-        if state.scope_conflicts:
-            log.info("任务 %s 检测到范围冲突 %d 项：%s", state.task_id,
-                     len(state.scope_conflicts),
-                     [c.get("path") for c in state.scope_conflicts])
+        # ---- 预算：上限始终跟随配置 -------------------------------------
+        # ★ 恢复时**只有上限**被刷新，用量（turns_used / tool_calls_used / errors_used）
+        #   保持快照里的值 —— 否则"断一次续一次"就能无限续命，预算形同虚设。
         b = state.budgets
         b.max_turns = self.config.max_turns
         b.max_seconds = self.config.max_seconds
@@ -556,9 +562,14 @@ class AgentCore:
         b.max_errors = self.config.max_errors
         b.approval_timeout_s = self.config.approval_timeout_s
         b.min_evidence = self.config.min_evidence
+        if resumed:
+            # ★ 墙钟预算的口径是"实际在跑的时间"：进程死掉的那段不该算进预算，
+            #   否则断一次就把长任务的剩余时间吃掉一大截，恢复等于白恢复。
+            state.started_at += max(0.0, resume.downtime_s)
 
         self._state = state
         self._history = []
+        self._resumed_from = int(resume.report.checkpoint_seq) if resumed else 0
         # 上下文压缩器：每轮调用模型前判断规模，超了就压。
         # ★ 摘要器复用同一个 adapter（不新建模型连接、不建第二套 Agent）。
         self.compactor = ContextCompactor(
@@ -573,8 +584,37 @@ class AgentCore:
         self._cancel_event.clear()
         self.bus.bind_task(state.task_id)
 
+        # ---- 恢复：把中断前的对话与基线接管回来 ---------------------------
+        if resumed:
+            # ★ 用 restore_history 装配（它负责缺口检查与游标对齐），
+            #   但不保留它的诊断 marker —— 换成一条明确的"继续"提示。
+            self.restore_history(state, resume.entries)
+            resumed_marker = Message.system(
+                f"[恢复] 本任务在第 {state.turn} 轮中断，现从中断处继续"
+                f"（checkpoint #{resume.report.checkpoint_seq}）。"
+                "上下文中的工具结果都是**已经执行过**的，不要重复执行同样的调用；"
+                "按计划推进剩余步骤即可。"
+            )
+            # 去掉诊断 marker（index 0），保留真实历史
+            self._history = [resumed_marker] + self._history[1:]
+            self._history_persisted = len(self._history)  # 这些消息已在库里，不重写
+            state.baseline_files = dict(resume.baseline_files or {})
+
         # ---- 系统提示 ---------------------------------------------------
         from ..prompts.system import build_system_prompt, tool_line
+        from ..skills import SkillLibrary
+
+        # ★ 技能库按**工作区**扫描：项目级 .loom/skills 跟着仓库走，
+        #   用户级 ~/.loom/skills 跨项目可用，内置目录兜底。
+        #   扫描很便宜（几个目录，几个小文件），每任务一次即可。
+        self._skills = SkillLibrary.from_config(
+            getattr(self.config, "skills", None), workspace=root,
+        )
+        if self._skills.count:
+            log.info("任务 %s 可用技能 %d 个：%s",
+                     state.task_id, self._skills.count, "、".join(self._skills.names))
+        for bad in self._skills.skipped:
+            log.warning("跳过技能目录 %s：%s", bad.get("dir", "?"), bad.get("reason", "?"))
 
         tool_lines = [tool_line(self.registry.get(n)) for n in sorted(self.registry.names)]
         self._system_prompt = build_system_prompt(
@@ -582,14 +622,23 @@ class AgentCore:
             tool_lines=tool_lines,
             extra_rules=self.extra_rules,
             rag=self.knowledge is not None,
+            session_mode=state.session_mode,
+            skill_catalog=self._skills.catalog_text(),
         )
 
         # ---- 开始 -------------------------------------------------------
         state.status = TaskStatus.RUNNING
-        # ★ 任务开始时的文件快照：用户在此之前就有的未提交修改**不是** Agent 干的。
-        #   没有这个基线，事后审计会把用户的改动算到 Agent 头上。
-        state.baseline_files = await asyncio.to_thread(scan_tree, root)
-        self.bus.task_start(state.goal, root, state.model)
+        if not resumed:
+            # ★ 任务开始时的文件快照：用户在此之前就有的未提交修改**不是** Agent 干的。
+            #   没有这个基线，事后审计会把用户的改动算到 Agent 头上。
+            #   ★ 恢复时**必须沿用**快照里的基线：重扫会把中断前 Agent 已经改过的
+            #     文件当成"用户原有状态"，审计直接漏报。
+            state.baseline_files = await asyncio.to_thread(scan_tree, root)
+        self.bus.task_start(
+            state.goal, root, state.model,
+            **({"resumed": True, "resumed_from_turn": resume.report.resumed_from_turn,
+                "checkpoint_seq": resume.report.checkpoint_seq} if resumed else {}),
+        )
 
         # ---- 步骤 6：广播权限模式 ---------------------------------------
         # ★ 模式是**环境配置**，不是 Policy 关卡（docs/22 §4.2）。
@@ -657,6 +706,104 @@ class AgentCore:
     # ===================================================================== #
     # 循环主体
     # ===================================================================== #
+    # ===================================================================== #
+    # ask_user：迟到的回答
+    # ===================================================================== #
+    def _on_late_answer(self, req: Any, answers: list[dict[str, Any]]) -> None:
+        """
+        ask_user 前台等待超时（pending）之后，用户仍然回答了。
+
+        ★ 为什么不能"唤醒工具"：工具协程在超时那一刻已经返回，没有 await 可以恢复。
+          唯一可行的通道 = 把这个答案当成一条用户消息放进对话历史，
+          模型下一步自然读到。
+
+        ★ 协程安全：本方法由 HTTP 协程调用，和 agent 循环在同一个事件循环里，
+          只做内存 append、不 await —— 不会和循环交错出"半个状态"。
+          落盘由循环下一次 `_persist_history()` 顺带完成（它按游标只写新增部分）。
+        """
+        state = getattr(self, "_active_state", None)
+        if state is None or state.status in (
+            TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABORTED,
+        ):
+            log.info("ask_user 迟到的回答没有接收方（任务已结束：%s），已丢弃",
+                     getattr(state, "status", "?"))
+            return
+        if req.task_id and state.task_id and req.task_id != state.task_id:
+            log.warning("ask_user 迟到的回答 task_id 不匹配（%s ≠ %s），已丢弃",
+                        req.task_id, state.task_id)
+            return
+
+        from .user_input import render_answers
+
+        body = render_answers(req.questions, answers)
+        self._history.append(Message.user(
+            "用户在我上一次提问超时之后补充了回答（那个问题当时没等到，不代表被拒绝）：\n"
+            f"{body}\n"
+            "请据此继续手头的工作，不要把这条当成新的任务目标。"
+        ))
+        log.info("ask_user 迟到的回答已并入任务 %s（%d 条答案）", state.task_id, len(answers))
+
+    def _init_intent_scope(self, state: TaskState, allowed_paths: list[str] | None) -> None:
+        """
+        新建任务的一次性初始化：意图分类 + 用户约束 + 范围冲突检测。
+
+        ★ 为什么抽成方法：**恢复路径不能走这里** —— 重算 intent/scope 会把
+          checkpoint 里的原始约束（例如"只许改 src/"）覆盖成调用方这次的默认值，
+          等于偷偷放宽权限。抽出来，两边各自清楚。
+        """
+        # ★ 为什么在 run 开头就定：意图决定了后面每一步怎么验证
+        #   （诊断任务不该被"测试失败"拦，修复任务不能只凭 exit_code=0 收尾）。
+        #   分类只用**用户写的文字**，不看文件变化 —— 后者是结果不是原因。
+        verdict = classify_intent(state.goal, forbidden_paths=state.forbidden_paths)
+        state.intent = verdict.intent
+        state.intent_confidence = verdict.confidence
+        state.intent_reasons = list(verdict.reasons)
+        state.constraints = dict(verdict.constraints)
+        if state.intent != "unknown":
+            log.info("任务 %s 意图判定：%s（%s）%s", state.task_id, state.intent,
+                     state.intent_confidence, verdict.reasons)
+
+        # ★ 用户说了"别改测试"而调用方没传 forbidden_paths → 自动补上，
+        #   复用现有 Policy 机制，不另建一套审批。
+        #   测试编写任务例外：那时改测试正是用户要的交付物。
+        if state.constraints.get("no_test_modification") and state.intent != "test_authoring":
+            for p in ("tests/", "conftest.py", "pytest.ini", "tox.ini"):
+                if not _scope_hits(p, state.forbidden_paths):
+                    state.forbidden_paths.append(p)
+            state.intent_reasons.append("用户要求不改测试 → 已自动加入禁止修改范围")
+        # ★ 「不许修改 <具体路径>」→ 路径约束（第四批：不再误判成全局只读）
+        for p in verdict.scoped_forbidden:
+            if not _scope_hits(p, state.forbidden_paths):
+                state.forbidden_paths.append(p)
+                state.intent_reasons.append(f"用户禁止修改 {p} → 已加入禁止范围")
+        # ★ 「其余只许改 <路径>」→ 允许范围（超出即越界，会被审计标记）
+        #   ★ 取**交集**而不是并集：调用方给的 allowed 是外层硬边界，
+        #   用户原话里的范围更具体 → 生效范围是两者中更严的那个。
+        api_allowed = list(allowed_paths) if allowed_paths else []
+        goal_allowed = verdict.scoped_allowed
+        if goal_allowed:
+            effective = [p for p in goal_allowed
+                         if not api_allowed or within_allowed(p, api_allowed)]
+            if effective:
+                state.allowed_paths = effective
+                state.intent_reasons.append(f"用户限定只许改 {', '.join(effective)} → 生效允许范围")
+            else:
+                state.intent_reasons.append(
+                    "用户原话的范围与调用方给的允许范围无交集 → 按更严的调用方范围执行")
+
+        # ---- 范围冲突检测（目标 vs 权限）--------------------------------
+        # ★ 只检测、只披露，**不自动放开权限**。
+        state.scope_conflicts = detect_scope_conflicts(
+            state.goal,
+            allowed_paths=state.allowed_paths,
+            forbidden_paths=state.forbidden_paths,
+        )
+        if state.scope_conflicts:
+            log.info("任务 %s 检测到范围冲突 %d 项：%s", state.task_id,
+                     len(state.scope_conflicts),
+                     [c.get("path") for c in state.scope_conflicts])
+
+
     async def _loop(self, state: TaskState) -> None:
         # ---- PLAN（第一轮之前）------------------------------------------
         if self.config.use_plan_phase:
@@ -765,6 +912,13 @@ class AgentCore:
           一边规划一边乱调工具 —— 那种混合输出很难解析，也很难展示。
         """
         from ..prompts.system import PLAN_PROMPT
+
+        # ★ 恢复任务：checkpoint 里已有计划和步进位置 —— 重规划会把它们抹掉，
+        #   模型会从第 1 步重新开始（等于假装之前的工作没发生）。
+        if self._resumed_from and state.plan:
+            log.info("任务 %s 恢复：沿用 checkpoint 里的 %d 步计划（步进 %d），不重规划",
+                     state.task_id, len(state.plan), state.current_step_index)
+            return
 
         state.next_turn()
 
@@ -1061,6 +1215,8 @@ class AgentCore:
         ctx = make_context(state)
         ctx.spawner = self.spawner      # M5：子任务能力随上下文下发（工具不持有全局状态）
         ctx.bus = self.bus              # M6：工作流工具用它发 workflow.state 事件
+        ctx.user_input = self._user_input  # ask_user 工具用它挂起等用户回答
+        ctx.skills = getattr(self, "_skills", None)  # skill 工具用它载入技能正文
         decision = self.policy.check(
             tc.name,
             tc.arguments,
@@ -1461,37 +1617,36 @@ class AgentCore:
     # --------------------------------------------------------------------- #
     def restore_history(self, state: TaskState, entries: list[dict[str, Any]]) -> dict[str, Any]:
         """
-        把持久化历史装载进内存，用于**诊断与未来恢复机制**。
+        把持久化历史装载进内存，并给出**可续跑性**判定。
 
-        ★ M1 的安全立场（必须如实理解）：
-          · 装载历史 ≠ 可以安全续跑。原因：
-            ① 消息缺口 = 工具可能已执行而结果未保存 → 重复执行有副作用风险；
-            ② 等待中的审批状态不在历史里（审批是内存 Future）；
-            ③ 工具副作用（文件系统）无法从消息重建。
-          · 因此本方法**只装配历史并给出诊断报告**，不改任务状态、不触发任何
-            工具调用、不解除任何闸门。真正的安全续跑属于后续阶段
-            （需要：工具结果持久化 + 副作用对账 + 审批状态持久化）。
+        ★ 判定口径（2026-11-11 更新，原本恒为 False）：
+          只有两条硬性理由会判不安全 —— 历史为空、存在工具结果缺口。
+          其余风险（工作区是否搬家、预算是否耗尽、快照是否过旧）由
+          `checkpoint.restore.plan_resume()` 统一裁定（那里有 workspace/budget/age 信息）。
+          两处**故意的分工**：本方法只看"消息层能不能接上"，plan_resume 看"现场能不能接上"。
+
+        ★ 恢复不重放历史动作：messages 原样回灌给模型，已执行过的工具不会再跑。
+          所以真正的风险只有一种 —— assistant 声明了 tool_calls、结果却没保存，
+          这时重跑有副作用、跳过又不完整，只能拒绝。
 
         返回 RestoreReport：
           loaded            装载的消息条数
           tool_call_gaps    消息缺口清单（assistant 有 tool_calls 但 tool 结果不足）
-          safe_to_resume    M1 恒为 False（除非历史为空）
-          reasons           为什么不能自动续跑
+          safe_to_resume    消息层是否可安全续跑
+          reasons           为什么不能续跑
         """
         messages = entries_to_messages(entries)
         gaps = find_tool_call_gaps(messages)
         reasons: list[str] = []
+        if not messages:
+            reasons.append("历史为空：没有可装载的上下文")
         if gaps:
             reasons.append(f"存在 {len(gaps)} 处消息缺口（工具可能已执行但结果未保存）")
-        if messages and messages[-1].role != "assistant":
-            reasons.append("最后一条不是 assistant 消息，执行位置不明确")
-        if entries:
-            reasons.append("工具副作用与审批状态无法从消息历史重建（M1 边界）")
-        safe = not reasons and not messages
+        safe = not reasons
 
         marker = Message.system(
             f"[恢复] 已从持久化历史装载 {len(messages)} 条消息"
-            f"（M1：仅供诊断，不会自动续跑；安全结论见 RestoreReport）"
+            f"（消息层可续跑：{'是' if safe else '否'}）"
         )
         self._history = [marker] + messages
         self._history_persisted = len(self._history)
@@ -2455,6 +2610,51 @@ class AgentCore:
                         "再用 run_command 或 terminal 跑一遍验证；\n"
                         "· 如果确实不需要动手（目标已存在且符合要求）："
                         "跑一条能证明现状的命令，并在答复里说明为什么不需要改动。"
+                    )
+                return "fail", detail
+
+        # ---- ②d desktop 点击后必须验证（computer use 闭环）------------
+        # ★ 真实事故：模型调用 desktop_click 点了一下屏幕，然后直接说"已完成"，
+        #   没有任何证据表明它点对了。这和 repair 闸门是同一个病灶：
+        #   "说完成但没证据"。
+        # ★ 判定逻辑（可观测事实，不解析模型的话）：
+        #   找到最后一次**成功**的 desktop_click（原生或 MCP），
+        #   如果它之后没有任何"观察类"调用（capture_screen / desktop_locate /
+        #   desktop_snapshot / desktop_find / desktop_get / desktop_is /
+        #   desktop_screenshot），说明点击后没有验证 → 拦一次。
+        # ★ 只拦成功的点击：点失败（ok=False）时模型应该如实报告失败，
+        #   不需要它再验证（它自己都知道没点到）。
+        # ★ 插在"没动过文件 → ok"之前：桌面任务通常不改文件，
+        #   不在这之前拦就会被 `if not state.change_records: return "ok"` 提前放行。
+        def _is_desktop_click(tool: str) -> bool:
+            return "desktop_click" in tool or "desktop_mouse_click" in tool
+
+        def _is_desktop_observe(tool: str) -> bool:
+            return tool == "capture_screen" or tool == "desktop_locate" or (
+                "desktop_snapshot" in tool or "desktop_find" in tool
+                or "desktop_get" in tool or "desktop_is" in tool
+                or "desktop_screenshot" in tool
+            )
+
+        click_idx = None
+        for i, ev in enumerate(state.tool_events):
+            if ev.ok and _is_desktop_click(ev.tool):
+                click_idx = i
+        if click_idx is not None:
+            after = [e for e in state.tool_events[click_idx + 1:] if _is_desktop_observe(e.tool)]
+            if not after:
+                detail = (
+                    f"调用了 desktop_click（{state.tool_events[click_idx].tool}）后，"
+                    "没有任何后续观察（截屏/快照/定位）—— 无法证明点击生效。"
+                )
+                if state.verification_retries < self.config.max_verification_retries:
+                    state.verification_retries += 1
+                    return "reject", (
+                        "[系统] 你点击了屏幕，但系统没有看到任何点击后的验证观察。\n"
+                        "桌面操作不能只凭「我点完了」判定完成。请二选一：\n"
+                        "· 用 desktop_snapshot 抓一次 UIA 树 / 用 desktop_locate 再定位一次，"
+                        "确认点击结果；\n"
+                        "· 如果点击没生效或无法验证，如实报告失败，不要写成已完成。"
                     )
                 return "fail", detail
 

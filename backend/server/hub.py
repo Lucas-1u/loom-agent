@@ -11,6 +11,10 @@
            event.seq: 任务内序号         （原样保留，用于前端排序去重）
 
   ② **需要缓冲**。客户端断线重连时得能补发。EventBus 不存历史。
+     ★ 缓冲只是"最近 3000 条"的热数据。冷数据由 `EventArchive` 落盘
+       （`task_events` 表，对比表 #49）。hub 自己**不认识 SQLite**，
+       只把每条事件同步塞进归档队列（见 `publish()` 末尾）——
+       于是"实时广播"和"落盘"彻底解耦：落盘慢/挂掉都不影响 SSE。
 
   ③ **需要广播**。多个客户端（刷新页面会短暂有两条连接）要各自收到。
 
@@ -87,20 +91,31 @@ class EventHub:
         max_event_bytes: int = MAX_EVENT_BYTES,
         max_total_bytes: int = MAX_TOTAL_BYTES,
         sub_queue_size: int = SUB_QUEUE_SIZE,
+        archive: Any = None,
+        start_id: int = 0,
+        seq_floor: Any = None,
     ) -> None:
         self.max_events = max_events
         self.max_event_bytes = max_event_bytes
         self.max_total_bytes = max_total_bytes
         self.sub_queue_size = sub_queue_size
 
-        self._gid = 0
+        # 落盘（#49）：只需 `enqueue(task_id, event_dict, gid)` 和 `seq_floor(task_id)`
+        # 两个方法，鸭子类型 —— hub 不认识 SQLite，也不 import store。
+        self._archive = archive
+        self._seq_floor = seq_floor
+
+        self._gid = int(start_id or 0)
         self._buf: deque[dict[str, Any]] = deque()
         self._bytes = 0
         self._subs: set[Subscriber] = set()
+        # 每个任务"最后一次发出"的 seq —— 见 publish 里的归一化说明
+        self._last_seq: dict[str, int] = {}
 
         # 统计（便于测试和 /api/health 观察）
         self.evicted = 0        # 被容量上限挤掉的事件数
         self.dropped = 0        # 因订阅者队列满而丢弃的投递数
+        self.seq_normalized = 0  # 被"抬"过的 seq 条数（续跑时才会 > 0）
 
     # ===================================================================== #
     # 发布
@@ -110,11 +125,41 @@ class EventHub:
         收一条事件：分配全局 id → 存缓冲副本 → 广播原始事件。
 
         返回刚生成的记录（便于测试）。
+
+        ★ 任务内 seq 的**归一化**（2026-11-11，事件落盘时加的）
+        ────────────────────────────────────────────────────────────
+        前端用 seq 排序去重，`task_events` 的主键也是 (task_id, seq)，
+        所以"同一任务内 seq 必须严格递增"是硬约束。而 EventBus 的 seq 是
+        每个实例从 1 数的 —— **续跑**会新建一个 bus，seq 又从 1 开始，
+        不处理的话新事件要么覆盖旧事件，要么被前端当重复丢掉。
+
+        处理方式：取 `max(本进程见过的上一个 seq, 库里已落盘的最大 seq)` 作地板，
+        比地板小的 seq 一律抬成 `地板+1`。正常运行时 `raw > floor` 恒成立，
+        这一步是纯 no-op；只有续跑/无 seq 的事件才会被抬。
+
+        没有 seq 的事件（运行时兜底的 error 事件就是）同样走这条路 ——
+        以前它靠"前端排序时 NaN 不参与"混过去，落盘之后必须给个真 seq。
         """
         self._gid += 1
         gid = self._gid
 
         event_dict = ev.to_dict()
+
+        floor = self._last_seq.get(task_id, 0)
+        if self._seq_floor is not None:
+            try:
+                floor = max(floor, int(self._seq_floor(task_id) or 0))
+            except Exception:  # noqa: BLE001 —— 缓存坏了不该影响事件流
+                pass
+        raw_seq = event_dict.get("seq")
+        if isinstance(raw_seq, int) and raw_seq > floor:
+            seq = raw_seq
+        else:
+            seq = floor + 1
+            if raw_seq is not None:
+                self.seq_normalized += 1
+        event_dict["seq"] = seq
+        self._last_seq[task_id] = seq
 
         # ---- 缓冲副本（可能截断超大 data）----
         buffered = self._make_buffered_copy(event_dict)
@@ -155,6 +200,13 @@ class EventHub:
                 sub.need_gap = True
                 sub.dropped += 1
                 self.dropped += 1
+
+        # ---- 落盘：同步入队，一微秒都不等（见 archive.py 顶部说明）----
+        if self._archive is not None:
+            try:
+                self._archive.enqueue(task_id, event_dict, gid)
+            except Exception:  # noqa: BLE001 —— 落盘侧任何问题都不许影响实时事件
+                pass
 
         return rec
 
@@ -210,6 +262,18 @@ class EventHub:
     # ===================================================================== #
     @property
     def latest_id(self) -> int:
+        return self._gid
+
+    def seed_gid(self, value: int) -> int:
+        """
+        用"库里最大的事件 id"播种全局游标。
+
+        ★ 不这么做的话，重启后 gid 又从 1 开始：客户端拿着上次的 `since=42`
+          来重连，新事件 id 只有 1、2、3 —— 要么补不出东西，要么补错。
+          落盘之后游标必须跟着库走，否则 `?since=` 的语义就断了。
+        """
+        if value and int(value) > self._gid:
+            self._gid = int(value)
         return self._gid
 
     @property
@@ -279,4 +343,6 @@ class EventHub:
             "evicted": self.evicted,
             "dropped": self.dropped,
             "subscribers": self.subscriber_count,
+            # >0 说明发生过 seq 归一化（续跑接 seq / 无 seq 事件），不是故障
+            "seq_normalized": self.seq_normalized,
         }

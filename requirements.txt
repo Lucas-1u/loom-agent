@@ -20,6 +20,11 @@ python-dotenv>=1.0.0
 # ---- HTTPS 证书（替代旧项目的 verify=False，见 Step1 分析报告） ----
 certifi
 
+# ---- Skill 技能 frontmatter 解析（对比表 #24）----
+# langgraph 已经间接引入它；这里显式声明，免得哪天换掉编排引擎后技能解析悄悄降级。
+# 没装也能跑：backend/skills/loader.py 里有 minimal_yaml 兜底（只支持常见写法）。
+pyyaml>=6.0
+
 # ---- Graph 编排引擎（M2，可选：legacy 模式不需要） ----
 langgraph>=0.2,<0.7
 

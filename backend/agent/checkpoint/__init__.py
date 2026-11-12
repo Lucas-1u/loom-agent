@@ -25,10 +25,17 @@ DSH 的 `dsh-session-checkpoint-policy` 是一个 cordis 插件，在
   3. at_turn_start      —— 每轮开始前（_loop / node_budget）
 
 这三个点覆盖了所有"有副作用或不可逆"的操作之前的窗口。
+
+★ 读回来的路径（2026-11-11 补齐）
+----------------
+`restore.plan_resume()` 把「最新 checkpoint + 持久化历史 + 基线快照」装配成
+`ResumePlan`，并用**真实判据**给出 `safe_to_resume`（以前恒为 False）。
+`AgentCore.run(resume=...)` 消费它，继续未完成的任务。
 """
 
 from .store import CheckpointStore, LocalDiskCheckpointStore, CheckpointRef, load_checkpoint
 from .policy import CheckpointPolicyConfig, save_checkpoint, latest_checkpoint_id
+from .restore import ResumePlan, ResumeReport, plan_resume
 
 __all__ = [
     "CheckpointStore",
@@ -38,4 +45,7 @@ __all__ = [
     "CheckpointPolicyConfig",
     "save_checkpoint",
     "latest_checkpoint_id",
+    "ResumePlan",
+    "ResumeReport",
+    "plan_resume",
 ]

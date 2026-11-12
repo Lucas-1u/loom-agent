@@ -1,0 +1,20 @@
+{
+  "_说明": "Loom 实际生效的 MCP 配置。复制自 mcp_servers.example.json；需要 .env 里设 LOOM_MCP=1 + LOOM_MCP_CONFIG=绝对路径 才生效。",
+  "_agent_desktop": {
+    "来源": "Vercel Labs agent-desktop 1.2.0（Apache-2.0，npm 全局安装）。纯 Windows UIA 树感知，不截图、不需要视觉模型。",
+    "状态": "2026-11-08 接入。observation 类工具标 READ 自动放行，写入/点击类默认 WRITE。",
+    "安全": "agent-desktop 是宿主机本机进程，拥有与 Loom 相同的系统权限；read-only 任务里其 WRITE 工具会被意图拦截，readonly 模式下注册表直接剔除。"
+  },
+  "servers": [
+    {
+      "id": "agent_desktop",
+      "command": "agent-desktop",
+      "args": ["mcp", "--headed"],
+      "enabled": true,
+      "trust": "prompt",
+      "read_tools": ["desktop_snapshot", "desktop_find", "desktop_get", "desktop_is",
+                      "desktop_list_windows", "desktop_list_displays", "desktop_list_apps"],
+      "timeout_s": 60
+    }
+  ]
+}

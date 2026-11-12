@@ -519,6 +519,12 @@ class CheckpointConfig:
     # True = 保存失败阻止下游执行（DSH 默认）；False = 只记日志（Loom 默认）
     fail_closed: bool = False
     dir_name: str = CHECKPOINT_DIR_NAME
+    # ---- 自动恢复（2026-11-11 接入）----
+    # 重启后扫描中断任务，判据通过（plan_resume.safe_to_resume）就自动续跑。
+    # False = 只标记为可恢复，由用户手动点"继续"。
+    auto_resume: bool = True
+    # 快照超过这个时长就不再自动续（现场大概率已变）。<=0 = 不限制。
+    resume_max_age_s: float = 86_400.0
 
     @classmethod
     def from_env(cls) -> "CheckpointConfig":
@@ -530,6 +536,8 @@ class CheckpointConfig:
             max_history=max(1, _env_int("LOOM_CKPT_MAX_HISTORY", 20)),
             fail_closed=_env("LOOM_CKPT_FAIL_CLOSED", "0").lower() in ("1", "true", "on", "yes"),
             dir_name=_env("LOOM_CKPT_DIR", CHECKPOINT_DIR_NAME) or CHECKPOINT_DIR_NAME,
+            auto_resume=_env("LOOM_CKPT_AUTO_RESUME", "1").lower() not in ("0", "false", "off", "no"),
+            resume_max_age_s=_env_float("LOOM_CKPT_RESUME_MAX_AGE_H", 24.0) * 3600.0,
         )
 
 
@@ -538,6 +546,143 @@ def _load_mcp_config():
     from .mcp.config import McpConfig
     cfg = McpConfig.from_env()
     return cfg if cfg.enabled else None
+
+
+# --------------------------------------------------------------------------- #
+# Skill 技能（对比表 #24，对齐 DSH dsh-skill / dsh-skill-filesystem）
+# --------------------------------------------------------------------------- #
+#: 项目级技能目录（相对工作区根）
+SKILLS_PROJECT_DIR = ".loom/skills"
+
+
+def default_user_skills_dir() -> str:
+    """用户级技能目录：`~/.loom/skills`（跨项目可用）。"""
+    return str(Path.home() / ".loom" / "skills")
+
+
+def default_builtin_skills_dir() -> str:
+    """内置技能目录：**仓库根**下的 `skills/`（Loom 自带的示例与开发套路）。
+
+    ★ 用 LOOM_DIR 而不是 PROJECT_ROOT：PROJECT_ROOT 是仓库的上一级
+      （docs/ 所在处），内置技能要跟代码一起进版本库。
+    """
+    return str(LOOM_DIR / "skills")
+
+
+@dataclass
+class EventsConfig:
+    """
+    事件流落盘（对比表 #49）。
+
+    · enabled         总开关（LOOM_EVENTS=0 → 只留内存环形缓冲，行为回到改造前）
+    · retention_days  保留天数，0 = 永不清理（LOOM_EVENTS_RETENTION_DAYS，默认 30）
+    · flush_interval  后台批量写间隔（秒），越大越省 IO，但"重启前最后几条"丢得越多
+    · batch_size      单个事务最多写几条
+
+    ★ 为什么默认开着：事件是**执行流的唯一证据**。不落盘的话，重启之后
+      前端只能看到"任务结论"，看不到它怎么走过来的 —— 而"看清内部机制"
+      正是这个项目存在的理由。
+    ★ 为什么要有保留期：thinking 是流式 delta，一个长任务几千条很正常。
+      不清理的话库会一直涨（实测一个中等任务约 200~600 条）。
+    """
+
+    enabled: bool = True
+    retention_days: int = 30
+    flush_interval: float = 0.25
+    batch_size: int = 64
+
+    @property
+    def usable(self) -> bool:
+        return self.enabled
+
+    @classmethod
+    def from_env(cls) -> "EventsConfig":
+        return cls(
+            enabled=_env("LOOM_EVENTS", "1").lower() not in ("0", "false", "off", "no"),
+            retention_days=max(0, _env_int("LOOM_EVENTS_RETENTION_DAYS", 30)),
+            flush_interval=max(0.01, _env_float("LOOM_EVENTS_FLUSH_S", 0.25)),
+            batch_size=max(1, _env_int("LOOM_EVENTS_BATCH", 64)),
+        )
+
+
+@dataclass
+class SkillsConfig:
+    """
+    Skill 技能配置（三级渐进披露：目录 → 正文 → 附带文件）。
+
+    · enabled            总开关（LOOM_SKILLS=0 时 load_skill 工具不注册）
+    · project_dir        项目级目录，相对工作区（随仓库走，优先级最高）
+    · user_dir           用户级目录，默认 ~/.loom/skills
+    · dirs               额外目录（LOOM_SKILLS_DIRS，用 os.pathsep 分隔）
+    · builtin_dir        仓库内置 skills/（优先级最低）
+    · max_body_chars     SKILL.md 正文上限，超出截断（防止一个技能撑爆上下文）
+    · max_file_chars     附带文件读入上限
+    · max_skills         单个根目录最多加载几个（防止误把家目录配进来）
+
+    ★ 优先级：项目级 > 用户级 > 自定义 > 内置。**先扫到的赢**，同名技能后面的
+      只记一条 skipped 记录，不覆盖 —— 否则项目里定好的约定会被全局技能悄悄改掉。
+    """
+
+    enabled: bool = True
+    project_dir: str = SKILLS_PROJECT_DIR
+    user_dir: str = field(default_factory=default_user_skills_dir)
+    dirs: list[str] = field(default_factory=list)
+    builtin_dir: str = field(default_factory=default_builtin_skills_dir)
+    max_body_chars: int = 24_000
+    max_file_chars: int = 12_000
+    max_skills: int = 64
+
+    @property
+    def usable(self) -> bool:
+        return self.enabled
+
+    @classmethod
+    def from_env(cls) -> "SkillsConfig":
+        raw_dirs = _env("LOOM_SKILLS_DIRS", "")
+        dirs = [p for p in (seg.strip() for seg in raw_dirs.split(os.pathsep)) if p]
+        return cls(
+            enabled=_env("LOOM_SKILLS", "1").lower() not in ("0", "false", "off", "no"),
+            project_dir=_env("LOOM_SKILLS_PROJECT_DIR", SKILLS_PROJECT_DIR) or SKILLS_PROJECT_DIR,
+            user_dir=_env("LOOM_SKILLS_USER_DIR", "") or default_user_skills_dir(),
+            dirs=dirs,
+            builtin_dir=_env("LOOM_SKILLS_BUILTIN_DIR", "") or default_builtin_skills_dir(),
+            max_body_chars=max(2000, _env_int("LOOM_SKILLS_MAX_BODY", 24_000)),
+            max_file_chars=max(1000, _env_int("LOOM_SKILLS_MAX_FILE", 12_000)),
+            max_skills=max(1, _env_int("LOOM_SKILLS_MAX", 64)),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 联网搜索（对比表 #21，DeepSeek Search API）
+# --------------------------------------------------------------------------- #
+@dataclass
+class WebSearchConfig:
+    """
+    联网搜索（DeepSeek Search API，对齐 DSH dsh-web-deepseek-api）。
+
+    · enabled      总开关：LOOM_WEB_SEARCH=0 可整体关闭（工具不注册）
+    · api_key      优先 LOOM_WEB_SEARCH_API_KEY，否则复用 DEEPSEEK_API_KEY
+    · base_url     可指向其他部署前缀（含 /v1/tools 路径前缀）
+    · timeout      单次搜索超时（秒）
+
+    ★ 任务级开关不在这里：前端"联网搜索"开关决定**每个任务**的注册表里
+      有没有 web_search 工具（与 desktop 模式剔除桌面工具同一套路，
+      服务端真强制，不是提示词层面）。
+    """
+
+    enabled: bool = True
+    base_url: str = "https://api.deepseek.com/v1/tools"
+    api_key: str = ""
+    timeout: float = 20.0
+
+    @classmethod
+    def from_env(cls) -> "WebSearchConfig":
+        return cls(
+            enabled=_env("LOOM_WEB_SEARCH", "1").lower() not in ("0", "false", "off", "no"),
+            base_url=_env("LOOM_WEB_SEARCH_BASE_URL", "https://api.deepseek.com/v1/tools"),
+            api_key=_env("LOOM_WEB_SEARCH_API_KEY") or _env("DEEPSEEK_API_KEY"),
+            timeout=_env_float("LOOM_WEB_SEARCH_TIMEOUT", 20.0),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -559,6 +704,12 @@ class Config:
     spill: SpillConfig = field(default_factory=SpillConfig.from_env)
     # Checkpoint：跨进程恢复快照（P0，对齐 DeepSeek Harness dsh-session-checkpoint-policy）
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig.from_env)
+    # 联网搜索（对比表 #21）：复用 DEEPSEEK_API_KEY
+    web_search: WebSearchConfig = field(default_factory=WebSearchConfig.from_env)
+    # Skill 技能（对比表 #24）：三级渐进披露，按工作区扫项目级目录
+    skills: SkillsConfig = field(default_factory=SkillsConfig.from_env)
+    # 事件流落盘（对比表 #49）：重启后时间线还在
+    events: EventsConfig = field(default_factory=EventsConfig.from_env)
     log_level: str = "INFO"
 
     @classmethod
@@ -574,6 +725,9 @@ class Config:
             multiagent=MultiAgentConfig.from_env(),
             spill=SpillConfig.from_env(),
             checkpoint=CheckpointConfig.from_env(),
+            web_search=WebSearchConfig.from_env(),
+            skills=SkillsConfig.from_env(),
+            events=EventsConfig.from_env(),
             log_level=_env("LOOM_LOG_LEVEL", "INFO"),
         )
 

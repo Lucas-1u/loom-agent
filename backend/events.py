@@ -79,6 +79,15 @@ class EventType(str, Enum):
     APPROVAL_DECISION = "approval.decision"  # 用户已决策（approved / rejected）
     APPROVAL_EXPIRED = "approval.expired"    # 等待超时，视同拒绝
 
+    # ---- 询问用户（ask_user）--------------------------------------------
+    # ★ 与审批的区别：审批是"允许/拒绝动作"，ask_user 是"回答澄清问题"。
+    #   机制相同（Future 挂起），语义不同（结构化答案）。
+    # ★ 2026-11-11 对齐 DSH：一次可问多个问题，每题带 options / multi_select，
+    #   答案里 selected[] 是勾选的选项、custom 是用户自己填的内容。
+    USER_INPUT_REQUEST = "user_input.request"    # Agent 提问（可能多个问题），挂起等待
+    USER_INPUT_RESPONSE = "user_input.response"  # 用户已回答（late=true 表示超时后才答的）
+    USER_INPUT_EXPIRED = "user_input.expired"    # 前台等待超时（pending=true 时问题**仍可回答**）
+
     # ---- 权限模式（步骤 6）--------------------------------------------------
     # ★ 模式是**环境配置**，不是 Policy 关卡（见 docs/22 §4.2）。
     #   它决定：Docker 挂载方式（:ro / :rw）、哪些工具注册、ACL 令牌配置。
@@ -303,11 +312,19 @@ class EventBus:
     # 以下方法把 EventType 的取值收拢到一处，Agent 里调用更短、更不易拼错。
     # 注意：它们都只是 emit 的薄封装，**不承载业务语义**。
 
-    def task_start(self, goal: str, workspace: str, model: str) -> Event:
+    def task_start(self, goal: str, workspace: str, model: str,
+                   **extra: Any) -> Event:
+        """
+        任务受理。
+
+        `extra` 用于恢复场景（resumed / resumed_from_turn / checkpoint_seq）——
+        ★ 不新增事件类型：恢复在语义上就是"任务又一次开始了"，
+          前端已有的 task.start 渲染能直接吃下这几个字段（未知键会被忽略）。
+        """
         return self.emit(
             Event.make(
                 EventType.TASK_START,
-                {"goal": goal, "workspace": workspace, "model": model},
+                {"goal": goal, "workspace": workspace, "model": model, **extra},
             )
         )
 

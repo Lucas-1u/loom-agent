@@ -171,8 +171,12 @@ async def suite_store(tmp: Path) -> None:
     check(row is not None and row.get("parent_task_id") is None, "★ 旧任务 parent_task_id 补成 NULL")
     cols = {r[1] for r in sqlite3.connect(old_db).execute("PRAGMA table_info(tasks)")}
     check("parent_task_id" in cols, "★ 迁移后表结构含 parent_task_id")
+    tabs = {r[0] for r in sqlite3.connect(old_db).execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    check("task_events" in tabs,
+          f"★★ 老库迁移顺手补上 task_events（否则第一次启动就 no such table）：{sorted(tabs)}")
     ver = sqlite3.connect(old_db).execute("PRAGMA user_version").fetchone()[0]
-    check(ver == 2, f"schema 版本升到 2（实际 {ver}）")
+    check(ver >= 2, f"★ v1 老库迁移到当前版本（实际 {ver}，>=2 即含 parent_task_id）")
 
 
 # --------------------------------------------------------------------------- #
@@ -405,7 +409,7 @@ async def suite_failures(tmp: Path) -> None:
 # --------------------------------------------------------------------------- #
 def suite_events() -> None:
     print("\n[E] 事件与契约")
-    check(len(list(EventType)) == 21, f"事件类型仍是 21 种（实际 {len(list(EventType))}）")
+    check(len(list(EventType)) == 24, f"事件类型仍是 24 种（实际 {len(list(EventType))}）")
     src = Path(__file__).resolve().parents[1] / "frontend" / "src" / "types" / "events.ts"
     if src.exists():
         text = src.read_text(encoding="utf-8")

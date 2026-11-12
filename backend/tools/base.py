@@ -257,6 +257,12 @@ class ToolContext:
     spawner: Any = None
     # M6：事件总线（工作流这类"多步并行"的工具需要自己发进度事件）
     bus: Any = None
+    # ask_user：用户输入挂起-恢复管理器（AgentCore 创建并注入；ask_user 工具用它挂起等用户回答）
+    user_input: Any = None
+    # Skill：本任务可见的技能库（AgentCore 按工作区构建后注入；load_skill 用它载入正文）
+    # ★ 为什么走 ctx 而不是工具实例：注册表是全局共享的一份，而技能是**按工作区**扫描的
+    #   （项目级 .loom/skills 随仓库变化）。把库挂在上下文上，注册表就不必为每个任务重建。
+    skills: Any = None
     # M5：子任务要继承的安全约束（来自父任务 TaskState）
     allowed_paths: list[str] | None = None
     forbidden_paths: list[str] | None = None

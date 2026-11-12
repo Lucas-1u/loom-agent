@@ -52,3 +52,11 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---- 本机探针 / 运行产物（不入库）----
+capture/
+sandbox/probe_*
+sandbox/*.png
+sandbox/*_out.txt
+sandbox/loop_out.txt
+dev/_*_backup_*.py

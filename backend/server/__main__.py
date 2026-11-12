@@ -22,6 +22,7 @@ import argparse
 import logging
 import socket
 import sys
+import time
 
 import uvicorn
 
@@ -32,6 +33,7 @@ from ..sandbox import SandboxManager
 from ..agent.rag import KnowledgeBase
 from ..tools.registry import build_default_registry
 from .app import create_app
+from .archive import EventArchive
 from .hub import EventHub
 from .scheduler import TaskScheduler
 from .store import StoreError, TaskStore
@@ -99,18 +101,39 @@ async def amain(args: argparse.Namespace) -> int:
         return 4
 
     # ---- ③ 孤儿恢复（必须在接新任务之前）----
-    orphans = await store.mark_orphans_failed("server_restarted")
-    if orphans:
-        print(f"[!] 发现 {len(orphans)} 个上次未完成的任务，已标记为 failed(server_restarted)：")
-        for t in orphans[:5]:
-            print(f"      {t}")
-        if len(orphans) > 5:
-            print(f"      …以及另外 {len(orphans) - 5} 个")
+    #
+    # ★ 这里不再"一刀切标 failed"：能不能续要看 checkpoint（见下面 scheduler 创建后
+    #   的 recover_interrupted）。旧实现直接标失败，等于把可恢复的任务判了死刑。
+    #   真正的处理推迟到 TaskScheduler 装配完成之后。
+    pending_orphans = await store.list_unfinished()
+    if pending_orphans:
+        print(f"[!] 发现 {len(pending_orphans)} 个上次未完成的任务，正在检查能否续跑……")
 
     await store.cleanup_idempotency()
 
     # ---- ④ 装配 ----
-    hub = EventHub()
+    #
+    # ★ 事件落盘（对比表 #49）必须在 hub 之前建好：
+    #   hub 每次 publish 要问它两件事 —— "这个任务已落盘的最大 seq 是多少"
+    #   （续跑接 seq）和"给我把这条塞进队列"。
+    archive = EventArchive(
+        store,
+        enabled=cfg.events.usable,
+        flush_interval=cfg.events.flush_interval,
+        batch_size=cfg.events.batch_size,
+    )
+    archived_tasks = 0
+    last_event_id = 0
+    if archive.enabled:
+        # ★ 这两步必须在**任何任务开跑之前**完成（续跑会立刻发事件）：
+        #   ① 把每任务的最大 seq 读进内存 → 新事件接着涨，不会覆盖旧事件
+        #   ② 用库里的 MAX(id) 给 hub 播种 → ?since= 跨重启仍然对
+        archived_tasks = archive.load_seq_cache_sync()
+        last_event_id = await store.max_event_id()
+
+    hub = EventHub(archive=archive if archive.enabled else None,
+                   start_id=last_event_id,
+                   seq_floor=archive.seq_floor if archive.enabled else None)
 
     # ★ 命令沙箱：先探测，把结果作为**明确的环境状态**告诉用户。
     #   Docker 不可用不影响启动（只读/写文件仍可用），但 run_command 会明确失败，
@@ -158,6 +181,25 @@ async def amain(args: argparse.Namespace) -> int:
     #   最后把 spawn_subtask 注册进去 —— 这样父子任务共用 Policy/审批/闸门，不存在旁路。
     adapter = OpenAICompatAdapter.from_config(cfg.model)
     agent_cfg = AgentConfig.from_budget_config(cfg.budgets, rag_auto=cfg.rag.auto_prefetch)
+    # ★ Checkpoint 策略必须挂到 AgentConfig 上：TaskRuntime 读的是 config.checkpoint，
+    #   以前没人赋值 → 服务端 checkpoint 从未落盘，恢复也就无从谈起。
+    agent_cfg.checkpoint = cfg.checkpoint
+    # ★ Skill 技能配置同理：core.run 里按工作区扫描技能库，配置不挂上去就永远为空。
+    agent_cfg.skills = cfg.skills
+
+    # 启动时汇总**跨项目层**技能（用户级 / 自定义），供 /api/health 诊断用。
+    # ★ 这里 workspace="" 是刻意的：项目级随任务工作区不同；内置目录只在
+    #   "工作区就在 Loom 仓库里"时生效（内置技能是 Loom 自己的开发套路），
+    #   两者都不该算进"全局"。
+    from ..skills import SkillLibrary
+
+    _skill_global = SkillLibrary.from_config(cfg.skills, workspace="")
+    skills_info = {
+        "enabled": cfg.skills.enabled,
+        "project_dir": cfg.skills.project_dir,
+        "builtin_dir": cfg.skills.builtin_dir,
+        "global": _skill_global.describe(),
+    }
 
     # ★ M6：异步工作流。与 tasks 共用同一个 SQLite 文件（表名 workflow_* 分区）。
     #   allow_local 默认关：http 步骤禁止访问内网/回环（防 SSRF）；本机 mock 测试时才开。
@@ -172,10 +214,32 @@ async def amain(args: argparse.Namespace) -> int:
     except ValueError:
         workflow_parallel = 3
 
+    # ★ Computer-Use 方案2：视觉模型通道（不配置 LOOM_VISION_MODEL 时 vision=None，
+    #   vision_look 工具不注册，工具清单与以前完全一致）。
+    from ..models.vision import VisionConfig as _VisionConfig
+    vision_cfg = _VisionConfig.from_env()
+    if vision_cfg.usable:
+        log.info("视觉模型已配置：%s（vision_look 工具已注册）", vision_cfg.model)
+    else:
+        log.info("视觉模型未配置（LOOM_VISION_MODEL 为空）—— vision_look 不注册")
+
+    # ★ 对比表 #21：联网搜索（DeepSeek Search API）。
+    #   复用 DEEPSEEK_API_KEY；未配 key 或 LOOM_WEB_SEARCH=0 时不注册 web_search，
+    #   工具清单与历史完全一致。
+    search_cfg = cfg.web_search
+    search_ready = bool(search_cfg.enabled and search_cfg.api_key)
+    if search_ready:
+        log.info("联网搜索已配置（base_url=%s）—— web_search 工具已注册", search_cfg.base_url)
+    else:
+        log.info("联网搜索未启用（LOOM_WEB_SEARCH=0 或未配 DEEPSEEK_API_KEY）—— web_search 不注册")
+
     registry = build_default_registry(
         sandbox=sandbox, knowledge=knowledge, mcp=mcp_manager,
         workflow=workflow_store, workflow_allow_local=workflow_allow_local,
         workflow_parallel=workflow_parallel,
+        vision=vision_cfg if vision_cfg.usable else None,
+        search=search_cfg if search_ready else None,
+        skills=cfg.skills.enabled,
     )
 
     from ..agent.subtask import SubtaskSpawner
@@ -198,6 +262,15 @@ async def amain(args: argparse.Namespace) -> int:
     #   避免 MCP 工具被注册两遍、状态漂移。
     readonly_registry = registry.readonly_view()
 
+    # ★ desktop 模式接入：剔除所有桌面工具（名字含 "desktop"）的注册表。
+    #   覆盖两类：MCP 的 mcp__agent_desktop__desktop_*（67 个）和原生
+    #   desktop_locate / desktop_click。workspace-write / full-access 用这份，
+    #   desktop 模式用完整注册表。capture_screen / vision_look 不剔除
+    #   （它们是通用观察工具，READ 风险，read-only 视图里也有）。
+    no_desktop_registry = registry.filter(
+        names=[n for n in registry.names if "desktop" not in n],
+    )
+
     scheduler = TaskScheduler(
         store=store,
         hub=hub,
@@ -208,7 +281,38 @@ async def amain(args: argparse.Namespace) -> int:
         knowledge=knowledge,
         spawner=spawner,
         readonly_registry=readonly_registry,
+        no_desktop_registry=no_desktop_registry,
     )
+
+    # ---- ③b 中断任务恢复（Checkpoint，2026-11-11）----------------------
+    #   规则：能续的（checkpoint + 无缺口 + 预算未耗尽 + 未过期）按
+    #   LOOM_CKPT_AUTO_RESUME 自动重新入队；不能续的标 aborted 并把原因写进快照。
+    recover_summary = await scheduler.recover_interrupted()
+    if recover_summary.get("scanned"):
+        print(f"[恢复] 扫描 {recover_summary['scanned']} 个中断任务："
+              f"续跑 {len(recover_summary.get('resumed') or [])} 个，"
+              f"收尾 {len(recover_summary.get('marked') or [])} 个")
+        for item in (recover_summary.get("resumed") or [])[:5]:
+            print(f"      ↩ {item['task_id']}（checkpoint #{item['checkpoint_seq']}，"
+                  f"第 {item['turn']} 轮）")
+        for item in (recover_summary.get("marked") or [])[:5]:
+            rep = item.get("report") or {}
+            why = "；".join(rep.get("reasons") or []) or "未开启自动恢复"
+            print(f"      × {item['task_id']}：{why}")
+
+    # ---- ③c 事件保留策略（对比表 #49）----------------------------------
+    #   只删"已终态且创建时间早于截止点"的任务事件；运行中/排队中的绝不动
+    #   （续跑要接 seq）。0 = 永不清理。
+    pruned_events = 0
+    if archive.enabled and cfg.events.retention_days > 0:
+        try:
+            cutoff = time.time() - cfg.events.retention_days * 86400
+            pruned_events = await store.prune_events(cutoff)
+        except Exception as exc:  # noqa: BLE001 —— 清理失败不该拦住启动
+            print(f"[!] 事件清理失败（不影响启动）：{type(exc).__name__}: {exc}")
+        if pruned_events:
+            print(f"[清理] 事件保留 {cfg.events.retention_days} 天，"
+                  f"删掉 {pruned_events} 条过期事件")
 
     # ---- 工作流恢复：启动时扫一遍未终结的 Workflow ---------------------
     #   · 幂等步骤（http GET / 只读工具）→ 退回 pending，后台继续跑
@@ -250,6 +354,17 @@ async def amain(args: argparse.Namespace) -> int:
         mcp=mcp_info,
         workflow_store=workflow_store,
         workflow_info=workflow_info,
+        # 对比表 #21：前端据此决定"联网搜索"开关是否可点
+        web_search={
+            "enabled": search_cfg.enabled,
+            "available": search_ready,
+            "base_url": search_cfg.base_url if search_ready else "",
+        },
+        # 对比表 #24：技能（全局层汇总；项目级按任务工作区扫）
+        skills=skills_info,
+        # 对比表 #49：事件落盘（lifespan 里启动后台刷盘；退出前 flush）
+        archive=archive if archive.enabled else None,
+        retention_days=cfg.events.retention_days if archive.enabled else 0,
     )
 
     print("=" * 62)
@@ -267,6 +382,20 @@ async def amain(args: argparse.Namespace) -> int:
               f"{mcp_info.get('tools', 0)} 个工具")
     else:
         print("  MCP       未启用（LOOM_MCP=0）")
+    _sk = skills_info["global"]
+    _names = f"（{'、'.join(_sk['names'])}）" if _sk["names"] else ""
+    print(f"  技能      用户级/自定义 {_sk['count']} 个{_names}")
+    print(f"            项目级见各工作区的 {cfg.skills.project_dir}；"
+          f"内置仅在 Loom 仓库内生效")
+    for bad in _sk["skipped"]:
+        print(f"  ! 跳过技能 {bad.get('dir')}：{bad.get('reason')}")
+    if archive.enabled:
+        _ret = (f"保留 {cfg.events.retention_days} 天"
+                if cfg.events.retention_days > 0 else "不清理")
+        print(f"  事件落盘  开启（{_ret}）· 已归档 {archived_tasks} 个任务 · "
+              f"游标 #{last_event_id}")
+    else:
+        print("  事件落盘  已关闭（LOOM_EVENTS=0）—— 重启后时间线会丢")
     print(f"  健康检查  http://{host}:{port}/api/health")
     print("=" * 62)
     if sb_warn:

@@ -50,6 +50,7 @@ import httpx
 import uvicorn
 
 from ..agent.core import AgentConfig
+from ..config import SkillsConfig
 from ..models.adapter import FakeAdapter, ModelAdapter, ModelReply, ToolCall
 from ..tools.registry import build_default_registry
 from ..server.app import create_app
@@ -66,7 +67,7 @@ SCENARIO_TIMEOUT = 90.0
 #   事件一缺就少记一条，总项数在 50 / 49 / 16 之间跳 ——
 #   同一套代码，"通过率"却能变，等于没法横向比较。
 # 现在每个场景跑完都核对条数，少一条就补一条失败并写明原因。
-EXPECTED_COUNTS = {"s1": 17, "s2": 12, "s3": 11, "s4": 9, "s5": 7}
+EXPECTED_COUNTS = {"s1": 17, "s2": 12, "s3": 11, "s4": 9, "s5": 7, "s6": 18, "s7": 12}
 
 _UNSET = object()
 
@@ -176,6 +177,10 @@ class LiveServer:
                 max_tool_calls=10,
                 approval_timeout_s=20,
                 min_evidence=0,
+                # ★ 技能：只扫工作区里的 .loom/skills，不碰本机的用户级目录 ——
+                #   端到端测试必须是封闭的（不依赖跑测试那台机器上装了什么）。
+                skills=SkillsConfig(builtin_dir="", user_dir="", dirs=[],
+                                    project_dir=".loom/skills"),
             ),
             max_global=max_global,
         )
@@ -384,6 +389,51 @@ def slow_script() -> list[ModelReply]:
     ] + [ModelReply(content="终于做完了。")]
 
 
+def ask_script() -> list[ModelReply]:
+    """ask_user 剧本：问两个问题（一个带选项、一个多选），拿到答案后收尾。"""
+    args = {
+        "questions": [
+            {
+                "id": "method",
+                "header": "HTTP 方法",
+                "question": "这个接口用 GET 还是 POST？",
+                "options": [
+                    {"label": "GET", "description": "幂等，适合查询"},
+                    {"label": "POST", "description": "有请求体"},
+                ],
+            },
+            {
+                "id": "files",
+                "question": "要改哪些文件？",
+                "multi_select": True,
+                "options": ["a.py", "b.py"],
+            },
+        ],
+        "timeout_s": 30,
+    }
+    return [
+        PLAN_REPLY,
+        ModelReply(tool_calls=[ToolCall(
+            id="c1", name="ask_user", arguments=args,
+            arguments_raw=json.dumps(args, ensure_ascii=False),
+        )]),
+        ModelReply(content="按你选的做，完成。"),
+    ]
+
+
+def skill_script(name: str = "e2e-skill") -> list[ModelReply]:
+    """技能剧本：先载入技能，再收尾。"""
+    args = {"name": name}
+    return [
+        PLAN_REPLY,
+        ModelReply(tool_calls=[ToolCall(
+            id="c1", name="load_skill", arguments=args,
+            arguments_raw=json.dumps(args, ensure_ascii=False),
+        )]),
+        ModelReply(content="按技能里的步骤做完了。"),
+    ]
+
+
 def build_adapter() -> RoutingAdapter:
     """
     注意：路由关键词要够独特，避免互相串。
@@ -393,6 +443,9 @@ def build_adapter() -> RoutingAdapter:
       GO-WRITE-*         → 写文件（触发审批）
       GO-SLOW-*          → 慢任务（用来测取消）
       GO-READONLY-*      → 试着写文件（read-only 模式下应被拦住）
+      GO-ASK-*           → 先问用户两个问题，再继续
+      GO-SKILL-*         → 先载入工作区里的技能，再继续
+      GO-NOSKILL-*       → 载入一个不存在的技能（应 not_found）
     """
     return RoutingAdapter(
         {
@@ -401,6 +454,9 @@ def build_adapter() -> RoutingAdapter:
             "GO-WRITE": write_script("e2e_out.txt", "hello-from-e2e"),
             "GO-READONLY": write_script("e2e_ro_blocked.txt", "should-not-exist"),
             "GO-SLOW": slow_script(),
+            "GO-ASK": ask_script(),
+            "GO-SKILL": skill_script("e2e-skill"),
+            "GO-NOSKILL": skill_script("no-such-skill"),
         },
         default=[ModelReply(content="（默认剧本）完成。")],
     )
@@ -695,6 +751,157 @@ async def scenario_readonly_enforced(srv: LiveServer) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 场景 6：ask_user 全链路（挂起 → 真实 HTTP 回答 → 答案进模型；自由输入 = custom）
+# --------------------------------------------------------------------------- #
+async def scenario_ask_user(srv: LiveServer) -> None:
+    print("\n[S6] ask_user：真实 HTTP 回答唤醒挂起的工具（含自由输入）")
+
+    async with httpx.AsyncClient(base_url=srv.base) as client:
+        async with SSECollector(srv.base) as sse:
+            sess = await post(client, "/api/sessions", {"title": "S6", "workspace": srv.workspace})
+            snap = await post(client, "/api/tasks",
+                              {"goal": "GO-ASK 动手前先问我两个问题", "session_id": sess["session_id"],
+                               "workspace": srv.workspace})
+            tid = snap["task_id"]
+
+            req = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "user_input.request",
+                timeout=60)
+            check(req is not None, "★★ 流上收到 user_input.request（工具真的挂起了）")
+            ask_id = str(ev_field(req, "ask_id") or "")
+            check(bool(ask_id), "事件带 ask_id（否则前端无法回答）", actual=ask_id)
+            questions = ev_field(req, "questions") or []
+            check(len(questions) == 2, f"两个问题都送到了前端（实际 {len(questions)}）")
+            check(ev_field(req, "question") == "这个接口用 GET 还是 POST？",
+                  "兼容字段 question = 第一个问题", actual=ev_field(req, "question"))
+            # 挂起时任务还没结束
+            mid = await get(client, f"/api/tasks/{tid}")
+            check(mid["status"] in ("queued", "running"), f"挂起期间任务仍在跑（{mid['status']}）")
+
+            # ★ 第一题不选任何给出的选项，改用自由输入（「其他」）
+            r1 = await post(client, f"/api/tasks/{tid}/user-input", {
+                "ask_id": ask_id,
+                "answers": [
+                    {"id": "method", "selected": [], "custom": "用 PUT，幂等且带体"},
+                    {"id": "files", "selected": ["a.py", "b.py"]},
+                ],
+            })
+            check(r1.get("accepted") is True, "★★ 回答被接收", actual=r1)
+            check(r1.get("status") == "answered", "status=answered（前台还在等）", actual=r1.get("status"))
+
+            resp = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "user_input.response")
+            check(resp is not None, "流上收到 user_input.response")
+            check(ev_field(resp, "late") is False, "不是补答（late=false）", actual=ev_field(resp, "late"))
+            answers = ev_field(resp, "answers") or []
+            custom_ans = next((a for a in answers if a.get("id") == "method"), {})
+            check(custom_ans.get("custom") == "用 PUT，幂等且带体",
+                  "★ 自由输入原样回传（custom 没被吞）", actual=custom_ans)
+            multi_ans = next((a for a in answers if a.get("id") == "files"), {})
+            check(multi_ans.get("selected") == ["a.py", "b.py"],
+                  "多选答案完整", actual=multi_ans)
+
+            # 答案要真的回到模型手里：看 tool.result 的 summary
+            result = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "tool.result"
+                and ev_field(e, "tool") == "ask_user")
+            check(result is not None, "ask_user 有 tool.result")
+            summary = str(ev_field(result, "summary") or "")
+            check("（自定义）用 PUT" in summary,
+                  "★★ 自由输入出现在工具返回摘要里（模型看得到）", actual=summary[:160])
+            check("a.py、b.py" in summary, "多选答案也进了摘要", actual=summary[:160])
+
+            # 一次性消费：同一个 ask_id 再提交一次必须被拒（409，不是 200 假成功）
+            r2 = await client.post(f"/api/tasks/{tid}/user-input",
+                                   json={"ask_id": ask_id,
+                                         "answers": [{"id": "method", "selected": ["GET"]}]},
+                                   timeout=30)
+            check(r2.status_code == 409, "★ 同一个 ask_id 再答 → 409（一次性）", actual=r2.status_code)
+            detail = r2.json().get("detail") or {}
+            # 拒绝原因可能是"已消费"或"任务已结束"（模型收尾很快时先到终态），两者都算拒绝
+            check(detail.get("reason") in ("ask_id_invalid", "task_finished") and bool(detail.get("note")),
+                  "409 带可读原因（已消费 / 任务已结束）", actual=detail)
+
+            end = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "task.end", timeout=60)
+            check(end is not None, "任务结束")
+            check(ev_field(end, "status") == "done", "终态 done（回答后正常收尾）",
+                  actual=ev_field(end, "status"))
+
+
+# --------------------------------------------------------------------------- #
+# 场景 7：Skill 技能（工作区扫描 → 目录进提示词 → load_skill 载入正文）
+# --------------------------------------------------------------------------- #
+async def scenario_skill(srv: LiveServer) -> None:
+    print("\n[S7] skill：工作区里的技能被扫描到，load_skill 能把正文送进模型")
+
+    skill_dir = Path(srv.workspace) / ".loom" / "skills" / "e2e-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: e2e-skill\n"
+        "description: 端到端测试用的技能：先读 A，再读 B\n"
+        "---\n"
+        "\n"
+        "# 步骤\n"
+        "\n"
+        "1. 先读 A\n"
+        "2. 再读 B\n"
+        f"\n目录占位符：<SKILL_ROOT>\n",
+        encoding="utf-8",
+    )
+
+    async with httpx.AsyncClient(base_url=srv.base) as client:
+        async with SSECollector(srv.base) as sse:
+            sess = await post(client, "/api/sessions", {"title": "S7", "workspace": srv.workspace})
+            snap = await post(client, "/api/tasks",
+                              {"goal": "GO-SKILL 按项目技能做一遍", "session_id": sess["session_id"],
+                               "workspace": srv.workspace})
+            tid = snap["task_id"]
+
+            call = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "tool.call",
+                timeout=60)
+            check(call is not None, "流上收到 tool.call")
+            check(ev_field(call, "tool") == "load_skill",
+                  "★ 调的是 load_skill（不是猜路径去读文件）", actual=ev_field(call, "tool"))
+
+            result = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "tool.result",
+                timeout=60)
+            check(result is not None, "流上收到 tool.result")
+            check(ev_field(result, "ok") is True, "技能载入成功",
+                  actual=ev_field(result, "ok"))
+            summary = str(ev_field(result, "summary") or "")
+            check("e2e-skill" in summary, "summary 里说明载入了哪个技能", actual=summary[:120])
+            body = str(ev_field(result, "data") or "")
+            check("先读 A" in body and "再读 B" in body,
+                  "★★ 正文真的进了上下文（模型能看到步骤）", actual=body[:160])
+            check("<SKILL_ROOT>" not in body and str(skill_dir).replace("\\", "/") in body,
+                  "★★ 正文里的 <SKILL_ROOT> 被替换成真实路径（搬来的技能能直接用）",
+                  actual=body[:200])
+
+            end = await sse.wait_event(
+                lambda e: e["task_id"] == tid and e["event"]["type"] == "task.end", timeout=60)
+            check(end is not None, "任务结束")
+            check(ev_field(end, "status") == "done", "终态 done", actual=ev_field(end, "status"))
+
+            # ---- 负面：载入不存在的技能 → not_found（不是静默空正文）----
+            snap2 = await post(client, "/api/tasks",
+                               {"goal": "GO-NOSKILL 载入一个不存在的技能",
+                                "session_id": sess["session_id"], "workspace": srv.workspace})
+            tid2 = snap2["task_id"]
+            bad = await sse.wait_event(
+                lambda e: e["task_id"] == tid2 and e["event"]["type"] == "tool.result",
+                timeout=60)
+            check(bad is not None, "未知名也有 tool.result")
+            check(ev_field(bad, "ok") is False, "★ 未知名 → 失败（不是返回空正文）",
+                  actual=ev_field(bad, "ok"))
+            err = ev_field(bad, "error") or {}
+            check(err.get("kind") == "not_found", "错误类型 not_found", actual=err.get("kind"))
+
+
+# --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 SCENARIOS: dict[str, Callable[[LiveServer], Any]] = {
@@ -703,6 +910,8 @@ SCENARIOS: dict[str, Callable[[LiveServer], Any]] = {
     "s3": scenario_write_approval,
     "s4": scenario_cancel,
     "s5": scenario_readonly_enforced,
+    "s6": scenario_ask_user,
+    "s7": scenario_skill,
 }
 
 

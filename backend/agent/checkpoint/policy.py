@@ -85,6 +85,13 @@ def save_checkpoint(
         return None
 
     try:
+        # ★ 基线只在第一次 checkpoint 时落一份独立文件：
+        #   它是事后审计的参照系（任务开始时的文件树），必须与任务第一天一致，
+        #   且不能被 max_history 的滚动清理带走（见 store.save_baseline 注释）。
+        saver = getattr(store, "save_baseline", None)
+        if saver is not None and getattr(state, "baseline_files", None):
+            saver(state.task_id, state.baseline_files)
+
         payload = {
             "task_id": state.task_id,
             "phase": phase,

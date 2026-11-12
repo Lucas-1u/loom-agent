@@ -85,7 +85,10 @@ def entries_to_messages(entries: list[dict[str, Any]]) -> list[Message]:
             role=str(e.get("role") or "assistant"),
             content=str(e.get("content") or ""),
             reasoning=str(e.get("reasoning") or ""),
-            tool_calls=tcs or None,
+            # ★ 必须给 list，不能给 None：Message.tool_calls 的默认值是 []
+            #   （各消费方直接 `for tc in m.tool_calls`），给 None 会在压缩器
+            #   measure() 里炸掉 —— 恢复路径以前没跑过，这个坑一直没暴露。
+            tool_calls=tcs,
             tool_call_id=str(e.get("tool_call_id") or "") or None,
             tool_name=str(e.get("tool_name") or "") or None,
         ))

@@ -86,6 +86,52 @@ class RiskLevel(str, Enum):
 
 
 # --------------------------------------------------------------------------- #
+# 反序列化辅助（checkpoint 恢复用）
+# --------------------------------------------------------------------------- #
+def _as_enum(enum_cls: Any, value: Any, default: Any) -> Any:
+    """
+    宽容地把持久化里的字符串转回枚举。
+
+    ★ 为什么宽容：快照可能是旧版本写的（枚举后来加过值，也可能被手改过）。
+      一条脏值不应该让整条恢复链断掉 —— 退回默认值 + 调用方在报告里体现即可。
+    """
+    if isinstance(value, enum_cls):
+        return value
+    try:
+        return enum_cls(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _as_dict_list(value: Any) -> list[dict[str, Any]]:
+    """只保留 dict 元素（快照被手改坏时不至于在列表推导里炸掉）。"""
+    if not isinstance(value, list):
+        return []
+    return [x for x in value if isinstance(x, dict)]
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """非 dict 一律退回空 dict（旧快照里这些字段可能是 null）。"""
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """宽容整数转换：脏值（字符串/None/对象）一律退回默认值。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """宽容浮点转换（时间戳/耗时用）。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# --------------------------------------------------------------------------- #
 # 权限模式（步骤 6）
 # --------------------------------------------------------------------------- #
 # ★ 为什么放在 state.py 而不是 sandbox/acl.py：
@@ -96,11 +142,13 @@ class RiskLevel(str, Enum):
 SESSION_MODE_READ_ONLY = "read-only"
 SESSION_MODE_WORKSPACE_WRITE = "workspace-write"
 SESSION_MODE_FULL_ACCESS = "full-access"
+SESSION_MODE_DESKTOP = "desktop"
 
 VALID_SESSION_MODES = (
     SESSION_MODE_READ_ONLY,
     SESSION_MODE_WORKSPACE_WRITE,
     SESSION_MODE_FULL_ACCESS,
+    SESSION_MODE_DESKTOP,
 )
 
 # 默认值与历史行为一致：能写工作区、能跑命令（步骤 5 之前是审批放行，之后是直接执行）
@@ -155,6 +203,45 @@ class Budgets:
     turns_used: int = 0
     tool_calls_used: int = 0
     errors_used: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_turns": self.max_turns,
+            "max_seconds": self.max_seconds,
+            "max_tool_calls": self.max_tool_calls,
+            "max_same_call_repeat": self.max_same_call_repeat,
+            "max_errors": self.max_errors,
+            "approval_timeout_s": self.approval_timeout_s,
+            "min_evidence": self.min_evidence,
+            "turns_used": self.turns_used,
+            "tool_calls_used": self.tool_calls_used,
+            "errors_used": self.errors_used,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Budgets":
+        """
+        重建预算。
+
+        ★ 上限与用量都还原：续跑不是"重新领一份预算"，
+          否则断一次就能无限续命，轮数上限形同虚设。
+        """
+        base = cls()
+        return cls(
+            max_turns=int(data.get("max_turns", base.max_turns) or base.max_turns),
+            max_seconds=float(data.get("max_seconds", base.max_seconds) or base.max_seconds),
+            max_tool_calls=int(data.get("max_tool_calls", base.max_tool_calls) or base.max_tool_calls),
+            max_same_call_repeat=int(data.get("max_same_call_repeat", base.max_same_call_repeat)
+                                     or base.max_same_call_repeat),
+            max_errors=int(data.get("max_errors", base.max_errors) or base.max_errors),
+            approval_timeout_s=float(data.get("approval_timeout_s", base.approval_timeout_s)
+                                     or base.approval_timeout_s),
+            min_evidence=int(data.get("min_evidence", base.min_evidence)
+                             if data.get("min_evidence") is not None else base.min_evidence),
+            turns_used=int(data.get("turns_used") or 0),
+            tool_calls_used=int(data.get("tool_calls_used") or 0),
+            errors_used=int(data.get("errors_used") or 0),
+        )
 
     def check(self, started_at: float) -> tuple[str, Any, Any] | None:
         """
@@ -215,7 +302,32 @@ class PlanStep:
             "evidence": self.evidence,
             "started_turn": self.started_turn,
             "ended_turn": self.ended_turn,
+            # ★ marks 必须进快照：它是"这一步开始时的证据游标"，
+            #   续跑时若丢失会被当成 (0,0,0) —— 历史证据会把当前步误判成已完成。
+            "marks": list(self.marks),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PlanStep":
+        marks_raw = data.get("marks")
+        marks: tuple[int, int, int] = (0, 0, 0)
+        if isinstance(marks_raw, (list, tuple)) and len(marks_raw) == 3:
+            try:
+                marks = (int(marks_raw[0]), int(marks_raw[1]), int(marks_raw[2]))
+            except (TypeError, ValueError):
+                marks = (0, 0, 0)
+        return cls(
+            index=_as_int(data.get("index")),
+            title=str(data.get("title") or ""),
+            status=_as_enum(StepStatus, data.get("status"), StepStatus.PENDING),
+            detail=str(data.get("detail") or ""),
+            completion=str(data.get("completion") or ""),
+            check=str(data.get("check") or "observation"),
+            evidence=str(data.get("evidence") or ""),
+            started_turn=_as_int(data.get("started_turn")),
+            ended_turn=_as_int(data.get("ended_turn")),
+            marks=marks,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -246,6 +358,16 @@ class Evidence:
             "ok": self.ok,
             "ts": self.ts,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Evidence":
+        return cls(
+            source=str(data.get("source") or ""),
+            summary=str(data.get("summary") or ""),
+            ref=str(data.get("ref") or ""),
+            ok=bool(data.get("ok", True)),
+            ts=float(data.get("ts") or 0.0),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +402,19 @@ class CommandRecord:
             "ts": self.ts,
             "stderr_tail": self.stderr_tail,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CommandRecord":
+        raw_code = data.get("exit_code")
+        return cls(
+            command=str(data.get("command") or ""),
+            # ★ exit_code 允许 None（超时/未执行），不能强转 int
+            exit_code=int(raw_code) if isinstance(raw_code, (int, float)) else None,
+            ok=bool(data.get("ok", False)),
+            turn=int(data.get("turn") or 0),
+            ts=float(data.get("ts") or 0.0),
+            stderr_tail=str(data.get("stderr_tail") or ""),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -335,6 +470,21 @@ class ToolEvent:
             "ts": self.ts,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ToolEvent":
+        args = data.get("args")
+        return cls(
+            call_id=str(data.get("call_id") or ""),
+            tool=str(data.get("tool") or ""),
+            args=args if isinstance(args, dict) else {},
+            ok=bool(data.get("ok", True)),
+            summary=str(data.get("summary") or ""),
+            error_kind=str(data.get("error_kind") or ""),
+            duration_ms=int(data.get("duration_ms") or 0),
+            turn=int(data.get("turn") or 0),
+            ts=float(data.get("ts") or 0.0),
+        )
+
 
 # --------------------------------------------------------------------------- #
 # 审批
@@ -387,6 +537,24 @@ class PendingApproval:
             "created_at": self.created_at,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PendingApproval":
+        args = data.get("args")
+        return cls(
+            approval_id=str(data.get("approval_id") or ""),
+            tool=str(data.get("tool") or ""),
+            args=args if isinstance(args, dict) else {},
+            args_hash=str(data.get("args_hash") or ""),
+            risk=_as_enum(RiskLevel, data.get("risk"), RiskLevel.WRITE),
+            action=str(data.get("action") or ""),
+            target=str(data.get("target") or ""),
+            impact=str(data.get("impact") or ""),
+            preview=str(data.get("preview") or ""),
+            turn=int(data.get("turn") or 0),
+            created_at=float(data.get("created_at") or 0.0),
+            status=_as_enum(ApprovalStatus, data.get("status"), ApprovalStatus.PENDING),
+        )
+
 
 @dataclass
 class ApprovalRecord:
@@ -410,6 +578,18 @@ class ApprovalRecord:
             "decided_at": self.decided_at,
             "reason": self.reason,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ApprovalRecord":
+        return cls(
+            approval_id=str(data.get("approval_id") or ""),
+            tool=str(data.get("tool") or ""),
+            target=str(data.get("target") or ""),
+            status=_as_enum(ApprovalStatus, data.get("status"), ApprovalStatus.PENDING),
+            args_hash=str(data.get("args_hash") or ""),
+            decided_at=float(data.get("decided_at") or 0.0),
+            reason=str(data.get("reason") or ""),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -448,6 +628,21 @@ class ChangeRecord:
             "turn": self.turn,
             "ts": self.ts,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ChangeRecord":
+        return cls(
+            path=str(data.get("path") or ""),
+            action=str(data.get("action") or ""),
+            before_hash=str(data.get("before_hash") or ""),
+            after_hash=str(data.get("after_hash") or ""),
+            added=int(data.get("added") or 0),
+            removed=int(data.get("removed") or 0),
+            approval_id=str(data.get("approval_id") or ""),
+            backup_path=str(data.get("backup_path") or ""),
+            turn=int(data.get("turn") or 0),
+            ts=float(data.get("ts") or 0.0),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -960,19 +1155,93 @@ class TaskState:
             "pending_approval": self.pending_approval.to_dict() if self.pending_approval else None,
             "approval_history": [a.to_dict() for a in self.approval_history],
             "change_records": [c.to_dict() for c in self.change_records],
-            "budgets": {
-                "max_turns": self.budgets.max_turns,
-                "max_seconds": self.budgets.max_seconds,
-                "max_tool_calls": self.budgets.max_tool_calls,
-                "max_same_call_repeat": self.budgets.max_same_call_repeat,
-                "max_errors": self.budgets.max_errors,
-                "approval_timeout_s": self.budgets.approval_timeout_s,
-                "min_evidence": self.budgets.min_evidence,
-                "turns_used": self.budgets.turns_used,
-                "tool_calls_used": self.budgets.tool_calls_used,
-                "errors_used": self.budgets.errors_used,
-            },
+            "budgets": self.budgets.to_dict(),
             "consecutive_errors": self.consecutive_errors,
             "final_answer": self.final_answer,
             "error": self.error,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TaskState":
+        """
+        从快照重建任务状态（`to_dict` 的逆操作）。
+
+        ★ 用途：Checkpoint 跨进程续跑。以前只有写没有读，checkpoint 等于摆设。
+
+        ★ 三条设计原则：
+          ① **宽容**：字段缺失/类型不符一律退回默认值 —— 旧快照必须能读，
+             不能因为版本多了个字段就整条恢复链断掉；
+          ② **不还原派生值**：`elapsed_s` 由 started_at 实时算，
+             `rag_context_block` 是注入内容的原文（只保留统计），
+             `baseline_files` 体量大，单独由 checkpoint 的 baseline 恢复；
+          ③ **不谎报终态**：`ended_at` 归零、`status` 由调用方设定
+             （恢复中的任务不能带着上次的 done/failed 上场）。
+        """
+        st = cls(
+            task_id=str(data.get("task_id") or "") or f"task_{uuid.uuid4().hex[:8]}",
+            goal=str(data.get("goal") or ""),
+            workspace=str(data.get("workspace") or ""),
+            model=str(data.get("model") or ""),
+            status=_as_enum(TaskStatus, data.get("status"), TaskStatus.CREATED),
+            started_at=_as_float(data.get("started_at"), time.time()),
+            ended_at=0.0,
+            end_reason="",
+            turn=_as_int(data.get("turn")),
+            plan_note=str(data.get("plan_note") or ""),
+            current_step_index=_as_int(data.get("current_step_index")),
+            verification_retries=_as_int(data.get("verification_retries")),
+            allowed_paths=[str(x) for x in (data.get("allowed_paths") or [])] or ["."],
+            forbidden_paths=[str(x) for x in (data.get("forbidden_paths") or [])],
+            intent=str(data.get("intent") or "unknown"),
+            intent_confidence=str(data.get("intent_confidence") or "unknown"),
+            intent_reasons=[str(x) for x in (data.get("intent_reasons") or [])],
+            constraints={k: bool(v) for k, v in (data.get("constraints") or {}).items()
+                         if isinstance(k, str)},
+            risk_review_retries=_as_int(data.get("risk_review_retries")),
+            history_persist_errors=_as_int(data.get("history_persist_errors")),
+            graph_trace=[str(x) for x in (data.get("graph_trace") or [])],
+            engine=str(data.get("engine") or "graph"),
+            session_mode=str(data.get("session_mode") or "workspace-write"),
+            budget_extended=bool(data.get("budget_extended", False)),
+            budget_reason=str(data.get("budget_reason") or ""),
+            context_peak_chars=_as_int(data.get("context_peak_chars")),
+            read_reuse_hits=_as_int(data.get("read_reuse_hits")),
+            consecutive_errors=_as_int(data.get("consecutive_errors")),
+            final_answer=str(data.get("final_answer") or ""),
+            error=data.get("error") if isinstance(data.get("error"), dict) else None,
+        )
+        st.plan = [PlanStep.from_dict(x) for x in _as_dict_list(data.get("plan"))]
+        st.tool_events = [ToolEvent.from_dict(x) for x in _as_dict_list(data.get("tool_events"))]
+        st.evidence_summary = [Evidence.from_dict(x)
+                               for x in _as_dict_list(data.get("evidence_summary"))]
+        st.command_history = [CommandRecord.from_dict(x)
+                              for x in _as_dict_list(data.get("command_history"))]
+        st.change_records = [ChangeRecord.from_dict(x)
+                             for x in _as_dict_list(data.get("change_records"))]
+        st.approval_history = [ApprovalRecord.from_dict(x)
+                               for x in _as_dict_list(data.get("approval_history"))]
+        pending = data.get("pending_approval")
+        st.pending_approval = PendingApproval.from_dict(pending) if isinstance(pending, dict) else None
+        st.budgets = Budgets.from_dict(data.get("budgets") or {})
+        # 纯 JSON 容器：只做类型守卫，不重建对象
+        st.audit = _as_dict(data.get("audit"))
+        st.evidence = _as_dict(data.get("evidence"))
+        st.read_cache = _as_dict(data.get("read_cache"))
+        st.context_last = _as_dict(data.get("context_last"))
+        st.rag_index = _as_dict(data.get("rag_index"))
+        st.read_index = _as_dict_list(data.get("read_index"))
+        st.rag_hits = _as_dict_list(data.get("rag_hits"))
+        st.rag_queries = _as_dict_list(data.get("rag_queries"))
+        st.risks = _as_dict_list(data.get("risks"))
+        st.risk_reviews = _as_dict_list(data.get("risk_reviews"))
+        st.scope_conflicts = _as_dict_list(data.get("scope_conflicts"))
+        st.compaction_log = _as_dict_list(data.get("compaction_log"))
+        st.reflections = _as_dict_list(data.get("reflections"))
+        st.cache_notes = [str(x) for x in (data.get("cache_notes") or [])]
+        st.rag_used = [str(x) for x in (data.get("rag_used") or [])]
+        reloop = data.get("reflect_reloop")
+        if isinstance(reloop, dict):
+            st.reflect_streak = int(reloop.get("streak") or 0)
+            st.reflect_recoveries = int(reloop.get("recoveries") or 0)
+            st.reflect_last_fingerprint = str(reloop.get("last_fingerprint") or "")
+        return st

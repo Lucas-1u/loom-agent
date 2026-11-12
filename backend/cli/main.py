@@ -74,8 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no", action="store_true", help="（已废弃）审批已移除，此参数无效果")
     p.add_argument("--readonly", action="store_true", help="只读模式：卸载所有写入工具")
     # 步骤 6：权限模式（read-only | workspace-write | full-access）
-    p.add_argument("--mode", default="", choices=["", "read-only", "workspace-write", "full-access"],
-                   help="权限模式（默认 workspace-write）")
+    p.add_argument("--mode", default="", choices=["", "read-only", "workspace-write", "full-access", "desktop"],
+                   help="权限模式（默认 workspace-write）；desktop = 可操控桌面模式")
 
     # 阶段开关（对比实验）
     p.add_argument("--no-plan", action="store_true", help="关闭 PLAN 阶段")
@@ -138,6 +138,8 @@ async def run_one(
     )
 
     agent_cfg.rag_auto = bool(getattr(cfg.rag, "auto_prefetch", True)) and knowledge is not None
+    # ★ Skill：CLI 也要把配置挂上去，否则 core 里扫描出来的技能库永远为空
+    agent_cfg.skills = cfg.skills
     core = AgentCore(adapter, registry, config=agent_cfg, bus=bus,
                      knowledge=knowledge)
 
@@ -217,7 +219,8 @@ async def amain(args) -> int:
     # ★ CLI 的 registry 是自己构建的，所以这里可以真强制 —— 不像服务端
     #   注册表是全局一份（per-task 切换随步骤 7 接入）。
     readonly = bool(args.readonly or (args.mode or "") == "read-only")
-    registry = build_default_registry(include_mutating=not readonly, knowledge=knowledge)
+    registry = build_default_registry(include_mutating=not readonly, knowledge=knowledge,
+                                      skills=cfg.skills.enabled)
     if readonly:
         # 保险：即使 build 里有 bug，也强制剔除写工具
         # ★ 步骤 5：审批已移除，needs_approval 恒 False，不能再拿它判只读。

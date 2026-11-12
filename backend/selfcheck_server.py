@@ -25,7 +25,8 @@ from backend.events import Event
 from backend.models.adapter import FakeAdapter, ModelReply, ToolCall
 from backend.server.hub import EventHub
 from backend.server.runtime import TaskRuntime
-from backend.server.store import SCHEMA_VERSION, StoreError, TaskStore
+from backend.server.archive import EventArchive
+from backend.server.store import EXPORT_FORMAT, SCHEMA_VERSION, StoreError, TaskStore
 from backend.tools.registry import build_default_registry
 
 VERBOSE = False
@@ -109,7 +110,8 @@ async def test_store(db: TmpDB) -> None:
             r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
     check(ver == SCHEMA_VERSION, f"schema 版本 = {ver}")
-    check({"sessions", "tasks", "idempotency"} <= tables, f"三张表都建了：{sorted(tables)}")
+    check({"sessions", "tasks", "idempotency", "task_history", "task_events"} <= tables,
+          f"★ 全新库一次建齐五张表（缺表只在第二次启动才会暴露）：{sorted(tables)}")
 
     # ---- Session ----
     await store.upsert_session(mk_session("s1", title="会话一"))
@@ -638,7 +640,116 @@ async def run_async_suites(db: TmpDB) -> None:
     await test_hub()
     await test_runtime(db)
     await test_runtime_persist_failure(db)
+    await test_event_archive(db)
     await test_scheduler(db)
+
+
+def test_events_http(db: TmpDB) -> None:
+    """
+    事件历史 HTTP（对比表 #49）—— **重启之后时间线还在**。
+
+    这是整个改动的验收点：以前重启后 `/events` 只能回一句"不可用"，
+    现在必须把落盘的事件原样还回来，并且说清来源是磁盘。
+    """
+    print("\n[EV2] 事件历史 HTTP：重启后时间线还在 + 导出/导入")
+
+    from fastapi.testclient import TestClient
+
+    ws = tempfile.mkdtemp(prefix="loom_ws_")
+    try:
+        store = db.store()
+        store.init_sync()
+        store.upsert_session_sync(mk_session("s_evh", ws=ws))
+        tid, _ = store.create_task_sync(
+            {"task_id": "t_evh", "session_id": "s_evh", "goal": "落盘验收",
+             "status": "done", "workspace": ws}
+        )
+        store.save_task_sync(tid, status="done", result="完成", ended_at=time.time())
+
+        # ---- 进程 A：有 hub、有归档，正常退出 ----
+        archive_a = EventArchive(store, flush_interval=0.02)
+        hub_a = EventHub(archive=archive_a)
+
+        async def _phase_a() -> None:
+            await archive_a.start()
+            for i in range(3):
+                await hub_a.publish(
+                    tid, "s_evh",
+                    Event.make("thinking",
+                               {"text": f"第{i}段", "phase": "act", "done": False},
+                               task_id=tid, turn=1, seq=i + 1),
+                )
+            await archive_a.stop()   # 等价于正常关服务：flush 后停后台 task
+
+        asyncio.run(_phase_a())
+        check(archive_a.written == 3, f"阶段A 落盘 3 条（{archive_a.written}）")
+        check(store.events_count_sync(tid) == 3, "阶段A 结束后库里有 3 条")
+
+        # ---- 进程 B：全新的 hub（内存是空的）+ 全新的 archive = 重启 ----
+        hub_b = EventHub()
+        sch = TaskScheduler(
+            store=store, hub=hub_b, adapter=SlowAdapter(delay=0.05),
+            registry=build_default_registry(),
+            config=AgentConfig(max_turns=1, max_seconds=10, min_evidence=0),
+            max_global=1,
+        )
+        app = create_app(
+            store=store, hub=hub_b, scheduler=sch,
+            archive=EventArchive(store, flush_interval=0.02), retention_days=30,
+        )
+
+        with TestClient(app) as client:
+            r = client.get(f"/api/tasks/{tid}/events")
+            body = r.json()
+            check(r.status_code == 200, f"events 接口 200（{r.status_code}）")
+            check(body["available"] is True, f"★★ 重启后事件历史仍然可用（{body['available']}）")
+            check(body["source"] == "disk", f"★ 来源是磁盘（{body.get('source')}）")
+            check([e["event"]["seq"] for e in body["events"]] == [1, 2, 3],
+                  f"★★ 时间线顺序正确（{[e['event']['seq'] for e in body['events']]}）")
+            check(body["events"][0]["event"]["data"]["text"] == "第0段", "★ 载荷完整解回来")
+
+            # since 过滤：没有更新的事件 ≠ 历史不可用
+            last_id = body["events"][-1]["id"]
+            b2 = client.get(f"/api/tasks/{tid}/events?since={last_id}").json()
+            check(b2["available"] is True and b2["events"] == [],
+                  "★★ since 之后没有新事件时 available 仍为 true（不能谎报不可用）")
+
+            # 从来没有事件的终态任务 → available=false, reason=empty
+            store.create_task_sync(
+                {"task_id": "t_noev", "session_id": "s_evh", "goal": "没事件",
+                 "status": "done", "workspace": ws}
+            )
+            b3 = client.get("/api/tasks/t_noev/events").json()
+            check(b3["available"] is False and b3["reason"] == "empty",
+                  f"★ 空历史说清是 empty（{b3.get('reason')}）")
+
+            # 导出 → 导入 → 立刻能看时间线
+            exp = client.get(f"/api/tasks/{tid}/export").json()
+            check(exp.get("format") == EXPORT_FORMAT and len(exp.get("events") or []) == 3,
+                  f"★ 导出接口带 format + 3 条事件（{exp.get('format')}）")
+            imp = client.post("/api/tasks/import", json=exp).json()
+            check(imp.get("renamed") is True, f"★ 导入撞号自动改名（{imp.get('task_id')}）")
+            b4 = client.get(f"/api/tasks/{imp['task_id']}/events").json()
+            check(b4["available"] is True and len(b4["events"]) == 3,
+                  f"★★ 导入后立刻能看时间线（{len(b4.get('events') or [])} 条）")
+
+            r5 = client.post("/api/tasks/import", json={"format": "nope"})
+            check(r5.status_code == 400, f"★ 非法格式 → 400（{r5.status_code}）")
+
+            r6 = client.post("/api/maintenance/prune", params={"days": 0}).json()
+            check(r6["deleted"] == 0 and "永不清理" in r6["note"],
+                  f"★ 保留期 0 = 不删（{r6.get('note')}）")
+
+            h = client.get("/api/health").json()
+            check("events" in h and h["events"]["enabled"] is True,
+                  "health 暴露事件落盘状态")
+            check(h["events"]["retention_days"] == 30, "health 带保留天数")
+    finally:
+        try:
+            store.close_sync()
+        except Exception:  # noqa: BLE001
+            pass
+        shutil.rmtree(ws, ignore_errors=True)
 
 
 def main() -> int:
@@ -658,6 +769,7 @@ def main() -> int:
         #   如果此时已经在 asyncio.run 里，会报 "another loop is running"
         test_http_and_sse(db)
         test_session_isolation(db)
+        test_events_http(db)
     finally:
         db.cleanup()
 
@@ -1202,6 +1314,146 @@ async def test_task_history(db: TmpDB) -> None:
     # 恢复安全检查依赖 tool_calls_json —— 它必须被持久化
     check("tool_calls_json" in rows[0] or True, "（schema 含 tool_calls_json 列）")
     await s.close()
+
+
+async def test_event_archive(db: TmpDB) -> None:
+    """
+    事件流落盘（对比表 #49）。
+
+    这一节想证明三件事，缺一条这个功能就是半成品：
+      ① 落盘是**异步批量**的：publish 之后事件还在队列里，没有同步写库
+      ② 真的写进去了：换一个 store 实例（= 重启）能原样读回来
+      ③ 续跑不会把旧事件覆盖掉：新的 seq 会接着库里最大值往上抬
+    """
+    print("\n[EV] 事件流落盘（归档 / 续跑接 seq / 保留策略 / 导出导入）")
+
+    store = db.store()
+    await store.init()
+    ws = tempfile.mkdtemp(prefix="loom_ws_")
+    await store.upsert_session(mk_session("s_ev", ws=ws))
+    tid, _ = await store.create_task(
+        {"task_id": "t_ev", "session_id": "s_ev", "goal": "落盘测试",
+         "status": "done", "workspace": ws}
+    )
+
+    archive = EventArchive(store, flush_interval=0.02)
+    await archive.start()
+    hub = EventHub(archive=archive, seq_floor=archive.seq_floor)
+
+    def pub(text: str, seq: int | None = None):
+        return hub.publish(
+            tid, "s_ev",
+            Event.make("thinking", {"text": text, "phase": "act", "done": False},
+                       task_id=tid, turn=1, seq=seq),
+        )
+
+    # ---- ① enqueue 是同步的：publish 完还在队列里 ----
+    await pub("第一段")
+    await pub("第二段")
+    check(archive.pending == 2, f"★★ publish 之后事件先落在队列里、没有同步写库（pending={archive.pending}）")
+    check(archive.written == 0, f"此刻还没写任何一条（written={archive.written}）")
+
+    n = await archive.flush()
+    check(n == 2 and archive.written == 2, f"★ flush 一次写 2 条（{n} / 累计 {archive.written}）")
+    check(archive.pending == 0, "队列已清空")
+
+    rows = store.load_events_sync(tid)
+    check([r["seq"] for r in rows] == [1, 2], f"★ 按 seq 升序读回（{[r['seq'] for r in rows]}）")
+    check(rows[0]["data"].get("text") == "第一段", "载荷完整（data_json 解回来是 dict）")
+    check(rows[0]["type"] == "thinking", "类型保留")
+
+    # ---- ② 无 seq 的事件也会被补一个（运行时兜底的 error 事件就是这种）----
+    await hub.publish(tid, "s_ev",
+                      Event.make("error", {"kind": "internal_error", "message": "x", "fatal": True},
+                                 task_id=tid))
+    await archive.flush()
+    rows = store.load_events_sync(tid)
+    check(len(rows) == 3 and rows[-1]["seq"] == 3,
+          f"★★ 没带 seq 的事件被补成 3（实际 {rows[-1]['seq'] if rows else None}）")
+    check(rows[-1]["type"] == "error", "补 seq 的是那条 error 事件")
+
+    # ---- ③ 续跑：新的 bus 又从 1 数，必须接着涨而不是覆盖 ----
+    before = store.load_events_sync(tid)
+    max_before = await store.max_event_id()
+    # ★ 和 __main__ 的装配方式一致：新 hub 必须用库里的 MAX(id) 播种，
+    #   否则 id 从头数、?since= 就跨不了重启。
+    hub2 = EventHub(archive=archive, start_id=max_before, seq_floor=archive.seq_floor)
+    await hub2.publish(tid, "s_ev",
+                       Event.make("thinking", {"text": "续跑后的第一句", "phase": "act"},
+                                  task_id=tid, turn=2, seq=1))
+    await archive.flush()
+    after = store.load_events_sync(tid)
+    check(len(after) == 4, f"★★ 续跑没有覆盖旧事件（{len(before)} → {len(after)}）")
+    check(after[-1]["seq"] == 4, f"★★ 新事件 seq 接着涨到 4（实际 {after[-1]['seq']}）")
+    check(hub2.seq_normalized >= 1, f"★ 归一化计数器记录了这次抬高（{hub2.seq_normalized}）")
+    check(after[-1]["id"] == max_before + 1,
+          f"★ 续跑的事件 id 也接着涨（{after[-1]['id']} vs {max_before}+1）")
+
+    # ---- ④ 全局 id：库里最大值能播种给新 hub，?since= 才跨重启可用 ----
+    max_id = await store.max_event_id()
+    check(max_id == max_before + 1, f"MAX(id) 前进了（{max_before} → {max_id}）")
+    hub3 = EventHub(start_id=max_id)
+    rec = await hub3.publish(tid, "s_ev", Event.make("act", {"intent": "x"}, task_id=tid, turn=2, seq=5))
+    check(rec["id"] == max_id + 1, f"★★ 播种后新事件 id 继续涨（{rec['id']}）")
+
+    # ---- ⑤ 队列上限：满了丢新事件并计数，不许吃爆内存 ----
+    tiny = EventArchive(store, max_queue=2)
+    tiny.enqueue(tid, {"seq": 90, "ts": 0, "turn": 0, "type": "act", "data": {}}, 0)
+    tiny.enqueue(tid, {"seq": 91, "ts": 0, "turn": 0, "type": "act", "data": {}}, 0)
+    tiny.enqueue(tid, {"seq": 92, "ts": 0, "turn": 0, "type": "act", "data": {}}, 0)
+    check(tiny.queued_dropped == 1 and len(tiny._queue) == 2,
+          f"★ 队列满后丢新事件并计数（dropped={tiny.queued_dropped}，队列 {len(tiny._queue)}）")
+    check("队列已满" in tiny.last_error, f"★ 丢弃原因写进 last_error（{tiny.last_error!r}）")
+
+    # ---- ⑥ 保留策略：只删"已终态且够老"的任务，运行中的绝不动 ----
+    now = time.time()
+    await store.create_task({"task_id": "t_old_done", "session_id": "s_ev",
+                             "goal": "老完成", "status": "done",
+                             "created_at": now - 10 * 86400, "workspace": ws})
+    await store.create_task({"task_id": "t_old_running", "session_id": "s_ev",
+                             "goal": "老运行中", "status": "running",
+                             "created_at": now - 10 * 86400, "workspace": ws})
+    for old_tid in ("t_old_done", "t_old_running"):
+        await store.append_events([{"task_id": old_tid, "id": 0, "seq": 1, "ts": now,
+                                    "turn": 0, "type": "act", "data": {}}])
+    deleted = await store.prune_events(now - 7 * 86400)
+    check(deleted == 1, f"★ 删掉 1 个终态老任务的事件（实际 {deleted}）")
+    check(store.events_count_sync("t_old_done") == 0, "★ 终态老任务的事件被清掉")
+    check(store.events_count_sync("t_old_running") == 1, "★★ 运行中任务的事件一条不动（续跑要用）")
+    check(store.events_count_sync(tid) == 4, f"★ 新任务不受影响（{store.events_count_sync(tid)}）")
+
+    # ---- ⑦ 导出 / 导入：换个 id 也不丢事件 ----
+    exp = await store.export_task(tid)
+    check(exp is not None and exp.get("format") == EXPORT_FORMAT,
+          f"★ 导出带格式标识（{exp.get('format') if exp else None}）")
+    check(len(exp["events"]) == 4 and len(exp["history"]) == 0,
+          f"导出含 4 条事件（{len(exp['events'])}）")
+    check(exp["task"]["state"] is not None or exp["task"]["task_id"] == tid, "导出含任务行")
+
+    res = await store.import_task(exp)
+    check(res["renamed"] is True, f"★ id 撞车 → 自动改名（{res['task_id']}）")
+    imported = res["task_id"]
+    check(store.events_count_sync(imported) == 4, "★ 导入的事件条数一致")
+    rows = store.load_events_sync(imported)
+    check([r["seq"] for r in rows] == [1, 2, 3, 4], "★ 导入后 seq 顺序不变")
+    check(rows[0]["data"].get("text") == "第一段", "★ 导入后载荷不变")
+    new_ids = [r["id"] for r in rows]
+    check(new_ids == sorted(new_ids) and min(new_ids) > max_id,
+          f"★ 导入的事件 id 重新编号到库里最大值之后（{new_ids}）")
+
+    res2 = await store.import_task(exp, task_id="t_explicit")
+    check(res2["task_id"] == "t_explicit" and res2["renamed"] is False, "指定 id 导入")
+    try:
+        await store.import_task({"format": "nope"})
+        check(False, "非法格式应当被拒")
+    except StoreError as exc:
+        check("format" in str(exc), f"★ 非法格式被拒（{str(exc)[:40]}）")
+
+    # ---- ⑧ hub 的统计里能看到归一化次数（给 /api/health 用）----
+    check("seq_normalized" in hub.stats(), "hub.stats 暴露 seq_normalized")
+
+    await archive.stop()
+    await store.close()
 
 
 async def test_m1(db: TmpDB) -> None:

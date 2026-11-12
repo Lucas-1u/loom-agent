@@ -26,16 +26,18 @@ import json
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .archive import EventArchive
 from .hub import EventHub
 from .scheduler import TaskScheduler
-from .store import TaskStore
+from .store import StoreError, TaskStore
 
 log = logging.getLogger("loom.server.app")
 
@@ -65,9 +67,13 @@ class CreateTaskBody(BaseModel):
     # forbidden 里的路径会在 Policy 层直接拦下；allowed 只在事后审计里标记。
     allowed_paths: list[str] = Field(default_factory=list)
     forbidden_paths: list[str] = Field(default_factory=list)
-    # 步骤 6：权限模式（read-only / workspace-write / full-access）
+    # 步骤 6：权限模式（read-only / workspace-write / full-access / desktop）
+    # desktop = 可操控桌面模式（完整权限 + 桌面工具 + 桌面操作协议）
     # 空 = 默认 workspace-write；非法值在 core.run 里抛 ValueError → 任务 failed
     mode: str = ""
+    # 对比表 #21：联网搜索开关。True = 该任务允许 Agent 调用 web_search 工具；
+    # False（默认）= 注册表里不注册 web_search，模型看不到、也调不到（服务端真强制）。
+    web_search: bool = False
 
 
 class ApprovalBody(BaseModel):
@@ -133,14 +139,57 @@ def create_app(
     mcp: dict[str, Any] | None = None,
     workflow_store: Any = None,
     workflow_info: dict[str, Any] | None = None,
+    web_search: dict[str, Any] | None = None,
+    skills: dict[str, Any] | None = None,
+    archive: EventArchive | None = None,
+    retention_days: int = 0,
 ) -> FastAPI:
-    app = FastAPI(title="Loom Agent Server", version="0.1.0")
+    """
+    ★ `archive` / `retention_days`（对比表 #49）：
+      传了就把事件流落盘能力接上 —— lifespan 里启动后台刷盘、退出前 flush；
+      `/api/tasks/{id}/events` 改成"内存优先、磁盘兜底"。
+      传 None 时行为完全回到改造前（自检里就有这么用的用例）。
+    """
+    # 保留期在闭包里先落成局部值：下面的 prune 接口参数会遮蔽同名变量
+    default_retention = int(retention_days or 0)
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        # ★ 必须在这里 start：后台刷盘 task 要绑在**真正 serving 的那个 loop** 上。
+        #   在 __main__ 里 asyncio.create_task 出来的 task，uvicorn 一换 loop 就废了。
+        if archive is not None:
+            await archive.start()
+        try:
+            yield
+        finally:
+            if archive is not None:
+                # 正常退出路径：把队列里剩下的写完（kill -9 除外，见 archive.py）
+                try:
+                    await archive.stop()
+                except Exception:  # noqa: BLE001 —— 退出阶段别再抛
+                    log.exception("事件归档停止失败")
+
+    app = FastAPI(title="Loom Agent Server", version="0.1.0", lifespan=_lifespan)
 
     # 前端从 Vite 的 5173 访问 8765，需要 CORS。
     # ★ 只放开本机来源 —— 这是本机 Agent，不该让任意网页调用。
+    #
+    # ★ 为什么要带 tauri.localhost（2026-11-11 补）：
+    #   打包成桌面应用后，WebView 的 origin **不再是 localhost:5173**，而是
+    #   Tauri 自定义协议域 —— Windows 上是 `http://tauri.localhost`
+    #   （开了 `app.useHttpsScheme` 则是 https；v1 时代还有 `tauri://localhost`）。
+    #   少了这一条，`tauri dev` 一切正常（origin 是 5173），但**一打包就连不上后端**：
+    #   所有 /api 请求和 SSE 都会被 Chromium 当跨域拦掉，界面表现为"后端未启动"。
+    #
+    # ★ 这为什么没放宽安全边界：浏览器里网页**无法伪造** Origin 头，
+    #   恶意站点仍然是 `https://evil.com` → 照旧被拒。能发出 `tauri.localhost`
+    #   的只有本机的 Tauri 应用，而本机进程本来就能直连 127.0.0.1:8765。
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_origin_regex=(
+            r"(https?://(localhost|127\.0\.0\.1|tauri\.localhost)(:\d+)?)"
+            r"|(tauri://localhost)"
+        ),
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["*"],
@@ -179,6 +228,18 @@ def create_app(
             "mcp": mcp,
             # M6：异步工作流（enabled / 恢复摘要）
             "workflow": workflow_info or {"enabled": False},
+            # 对比表 #21：联网搜索（enabled=总开关 / available=真的能搜）。
+            # 前端据此决定"联网搜索"开关是否可点 —— 不能让用户勾了却什么都搜不到。
+            "web_search": web_search or {"enabled": False, "available": False},
+            # 对比表 #24：技能。count 只算**全局层**（用户级/自定义/内置），
+            # 项目级 `.loom/skills` 是每个工作区自己的，随任务加载、不在这里汇总。
+            "skills": skills or {"enabled": False},
+            # 对比表 #49：事件落盘。written/failed/pending 让"有没有在正常落盘"
+            # 一眼可见 —— 写失败必须能看出来，不能默默少一半历史。
+            "events": {
+                **(archive.stats() if archive is not None else {"enabled": False}),
+                "retention_days": retention_days,
+            },
         }
 
     # ===================================================================== #
@@ -339,6 +400,7 @@ def create_app(
             allowed_paths=body.allowed_paths or None,
             forbidden_paths=body.forbidden_paths or None,
             mode=body.mode,
+            web_search=body.web_search,
         )
         return snap
 
@@ -365,38 +427,140 @@ def create_app(
         since: int | None = Query(default=None, description="只返回 id 大于它的记录"),
     ) -> dict[str, Any]:
         """
-        任务的历史事件（HTTP 拉取，非 SSE）。
+        任务的事件历史（HTTP 拉取，非 SSE）。
 
-        ★ 三种"不可用"要明确区分，前端据此显示不同文案：
-            available=false, reason=evicted      → 缓冲淘汰了
-            available=false, reason=unknown_task → 任务不存在
-            available=true                       → 正常
-          服务重启后 runtime 没了、hub 也没了 → evicted / empty
+        ★ 从 2026-11-11（对比表 #49）起，事件是**落盘**的：
+          内存缓冲优先（最新、未被截断）→ 磁盘兜底（重启后、被淘汰后）。
+          两侧按全局 id 合并去重，所以「实时 + 历史」不会重也不会缺。
+
+        ★ 「不可用」必须说清是哪一种，前端据此显示不同文案：
+            available=false, reason=pruned   → 过了保留期被清掉了
+            available=false, reason=empty    → 这个任务从来没落过盘（老库 / 关闭了归档）
+            available=true,  source=memory|disk|hybrid
+          绝不把"拿不到"说成"没有"。
         """
         snap = await scheduler.describe(task_id)
         if snap is None:
             raise HTTPException(404, f"任务不存在：{task_id}")
 
-        recs = hub.buffered_for_task(task_id)
+        # ---- ① 内存：最近的热数据 ----
+        mem = hub.buffered_for_task(task_id)
         if since is not None:
-            recs = [r for r in recs if r["id"] > since]
+            mem = [r for r in mem if r["id"] > since]
+
+        # ---- ② 磁盘：冷数据 ----
+        disk: list[dict[str, Any]] = []
+        archived = 0
+        if archive is not None:
+            try:
+                # 读之前先刷一次：刚发生的事件可能还在队列里（最多晚 250ms）
+                await archive.flush()
+                events = await store.load_events(task_id, since_id=since)
+            except Exception:  # noqa: BLE001 —— 磁盘读失败不能让实时历史也拿不到
+                log.exception("读取落盘事件失败：%s", task_id)
+                events = []
+            archived = len(events)
+            session_id = str(snap.get("session_id") or "")
+            disk = [
+                {
+                    "id": e["id"],
+                    "task_id": e["task_id"],
+                    "session_id": session_id,
+                    "size": e.get("size", 0),
+                    "event": {
+                        "seq": e["seq"],
+                        "ts": e["ts"],
+                        "task_id": e["task_id"],
+                        "turn": e["turn"],
+                        "type": e["type"],
+                        "data": e["data"],
+                    },
+                }
+                for e in events
+            ]
+
+        # ---- ③ 合并：同 id 以内存为准（内存里是完整 data，磁盘只是副本）----
+        merged: dict[int, dict[str, Any]] = {r["id"]: r for r in disk}
+        for r in mem:
+            merged[r["id"]] = r
+        recs = [merged[k] for k in sorted(merged)]
 
         if not recs:
-            return {
-                "task_id": task_id,
-                "available": False,
-                "reason": "evicted" if hub.evicted else "empty",
-                "note": "事件历史不在内存缓冲里（服务重启过，或已被容量上限淘汰）。"
-                        "任务结论仍在快照的 result 字段中。",
-                "events": [],
-            }
+            if since is not None:
+                # 客户端只是"没有更新的事件"，不是"历史丢了"
+                return {"task_id": task_id, "available": True, "reason": "",
+                        "source": "none", "events": [], "note": "没有更新的事件"}
+            reason = "empty"
+            note = "这个任务没有落盘的事件（老库未迁移，或 LOOM_EVENTS=0 关闭了归档）。"
+            if archive is not None and archive.enabled and retention_days > 0:
+                created = float(snap.get("created_at") or 0)
+                if created and created < time.time() - retention_days * 86400:
+                    reason = "pruned"
+                    note = f"事件已超过保留期（{retention_days} 天）被清理；任务结论仍在快照里。"
+            return {"task_id": task_id, "available": False, "reason": reason,
+                    "source": "none", "note": note, "events": []}
 
+        source = "memory" if not disk else ("disk" if not mem else "hybrid")
         return {
             "task_id": task_id,
             "available": True,
             "reason": "",
-            "events": [r for r in recs],
+            "source": source,
+            "archived": archived,
+            "events": recs,
         }
+
+    # ===================================================================== #
+    # 导出 / 导入 / 保留策略（对比表 #49）
+    # ===================================================================== #
+    @app.get("/api/tasks/{task_id}/export")
+    async def export_task(task_id: str) -> dict[str, Any]:
+        """
+        导出一个任务的全套材料（行 + 状态快照 + 消息历史 + 事件流）。
+
+        ★ 用途：把一次失败的运行原样发给别人复现 —— 光有结论没有过程是没用的。
+        ★ 文件里带 `format`，导入端据此拒绝不认识的格式。
+        """
+        data = await store.export_task(task_id)
+        if data is None:
+            raise HTTPException(404, f"任务不存在：{task_id}")
+        return data
+
+    @app.post("/api/tasks/import")
+    async def import_task(
+        payload: dict[str, Any] = Body(...),
+        task_id: str = Query(default="", description="指定新 id（默认沿用导出文件里的）"),
+    ) -> dict[str, Any]:
+        """
+        导入 `GET /api/tasks/{id}/export` 的产物。
+
+        ★ task_id 撞车时自动改名（导入不是覆盖），返回里的 `renamed` 会说清楚。
+        ★ 事件 id 会重新编号 —— 它是**全局**游标，两个库混一起时旧 id 可能重复。
+        """
+        try:
+            return await store.import_task(payload, task_id=task_id)
+        except StoreError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/maintenance/prune")
+    async def prune_events(
+        days: int | None = Query(default=None, description="留几天，0=不删"),
+    ) -> dict[str, Any]:
+        """
+        手动触发事件清理（服务启动时也会按配置自动跑一次）。
+
+        ★ 只删"已终态且创建时间早于截止点"的任务的事件：
+          运行中/排队中的任务事件还要用（续跑要接 seq）。
+        ★ 参数名不能叫 retention_days —— 会遮蔽外层闭包里的同名配置值，
+          于是"不传参数"永远落进 None 分支（这里踩过）。
+        """
+        keep = default_retention if days is None else int(days)
+        if keep <= 0:
+            return {"deleted": 0, "retention_days": 0,
+                    "note": "保留期为 0（永不清理），没有删除任何事件"}
+        cutoff = time.time() - keep * 86400
+        deleted = await store.prune_events(cutoff)
+        return {"deleted": deleted, "retention_days": keep, "cutoff": cutoff}
 
     @app.post("/api/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str) -> dict[str, Any]:
@@ -407,6 +571,33 @@ def create_app(
           最终是否停下要看 `status` 是否变成 `aborted`。
         """
         return await scheduler.cancel(task_id)
+
+    # ===================================================================== #
+    # Checkpoint 恢复（2026-11-11）
+    # ===================================================================== #
+    @app.get("/api/tasks/{task_id}/resume-check")
+    async def resume_check(task_id: str) -> dict[str, Any]:
+        """
+        只读探测：这个任务能不能续跑？（不改状态、不入队）
+
+        返回 `report`：safe_to_resume 由真实判据得出 ——
+        checkpoint 是否存在、工作区是否一致、历史有没有工具结果缺口、
+        预算是否耗尽、快照是否过旧。
+        """
+        plan, report = await scheduler.inspect_resume(task_id)
+        out = report.to_dict()
+        out["resumable"] = plan is not None
+        return out
+
+    @app.post("/api/tasks/{task_id}/resume")
+    async def resume_task(task_id: str) -> dict[str, Any]:
+        """
+        从最近 checkpoint 续跑。
+
+        ★ `accepted=true` 只代表"已排入恢复队列"，不代表已跑完；
+          最终结果看后续事件与任务状态。
+        """
+        return await scheduler.resume(task_id)
 
     # ===================================================================== #
     # 审批
@@ -428,6 +619,59 @@ def create_app(
         )
         if not result["accepted"]:
             # 409：状态冲突（已决策 / 已超时 / 不属于该任务）
+            raise HTTPException(409, detail=result)
+        return result
+
+    # ===================================================================== #
+    # 询问用户（ask_user）
+    # ===================================================================== #
+    @app.post("/api/tasks/{task_id}/user-input")
+    async def user_input_answer(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """
+        提交用户对 ask_user 问题的回答。
+
+        body（新）: {"ask_id": "...", "answers": [{"id": "...", "selected": ["A"], "custom": ""}]}
+        body（旧）: {"ask_id": "...", "answer": "一段自由文本"}   ← 兼容，转成 custom
+
+        ★ `selected` 为空且没有 `custom` = 用户明确跳过该问题（不是没提交）。
+        """
+        ask_id = str(body.get("ask_id") or "").strip()
+        if not ask_id:
+            raise HTTPException(400, detail={"reason": "ask_id_required"})
+
+        raw_answers = body.get("answers")
+        answers: list[dict[str, Any]] = []
+
+        if isinstance(raw_answers, list) and raw_answers:
+            for item in raw_answers:
+                if not isinstance(item, dict):
+                    raise HTTPException(400, detail={"reason": "answers_item_must_be_object"})
+                qid = str(item.get("id") or "").strip()
+                if not qid:
+                    raise HTTPException(400, detail={"reason": "answers_item_id_required"})
+                selected = item.get("selected") or []
+                if not isinstance(selected, list):
+                    raise HTTPException(400, detail={"reason": "selected_must_be_array"})
+                answer_item: dict[str, Any] = {
+                    "id": qid,
+                    "selected": [str(s) for s in selected],
+                }
+                custom = str(item.get("custom") or "").strip()
+                if custom:
+                    answer_item["custom"] = custom
+                answers.append(answer_item)
+        else:
+            # ---- 旧格式：单个自由文本回答 ----
+            text = str(body.get("answer") or "").strip()
+            if not text:
+                raise HTTPException(400, detail={"reason": "answer_required"})
+            answers = [{"id": str(body.get("question_id") or "q1"),
+                        "selected": [], "custom": text}]
+
+        result = await scheduler.resolve_user_input(
+            task_id=task_id, ask_id=ask_id, answers=answers,
+        )
+        if not result["accepted"]:
             raise HTTPException(409, detail=result)
         return result
 

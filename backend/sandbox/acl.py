@@ -89,7 +89,8 @@ else:
 READ_ONLY = "read-only"
 WORKSPACE_WRITE = "workspace-write"
 FULL_ACCESS = "full-access"
-_VALID_MODES = (READ_ONLY, WORKSPACE_WRITE, FULL_ACCESS)
+DESKTOP = "desktop"
+_VALID_MODES = (READ_ONLY, WORKSPACE_WRITE, FULL_ACCESS, DESKTOP)
 
 # ---- Win32 常量（pywin32 未全部暴露，按 SDK 定义写死） ----
 # 写授权掩码：Write | Delete | FILE_DELETE_CHILD
@@ -188,8 +189,10 @@ def create_restricted_token(
         win32api.GetCurrentProcess(), TOKEN_BASIC_RIGHTS
     )
     try:
-        if mode == FULL_ACCESS:
+        if mode == FULL_ACCESS or mode == DESKTOP:
             # DuplicateTokenEx 从自己的令牌复制一个主令牌：不需要任何特权
+            # ★ desktop 模式走同样的不受限令牌：桌面操控是宿主机物理动作，
+            #   受限令牌会挡住 agent-desktop 的指针操作（与 full-access 同域）。
             token = win32security.DuplicateTokenEx(
                 base,
                 win32security.SecurityImpersonation,

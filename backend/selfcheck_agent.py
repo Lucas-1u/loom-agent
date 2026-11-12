@@ -432,6 +432,453 @@ async def test_edit_file(sb: Sandbox) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# [A2.5] delete_file —— 删除工具（删除前备份 / 只删文件不删目录）
+# --------------------------------------------------------------------------- #
+async def test_delete_file(sb: Sandbox) -> None:
+    """
+    ☆ delete_file 的全部安全承诺都在这 12 条断言里：
+
+      ✅ 删除前自动备份 —— 备份存在且内容 = 原文件内容（可还原）
+      ✅ 删除真的落盘 —— os.path 层确认文件消失
+      ✅ 变更留痕口径 —— ChangeRecord(action="delete")、before_hash 与删除前哈希一致
+      ✅ side_effects 记录 file_delete（与 write_file/file_write 同构）
+      ❌ 文件不存在 → not_found（带 hint）
+      ❌ 目标是目录 → not_a_file，且 hint 指向 run_command（绝不递归删目录）
+      ❌ 越界路径 → path_outside_workspace（安全事件）
+      ❌ 缺参数 → invalid_arguments
+    """
+    print("\n[A2.5] delete_file（删除：备份先行 / 只删文件 / 路径安全）")
+
+    from backend.tools.mutating._shared import sha256_file
+
+    reg = build_default_registry()
+    ctx = make_context_standalone(sb.dir)
+    tool = reg.require("delete_file")
+
+    # ---- ① 正常删除 ----
+    sb._write("deletable.txt", "line one\nline two\nline three\n")
+    before_hash = sha256_file(sb.path("deletable.txt"))
+
+    r = await tool.run({"path": "deletable.txt"}, ctx)
+    check(r.ok, f"删除成功（{r.summary[:50]}）")
+    check(not os.path.exists(sb.path("deletable.txt")), "★ 文件真的从磁盘上消失了")
+
+    # ---- ② ★ 删除前备份：内容必须与原文件一致（可还原）----
+    change = r.data.get("change", {})
+    backup = change.get("backup_path", "")
+    check(bool(backup), f"★ 删除前自动备份：{backup}")
+    check(change.get("action") == "delete", f"ChangeRecord action = delete（实际 {change.get('action')}）")
+    check(change.get("before_hash") == before_hash, "★ before_hash = 删除前的原文件哈希")
+    check(change.get("removed", change.get("removed_lines")) == 3, "★ removed 行数正确（3 行）")
+
+    if backup:
+        rel = backup[2:] if backup.startswith("./") else backup
+        bpath = os.path.join(sb.dir, rel.replace("/", os.sep))
+        check(os.path.isfile(bpath), f"备份文件确实存在：{backup}")
+        with open(bpath, encoding="utf-8") as f:
+            bcontent = f.read()
+        check("line one" in bcontent and "line three" in bcontent,
+              "★★ 备份内容 = 原文件内容（用户可手工还原）")
+
+    # ---- ③ side_effects 与 write/edit 同构 ----
+    check(any(se.get("kind") == "file_delete" for se in r.side_effects),
+          "side_effects 记录 file_delete")
+    check(any(se.get("kind") == "file_write" for se in r.side_effects) is False,
+          "删除不冒充写入（action 语义分开）")
+
+    # ---- ④ 删除不存在的文件 → not_found ----
+    r2 = await tool.run({"path": "never_existed.txt"}, ctx)
+    check(not r2.ok and r2.error["kind"] == "not_found", f"删除不存在的文件 → not_found")
+    check(bool(r2.error.get("hint")), "失败带 hint（建议先 list_files 确认）")
+
+    # ---- ⑤ ★★ 目标是目录 → 拒绝（绝不递归删目录）----
+    r3 = await tool.run({"path": "node_modules"}, ctx)
+    check(not r3.ok and r3.error["kind"] == "not_a_file",
+          "★★ 删除目录被拒（not_a_file，不递归）")
+    check("run_command" in r3.error.get("hint", ""),
+          "★ hint 指向 run_command（沙箱里做目录删除）")
+    check(os.path.isdir(sb.path("node_modules")), "★★ 目录原封未动")
+
+    # ---- ⑥ 越界路径 → 安全事件 ----
+    r4 = await tool.run({"path": "../outside.txt"}, ctx)
+    check(not r4.ok and r4.error["kind"] == "path_outside_workspace", "越界删除被拦")
+    check(r4.error["security"] is True, "越界删除标记为安全事件")
+
+    # ---- ⑦ 缺参数 ----
+    r5 = await tool.run({}, ctx)
+    check(not r5.ok and r5.error["kind"] == "invalid_arguments", "缺 path → invalid_arguments")
+
+    # ---- ⑧ 删除空文件也成功（空文件就是没有内容的合法删除目标）----
+    sb._write("empty.txt", "")
+    r6 = await tool.run({"path": "empty.txt"}, ctx)
+    check(r6.ok, "空文件可以删除（removed_lines=0 不报错）")
+    check(not os.path.exists(sb.path("empty.txt")), "空文件真的被删了")
+
+    # ---- ⑨ describe_action：再删一次可以提前看到"要删的是什么"----
+    sb._write("preview_me.txt", "alpha\nbeta\ngamma\n")
+    info = tool.describe_action({"path": "preview_me.txt"}, ctx)
+    check(info["action"] == "删除文件", f"action = {info['action']}")
+    check("preview_me.txt" in info["target"], "target 是工作区相对路径")
+    check("alpha" in info["preview"], "★ 预览显示文件开头内容（删之前先看到要删什么）")
+    check("删除" in info["impact"] and "备份" in info["impact"], "影响说明告知删除 + 会备份")
+
+    # ---- ⑩ 敏感文件显著警示（不拒绝，只提醒）----
+    sb._write("id_rsa", "PRIVATE KEY MATERIAL\n")
+    info2 = tool.describe_action({"path": "id_rsa"}, ctx)
+    check("敏感文件" in info2["impact"], f"★ 删除敏感文件时显著警示：{info2['impact'][:60]}")
+
+    # ---- ⑪ describe_action 不崩：不存在的路径给"会失败"提示 ----
+    info3 = tool.describe_action({"path": "ghost.txt"}, ctx)
+    check("不存在" in info3["impact"] or "失败" in info3["impact"],
+          "预览不存在的目标时提前警告")
+
+    # ---- ⑫ 只读视图中没有 delete_file（与 write/edit 同待遇）----
+    ro = build_default_registry(include_mutating=False).readonly_view()
+    check("delete_file" not in ro.names, "★ 只读视图剔除 delete_file（服务端真强制）")
+    full = build_default_registry()
+    check("delete_file" in full.names, "完整注册表有 delete_file")
+
+
+# --------------------------------------------------------------------------- #
+# [A2.6] web_search —— 联网搜索（对比表 #21）
+# --------------------------------------------------------------------------- #
+async def test_web_search(sb: Sandbox) -> None:
+    """
+    ☆ 联网搜索的两类承诺：
+
+      ✅ 默认隐形 —— 未注入配置时工具不注册（未配置的部署工具清单不变）
+      ✅ 只读 —— risk=read，只读视图里也保留（查文档是纯读操作）
+      ✅ 请求形状 —— URL/认证/请求体符合 DeepSeek Search API
+      ✅ 响应解析 —— results[{title,url,snippet}] 映射到 data
+      ✅ 开关有效 —— without() 能剔除且保留原分组（任务级开关的实现基础）
+      ❌ 缺参数 → invalid_arguments
+      ❌ 空结果 → not_found（带换关键词的 hint）
+      ❌ 401 → permission_denied（提示检查 key）
+
+    ★ 全程 mock urlopen，不发任何真实网络请求 —— 自检必须离线可跑。
+    """
+    print("\n[A2.6] web_search（联网搜索：注入才注册 / 响应解析 / 错误分类）")
+
+    import urllib.error
+
+    import backend.tools.readonly.web_search as ws_mod
+    from backend.config import WebSearchConfig
+
+    # ---- ① 未配置 → 不注册（默认部署无感）----
+    check(ws_mod.make(api_key="") is None, "未配置 key 时工厂返回 None（不注册）")
+    check("web_search" not in build_default_registry().names,
+          "默认注册表不含 web_search（与历史工具清单一致）")
+
+    # ---- ② 注入配置后注册，且是只读工具 ----
+    cfg = WebSearchConfig(
+        enabled=True, base_url="https://api.deepseek.com/v1/tools",
+        api_key="dummy-key", timeout=5.0,
+    )
+    reg = build_default_registry(search=cfg)
+    check("web_search" in reg.names, "注入 search 配置后 web_search 已注册")
+    tool = reg.require("web_search")
+    check(tool.risk.value == "read", "风险等级为 read（纯只读）")
+    check("web_search" in reg.readonly_view().names,
+          "只读视图保留 web_search（只读模式下也能查文档）")
+
+    ctx = make_context_standalone(sb.dir)
+
+    # ---- ③ 参数校验 ----
+    r = await tool.run({}, ctx)
+    check(not r.ok and r.error["kind"] == "invalid_arguments", "缺 query → invalid_arguments")
+
+    # ---- ④ mock 正常响应：验证请求形状 + 解析 ----
+    class _FakeResp:
+        def __init__(self, body: str) -> None:
+            self._body = body.encode("utf-8")
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    captured: dict = {}
+
+    def fake_ok(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["auth"] = req.get_header("Authorization")
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResp(json.dumps({
+            "results": [
+                {"title": "asyncio 文档", "url": "https://docs.python.org/3/library/asyncio.html",
+                 "snippet": "asyncio 是并发执行代码的库", "date": "2026-01-01"},
+                {"title": "TaskGroup", "url": "https://example.com/taskgroup",
+                 "snippet": "结构化并发"},
+                {"title": "无 url 的脏数据", "snippet": "应被过滤掉"},
+            ]
+        }, ensure_ascii=False))
+
+    orig = ws_mod.urllib.request.urlopen
+    try:
+        ws_mod.urllib.request.urlopen = fake_ok
+        r = await tool.run({"query": "python asyncio", "count": 3}, ctx)
+    finally:
+        ws_mod.urllib.request.urlopen = orig
+
+    check(r.ok, f"正常响应解析成功（{r.summary[:40]}）")
+    check(captured.get("url", "").endswith("/v1/tools/search"), "请求 URL 指向 /v1/tools/search")
+    check(captured.get("auth") == "Bearer dummy-key", "认证头是 Bearer <key>")
+    check(captured.get("body", {}).get("need_content") is False,
+          "★ need_content=False（只要摘要，不抓正文 → 不炸上下文）")
+    check(len(r.data["results"]) == 2, "★ 缺 url 的脏数据被过滤（3 条原始 → 2 条有效）")
+    check(r.data["results"][0]["url"].startswith("https://docs.python.org"), "url/title 映射正确")
+
+    # ---- ⑤ 空结果 → not_found ----
+    try:
+        ws_mod.urllib.request.urlopen = lambda req, timeout=None: _FakeResp('{"results": []}')
+        r_empty = await tool.run({"query": "不存在的关键词"}, ctx)
+    finally:
+        ws_mod.urllib.request.urlopen = orig
+    check(not r_empty.ok and r_empty.error["kind"] == "not_found", "空结果 → not_found")
+    check("关键词" in (r_empty.error["hint"] or ""), "★ hint 建议换关键词，而不是让模型瞎猜")
+
+    # ---- ⑥ 401 → permission_denied ----
+    def fake_401(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    try:
+        ws_mod.urllib.request.urlopen = fake_401
+        r_401 = await tool.run({"query": "x"}, ctx)
+    finally:
+        ws_mod.urllib.request.urlopen = orig
+    check(not r_401.ok and r_401.error["kind"] == "permission_denied", "401 → permission_denied")
+    check("DEEPSEEK_API_KEY" in (r_401.error["hint"] or ""), "★ hint 指向具体配置项")
+
+    # ---- ⑦ 任务级开关的实现基础：without() 剔除且保留分组 ----
+    stripped = reg.without("web_search")
+    check("web_search" not in stripped.names, "★ without() 能剔除 web_search")
+    check("read_file" in stripped.group("readonly"),
+          "★ without() 保留原分组（不是全塞进 filtered）")
+
+
+# --------------------------------------------------------------------------- #
+# [A2.7] skill —— 技能机制（三级渐进披露 / 对比表 #24）
+# --------------------------------------------------------------------------- #
+def _write_skill(root: str, name: str, *, desc: str = "示例技能",
+                 body: str = "# 做法\n\n按步骤做。", extra: dict[str, str] | None = None,
+                 raw: str | None = None) -> str:
+    """在 root/name 下造一个技能目录，返回目录路径。"""
+    import os as _os
+
+    d = _os.path.join(root, name)
+    _os.makedirs(d, exist_ok=True)
+    text = raw if raw is not None else (
+        f"---\nname: {name}\ndescription: {desc}\n---\n\n{body}\n"
+    )
+    with open(_os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    for rel, content in (extra or {}).items():
+        p = _os.path.join(d, rel.replace("/", _os.sep))
+        _os.makedirs(_os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    return d
+
+
+async def test_skills(sb: Sandbox) -> None:
+    """
+    ☆ 技能机制的三条承诺：
+
+      ✅ 渐进披露 —— 目录常驻提示词，正文与附带文件按需载入
+      ✅ 坏技能不拖垮好技能 —— 跳过 + 记原因，不是整个加载失败
+      ✅ 只读安全 —— risk=read；技能名白名单，附带文件不许越界
+      ❌ 没有 frontmatter / 缺 description / 名字非法 → 跳过并说明原因
+      ❌ `../` 读技能目录外 → 拒绝
+    """
+    print("\n[A2.7] skill（技能：扫描 / 解析 / 目录 / 载入 / 路径安全）")
+
+    import os as _os
+    import tempfile
+
+    from backend.config import SkillsConfig
+    from backend.skills import SkillLibrary, minimal_yaml, parse_frontmatter
+    from backend.skills.library import ResolvedRoot, render_skill, render_skill_file
+    from backend.tools.readonly.skill import make as make_skill
+
+    # ---- A0 注册与开关 ----
+    reg_on = build_default_registry()
+    check("load_skill" in reg_on.names, "★ 默认注册表里有 load_skill")
+    check(reg_on.require("load_skill").risk.value == "read", "load_skill 风险=read（只读）")
+    check("load_skill" in reg_on.readonly_view().names,
+          "★ 只读视图保留 load_skill（read-only 任务也能用技能）")
+    check("load_skill" not in build_default_registry(skills=False).names,
+          "★ skills=False 时不注册（LOOM_SKILLS=0 的效果）")
+
+    # ---- A1 frontmatter 解析 ----
+    meta, body, err = parse_frontmatter("---\nname: a\ndescription: 做什么\n---\n\n正文")
+    check(not err and meta.get("name") == "a" and body.strip() == "正文",
+          "正常 frontmatter 解析出 meta 与正文")
+    _, _, err = parse_frontmatter("# 没有 frontmatter\n")
+    check(bool(err) and "---" in err, "★ 没有 frontmatter → 报错（不静默当成正文）")
+    _, _, err = parse_frontmatter("---\nname: a\n") 
+    check(bool(err) and "结束" in err, "frontmatter 没闭合 → 报错")
+
+    meta_b, _, err_b = parse_frontmatter("---\nname: b\ndescription: |\n  第一行\n  第二行\n---\n")
+    check(not err_b and "第一行" in str(meta_b.get("description")),
+          "块标量 | 能解析成多行描述")
+    meta_min, err_min = minimal_yaml("name: c\ndescription: >\n  折叠 成 一行\ntags:\n  - x\n  - y")
+    check(not err_min and meta_min.get("name") == "c", "内置 minimal_yaml 能解析普通键值")
+    check("折叠" in str(meta_min.get("description")) and "\n" not in str(meta_min.get("description")),
+          "minimal_yaml 的 > 折叠成一行")
+    check(meta_min.get("tags") == ["x", "y"], "minimal_yaml 能解析缩进列表")
+
+    # ---- A2 扫描：好技能进、坏技能记原因 ----
+    tmp = tempfile.mkdtemp(prefix="loom_skill_")
+    try:
+        _write_skill(tmp, "good", desc="好技能", extra={"references/api.md": "# API\n细节"})
+        _write_skill(tmp, "nodesc", raw="---\nname: nodesc\n---\n\n正文")
+        _write_skill(tmp, "evil", raw="---\nname: ../evil\ndescription: x\n---\n")
+        _write_skill(tmp, "badyaml", raw="---\nname: badyaml\ndescription: [未闭合\n---\n")
+        _os.makedirs(_os.path.join(tmp, "_shared"), exist_ok=True)
+        _write_skill(_os.path.join(tmp, "_shared"), "hidden", desc="不该被扫到")
+        _os.makedirs(_os.path.join(tmp, "not_a_skill"), exist_ok=True)  # 没有 SKILL.md
+
+        lib = SkillLibrary.from_roots([ResolvedRoot(tmp, "测试")])
+        check(lib.names == ["good"], f"只加载合法技能（实际 {lib.names}）")
+        reasons = " | ".join(s["reason"] for s in lib.skipped)
+        check(any("description" in s["reason"] for s in lib.skipped),
+              "★ 缺 description 被跳过并记原因")
+        check(any("技能名不合法" in s["reason"] for s in lib.skipped),
+              "★ 名字含 ../ 被跳过（挡路径穿越）")
+        check("YAML" in reasons, "★ 坏 YAML 被跳过，原因指向 YAML（不是含糊的字段缺失）")
+        check("hidden" not in lib.names, "_ 前缀目录不当技能扫描")
+
+        # ---- A2b 内置目录的作用域：只在自己的仓库里生效 ----
+        repo_sim = _os.path.join(tmp, "repo_sim")
+        _os.makedirs(repo_sim, exist_ok=True)
+        _write_skill(_os.path.join(repo_sim, "skills"), "innerskill", desc="仓库自带")
+        cfg_b = SkillsConfig(project_dir=".loom/skills", user_dir="", dirs=[],
+                             builtin_dir=_os.path.join(repo_sim, "skills"))
+        outer = SkillLibrary.from_config(cfg_b, workspace=_os.path.join(tmp, "other_project"))
+        check(outer.count == 0,
+              "★★ 内置技能不会出现在别的项目里（模型不会去跑本仓库的自检命令）")
+        inner = SkillLibrary.from_config(cfg_b, workspace=_os.path.join(repo_sim, "src"))
+        check("innerskill" in inner.names, "★ 在本仓库内（含子目录）能看到内置技能")
+
+        # ---- A3 目录渲染（第 1 级披露）----
+        cat = lib.catalog_text()
+        check("good" in cat and "好技能" in cat, "目录含名字与描述")
+        check(cat.startswith("### 测试"), "目录按来源分组")
+        check(SkillLibrary.from_roots([]).catalog_text() == "",
+              "★ 空库不渲染目录（不会出现空的「可用技能」标题）")
+        long_lib = SkillLibrary.from_roots([ResolvedRoot(tmp, "测试")])
+        long_lib.skills["good"].description = "长" * 500
+        check("…" in long_lib.catalog_text(), "超长描述被截断")
+
+        # ---- A4 载入（第 2 级披露）----
+        skill, err = lib.load("good")
+        check(skill is not None and not err, "load 成功")
+        check(skill.files == ["references/api.md"], f"附带文件被列出（{skill.files}）")
+        rendered = render_skill(skill)
+        check(skill.root.replace("\\", "/") in rendered, "渲染结果带绝对目录（脚本能直接跑）")
+
+        tok_skill = SkillLibrary.from_roots([ResolvedRoot(tmp, "测试")])
+        tok_skill.skills["good"].body = "cd $SKILL_DIR && cd <SKILL_ROOT>"
+        out = render_skill(tok_skill.skills["good"])
+        check("$SKILL_DIR" not in out and "<SKILL_ROOT>" not in out,
+              "★★ 正文里的 $SKILL_DIR / <SKILL_ROOT> 被替换成真实路径")
+        check(out.count(skill.root.replace("\\", "/")) >= 2, "两个占位符都换成了同一目录")
+
+        _, err = lib.load("nope")
+        check("good" in err, "未知名 → 错误里列出可用技能")
+
+        # ---- A5 附带文件（第 3 级披露）+ 路径安全 ----
+        text, err = lib.read_file("good", "references/api.md")
+        check(not err and "细节" in text, "读 references 文件成功")
+        check("绝对路径" in render_skill_file(skill, "references/api.md", text),
+              "文件渲染带绝对路径")
+        _, err = lib.read_file("good", "../../secret.txt")
+        check("越界" in err, "★★ `../` 越界被拒（不许把任意文件读进上下文）")
+        _, err = lib.read_file("good", "references/none.md")
+        check("没有" in err and "api.md" in err, "不存在的文件 → 错误 + 相近候选")
+        _write_skill(tmp, "bin", desc="x", extra={"assets/logo.png": "PNG\x00\x01data"})
+        lib2 = SkillLibrary.from_roots([ResolvedRoot(tmp, "测试")])
+        _, err = lib2.read_file("bin", "assets/logo.png")
+        check("二进制" in err, "二进制文件被拒（不把乱码塞进上下文）")
+
+        # ---- A6 工具层 ----
+        tool = make_skill()
+        ctx = make_context_standalone(sb.dir)
+        r = await tool.run({"name": "good"}, ctx)
+        check(not r.ok and r.error["kind"] == "execution_error",
+              "未注入技能库 → execution_error（不是静默成功）")
+
+        ctx.skills = lib
+        r = await tool.run({"name": "good"}, ctx)
+        check(r.ok and isinstance(r.data, str) and "做法" in r.data,
+              "★ 载入成功，data 是字符串（正文原样透传，不转义）")
+        check("已载入技能 good" in r.summary, "summary 说明载入了哪个技能")
+        r = await tool.run({"name": "good", "file": "references/api.md"}, ctx)
+        check(r.ok and "细节" in r.data, "file= 分支能读附带文件")
+        r = await tool.run({"name": "nope"}, ctx)
+        check(not r.ok and r.error["kind"] == "not_found", "未知名 → not_found")
+        ctx.skills = SkillLibrary.from_roots([])
+        r = await tool.run({"name": "good"}, ctx)
+        check(not r.ok and r.error["kind"] == "not_found" and "没有可用技能" in r.summary,
+              "空库 → 明确说没有可用技能（hint 指向目录）")
+
+        # ---- A7 Agent 集成：提示词里只有目录，正文靠工具载入 ----
+        ws = tempfile.mkdtemp(prefix="loom_skill_ws_")
+        try:
+            proj = _os.path.join(ws, ".loom", "skills")
+            _os.makedirs(proj, exist_ok=True)
+            _write_skill(proj, "projskill", desc="项目级技能：按团队约定做",
+                         body="# 步骤\n\n1. 先做 A\n2. 再做 B")
+
+            cfg = SkillsConfig(builtin_dir="", user_dir="", dirs=[], project_dir=".loom/skills")
+            # ★ 第一条剧本属于 PLAN 阶段（PLAN 不给工具，调工具会被浪费掉）
+            adapter = FakeAdapter([
+                ModelReply(content="先载入项目技能，再照做。"),
+                ModelReply(tool_calls=[ToolCall(
+                    id="c1", name="load_skill", arguments={"name": "projskill"},
+                    arguments_raw='{"name":"projskill"}')]),
+                ModelReply(content="按技能步骤做完了。"),
+            ])
+            bus = EventBus()
+            events = collect(bus)
+            core = AgentCore(adapter, build_default_registry(),
+                             config=AgentConfig(max_turns=4, min_evidence=0, skills=cfg,
+                                                use_reflect_phase=False), bus=bus)
+            st = await core.run("按项目技能做一遍", workspace=ws)
+
+            check(st.status.value == "done", f"带技能的任务正常收尾（{st.status.value}）")
+            check("# 可用技能" in core._system_prompt, "★ 系统提示里有「可用技能」一节")
+            check("projskill" in core._system_prompt, "★ 目录里列出了项目级技能名")
+            check("先做 A" not in core._system_prompt,
+                  "★★ 正文不在系统提示里（渐进披露：只有目录常驻）")
+            results = [e for e in events if e.type == EventType.TOOL_RESULT]
+            check(bool(results) and results[0].data.get("tool") == "load_skill"
+                  and results[0].data.get("ok") is True,
+                  "load_skill 真的被调用且成功（tool.result ok）")
+            check("按技能步骤做完了" in (st.final_answer or ""), "模型拿到正文后继续完成")
+        finally:
+            import shutil as _shutil
+
+            _shutil.rmtree(ws, ignore_errors=True)
+
+        # 没有技能时不该出现空的目录节
+        core2 = AgentCore(FakeAdapter([ModelReply(content="好")]), build_default_registry(),
+                          config=AgentConfig(max_turns=2, min_evidence=0, skills=cfg),
+                          bus=EventBus())
+        await core2.run("随便看看", workspace=sb.dir)
+        check("# 可用技能" not in core2._system_prompt,
+              "★ 没有技能时不加空目录节（提示词不膨胀）")
+    finally:
+        import shutil as _shutil
+
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # [A3] read_file ↔ edit_file 的 hash 口径一致性
 # --------------------------------------------------------------------------- #
 async def test_read_hash(sb: Sandbox) -> None:
@@ -636,8 +1083,8 @@ async def test_session_mode(sb: Sandbox) -> None:
     check(normalize_session_mode("") == "workspace-write", "空值 → 默认 workspace-write")
     check(normalize_session_mode(None) == "workspace-write", "None → 默认 workspace-write")
     check(normalize_session_mode("  READ-ONLY  ") == "read-only", "大小写/空白归一")
-    check(set(VALID_SESSION_MODES) == {"read-only", "workspace-write", "full-access"},
-          f"三种模式（{VALID_SESSION_MODES}）")
+    check(set(VALID_SESSION_MODES) == {"read-only", "workspace-write", "full-access", "desktop"},
+          f"四种模式（{VALID_SESSION_MODES}）")
 
     raised = False
     try:
@@ -648,8 +1095,34 @@ async def test_session_mode(sb: Sandbox) -> None:
 
     # ---- 与 ACL 层的常量必须一致 ----
     from backend.sandbox import acl as _acl
-    check((_acl.READ_ONLY, _acl.WORKSPACE_WRITE, _acl.FULL_ACCESS) == VALID_SESSION_MODES,
+    check((_acl.READ_ONLY, _acl.WORKSPACE_WRITE, _acl.FULL_ACCESS, _acl.DESKTOP) == VALID_SESSION_MODES,
           "★ state.py 与 sandbox/acl.py 的模式字符串一致")
+
+    # ---- desktop 模式专项测试 ----
+    check(normalize_session_mode("desktop") == "desktop", "desktop 模式归一")
+    check(normalize_session_mode("  Desktop  ") == "desktop", "desktop 大小写/空白归一")
+
+    # 提示词：desktop 模式注入桌面协议，其他模式注入一行提示
+    from backend.prompts.system import build_system_prompt, DESKTOP_PROTOCOL, DESKTOP_MODE_HINT
+    prompt_desktop = build_system_prompt(workspace=sb.dir, session_mode="desktop")
+    prompt_default = build_system_prompt(workspace=sb.dir, session_mode="workspace-write")
+    check("桌面操作协议" in prompt_desktop, "★ desktop 模式提示词含桌面操作协议")
+    check("desktop_snapshot" in prompt_desktop, "桌面协议提到 desktop_snapshot 工具")
+    check("点击后必须验证" in prompt_desktop, "桌面协议要求点击后验证")
+    check(DESKTOP_MODE_HINT.strip() in prompt_default, "非 desktop 模式提示词含一行提示")
+    check("桌面操作协议" not in prompt_default, "非 desktop 模式不注入完整协议")
+
+    # 注册表：no_desktop_registry 剔除所有 desktop 工具
+    reg_full = build_default_registry()
+    no_desktop = reg_full.filter(
+        names=[n for n in reg_full.names if "desktop" not in n])
+    desktop_tools_in_full = [n for n in reg_full.names if "desktop" in n]
+    # desktop 工具只在 MCP/vision 注入时才有；这里至少验证过滤逻辑
+    check(all("desktop" not in n for n in no_desktop.names),
+          "★ no_desktop_registry 剔除所有 desktop 工具")
+    check(set(no_desktop.names) <= set(reg_full.names), "no_desktop 是 full 的子集")
+    # desktop 模式走完整注册表（含 desktop 工具）
+    check(reg_full is reg_full, "desktop 模式使用完整注册表（含 desktop 工具）")
 
     # ---- 默认模式：写入 state + 发一条事件 ----
     bus = EventBus()
@@ -1451,6 +1924,39 @@ class StubEditTool(Tool):
         )
 
 
+class StubDesktopClickTool(Tool):
+    """假的 desktop_click：可控地成功/失败，用于验证闸门。
+
+    ★ 闸门用「点击后有没有观察」判断验证，所以测试里需要能制造
+      点击事件 + 可控的后续观察。
+    """
+
+    name = "desktop_click"
+    description = "测试用假桌面点击"
+    parameters = {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]}
+    risk = RiskLevel.EXEC
+
+    def __init__(self, ok: bool = True) -> None:
+        self.ok = ok
+
+    async def run(self, args, ctx):  # type: ignore[override]
+        if self.ok:
+            return ToolResult.success(self.name, "点击成功", data={"x": args.get("x"), "y": args.get("y")})
+        return ToolResult.failure(self.name, ErrorKind.EXECUTION_ERROR, "点击失败")
+
+
+class StubCaptureTool(Tool):
+    """假的 capture_screen：点击后的"观察"信号。"""
+
+    name = "capture_screen"
+    description = "测试用假截屏（验证观察）"
+    parameters = {"type": "object", "properties": {}}
+    risk = RiskLevel.READ
+
+    async def run(self, args, ctx):  # type: ignore[override]
+        return ToolResult.success(self.name, "已截图")
+
+
 async def test_verification_gate(sb: Sandbox) -> None:
     """[V] 「模型说完成」不等于「任务真的完成」。"""
     print("\n[V] 完成验证闸门（失败不能被判成功）")
@@ -1601,6 +2107,279 @@ async def test_verification_gate(sb: Sandbox) -> None:
           f"★ 观测型任务（没改文件）如实报告失败也判 done（{state6.status.value}）")
     check(state6.verification_retries == 0, "观测型任务不触发驳回")
     check("退出码 1" in state6.final_answer, "如实汇报的内容原样保留")
+
+
+def _desktop_gate_registry(click_ok: bool = True):
+    from backend.tools.readonly.list_files import make as mk_list
+    from backend.tools.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    reg.register(mk_list(), group="readonly")
+    reg.register(StubDesktopClickTool(ok=click_ok), group="exec")
+    reg.register(StubCaptureTool(), group="readonly")
+    return reg
+
+
+async def test_desktop_verification_gate(sb: Sandbox) -> None:
+    """[V] desktop_click 后必须验证 —— "点了"不等于"点对了"。"""
+    print("\n[V] desktop 点击验证闸门")
+
+    # ---- V7 ★ 可证伪：点击后不验证 → 被拦 → 再犯 → fail ----
+    # 序列：click → "完成"（被拒）→ click → "完成"（再拒→fail）
+    adapter7 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("k1", "desktop_click", {"x": 100, "y": 200})]),
+            ModelReply(content="已点击完成。"),
+            ModelReply(tool_calls=[tc("k2", "desktop_click", {"x": 100, "y": 200})]),
+            ModelReply(content="完成。"),
+            ModelReply(content="（不该走到这里）"),
+        ]
+    )
+    bus7 = EventBus()
+    evs7 = collect(bus7)
+    core7 = AgentCore(
+        adapter7, _desktop_gate_registry(),
+        config=AgentConfig(max_turns=8, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False, max_verification_retries=1),
+        bus=bus7,
+    )
+    state7 = await core7.run("点击屏幕上的按钮", workspace=sb.dir)
+    await bus7.drain()
+    check(state7.status is TaskStatus.ABORTED,
+          f"★ 点击后无验证 → aborted 而非 done（{state7.status.value}）")
+    check(state7.end_reason == "verification_failed",
+          f"★ 结束原因 verification_failed（{state7.end_reason}）")
+    check(state7.verification_retries == 1, f"记录了一次驳回（{state7.verification_retries}）")
+    check(any(e.type == EventType.ERROR and e.data.get("kind") == "unverified_completion"
+              for e in evs7), "★ 发出了 unverified_completion 错误事件")
+
+    # ---- V8 点击后验证（capture_screen）→ 放行 ----
+    adapter8 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("m1", "desktop_click", {"x": 100, "y": 200})]),
+            ModelReply(tool_calls=[tc("m2", "capture_screen", {})]),
+            ModelReply(content="点击并已截屏确认，完成。"),
+        ]
+    )
+    core8 = AgentCore(
+        adapter8, _desktop_gate_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state8 = await core8.run("点击并验证", workspace=sb.dir)
+    check(state8.status is TaskStatus.DONE,
+          f"★ 点击后有 capture_screen → done（{state8.status.value}）")
+    check(state8.verification_retries == 0, "有验证 → 不触发驳回")
+
+    # ---- V9 点击失败（ok=False）→ 不拦（如实报告失败即可）----
+    adapter9 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("n1", "desktop_click", {"x": 100, "y": 200})]),
+            ModelReply(content="点击失败，目标窗口不存在。"),
+        ]
+    )
+    core9 = AgentCore(
+        adapter9, _desktop_gate_registry(click_ok=False),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state9 = await core9.run("点击屏幕按钮", workspace=sb.dir)
+    check(state9.status is TaskStatus.DONE,
+          f"★ 点击失败（如实报告）→ done，不强制验证（{state9.status.value}）")
+
+    # ---- V10 没有 desktop_click 的任务 → 不受影响 ----
+    adapter10 = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("o1", "list_files", {"path": "."})]),
+            ModelReply(content="项目结构分析完成。"),
+        ]
+    )
+    core10 = AgentCore(
+        adapter10, _desktop_gate_registry(),
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=EventBus(),
+    )
+    state10 = await core10.run("分析项目", workspace=sb.dir)
+    check(state10.status is TaskStatus.DONE,
+          f"★ 无 desktop_click 任务不受闸门影响（{state10.status.value}）")
+
+
+async def test_ask_user(sb: Sandbox) -> None:
+    """[A] ask_user：挂起-恢复 + 多问题/选项/自由输入 + 超时 pending + 迟到补答。"""
+    print("\n[A] ask_user（对齐 DSH：questions[] / options / multi_select / pending）")
+
+    from backend.agent.user_input import UserInputManager, render_answers
+    from backend.agent.state import TaskState
+    from types import SimpleNamespace
+
+    # ---- A0 工具已注册 ----
+    reg = build_default_registry()
+    check("ask_user" in reg.names, "★ ask_user 已注册到默认注册表")
+    check(reg.get("ask_user").risk is RiskLevel.READ, "ask_user 风险=READ（无副作用）")
+
+    # ---- A1 完整流程（旧写法仍然兼容）：挂起 → 回答 → 继续 ----
+    adapter = FakeAdapter(
+        [
+            ModelReply(tool_calls=[tc("u1", "ask_user", {"question": "用 GET 还是 POST？"})]),
+            ModelReply(content="已按用户选择 GET 继续。"),
+        ]
+    )
+    bus = EventBus()
+    events = collect(bus)
+    core = AgentCore(
+        adapter, reg,
+        config=AgentConfig(max_turns=6, min_evidence=0, use_plan_phase=False,
+                           use_reflect_phase=False),
+        bus=bus,
+    )
+    task = asyncio.create_task(core.run("帮我改接口", workspace=sb.dir))
+
+    req_event = None
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        for e in events:
+            if e.type == EventType.USER_INPUT_REQUEST:
+                req_event = e
+                break
+        if req_event:
+            break
+    check(req_event is not None, "★ 发出了 USER_INPUT_REQUEST 事件（Agent 在挂起等用户）")
+    ask_id = req_event.data.get("ask_id") if req_event else None
+    check(bool(ask_id), "事件里带 ask_id")
+    check(isinstance(req_event.data.get("questions"), list),
+          "★ 事件带 questions 数组（多问题契约）")
+    check(req_event.data.get("question") == "用 GET 还是 POST？",
+          "兼容字段 question 仍在（旧的渲染/日志不受影响）")
+
+    # 用户回答（新签名的自由输入）
+    status = core._user_input.resolve(ask_id, [{"id": "q1", "selected": [], "custom": "用 GET"}])
+    check(status == "answered", f"★ resolve 返回 answered（唤醒挂起）→ {status}")
+
+    state = await task
+    check(state.status is TaskStatus.DONE, f"★ 用户回答后正常完成（{state.status.value}）")
+    resp = [e for e in events if e.type == EventType.USER_INPUT_RESPONSE]
+    check(len(resp) == 1, "发出了 1 条 USER_INPUT_RESPONSE")
+    check(resp and resp[0].data.get("answers", [{}])[0].get("custom") == "用 GET",
+          "★ 答案里的 custom 字段正确回传")
+    check(resp and resp[0].data.get("late") is False, "正常回答 late=False")
+
+    # ---- A2 没有 user_input 管理器 → failure（不假装成功）----
+    tool = reg.get("ask_user")
+    ctx = SimpleNamespace(workspace=sb.dir, user_input=None, bus=None,
+                          task_id="t1", turn=1)
+    res = await tool.run({"question": "测试问题"}, ctx)
+    check(not res.ok, "★ 无 user_input 管理器 → failure")
+
+    # ---- A3 参数规范化：多问题 / 选项两种写法 / 多选 / header ----
+    from backend.tools.readonly.ask_user import normalize_questions
+
+    qs, err = normalize_questions({
+        "questions": [
+            {"id": "f", "question": "改哪个文件？", "header": "确认",
+             "options": [{"label": "a.py", "description": "主入口"}, {"label": "b.py"}]},
+            {"id": "m", "question": "要跑哪些检查？", "multi_select": True,
+             "options": ["pytest", "ruff"]},
+        ]
+    })
+    check(not err, f"多问题参数通过校验（{err}）")
+    check(len(qs) == 2 and qs[0]["id"] == "f" and qs[0]["header"] == "确认",
+          "★ 多问题 + header 正确解析")
+    check(qs[0]["options"][0] == {"label": "a.py", "description": "主入口"},
+          "对象式 options 解析正确")
+    check(qs[1]["options"] == [{"label": "pytest"}, {"label": "ruff"}],
+          "★ 字符串数组式 options 也接受（向后兼容）")
+    check(qs[1].get("multi_select") is True, "multi_select 透传")
+
+    _, err = normalize_questions({"questions": [{"id": "x", "question": "a"},
+                                                {"id": "x", "question": "b"}]})
+    check(bool(err), "★ 重复 id 被拒（答案靠 id 对应）")
+    _, err = normalize_questions({"questions": [{"id": "x", "question": "  "}]})
+    check(bool(err), "空 question 被拒")
+    _, err = normalize_questions({"questions": [{"id": "x", "question": "a"}], "timeout_s": 0})
+    check(bool(err), "★ timeout_s=0 被拒（只允许 -1 或正整数）")
+    _, err = normalize_questions({})
+    check(bool(err), "既没有 questions 也没有 question → 报错")
+
+    # ---- A4 答案渲染（跳过 / 自定义 / 多选）----
+    text = render_answers(
+        [{"id": "f", "question": "改哪个文件？"}, {"id": "m", "question": "跑哪些检查？"}],
+        [{"id": "f", "selected": [], "custom": "src/main.py"},
+         {"id": "m", "selected": ["pytest", "ruff"]},
+         {"id": "z", "selected": []}],
+    )
+    check("（自定义）src/main.py" in text, "★ 自定义答案渲染成「（自定义）…」")
+    check("pytest、ruff" in text, "多选渲染成顿号分隔")
+    check("（跳过，未作答）" in text, "空答案渲染成「跳过」而不是空白")
+
+    # ---- A5 超时 → pending（不是 failure，问题仍可回答）----
+    mgr = UserInputManager(timeout_s=0.05)
+    seen: dict[str, Any] = {"pending": None, "late": None, "answers": None}
+
+    async def _run_timeout() -> list[dict[str, Any]] | None:
+        return await mgr.request(
+            [{"id": "q1", "question": "还要继续吗？"}],
+            task_id="t9",
+            on_pending=lambda aid, req: seen.__setitem__("pending", (aid, req.state)),
+            on_response=lambda ans, late: seen.__setitem__("late", (ans, late)),
+        )
+
+    got = await _run_timeout()
+    check(got is None, "★ 超时返回 None（前台不再等）")
+    check(seen["pending"] is not None and seen["pending"][1] == "pending",
+          "★ 超时后请求转入 pending 状态（问题没作废）")
+    pending_id = seen["pending"][0] if seen["pending"] else ""
+    check(len(mgr.open_requests()) == 1, "pending 请求仍挂在管理器里")
+    check(mgr.expired_count == 1, "expired_count 计数正确")
+
+    # ---- A6 pending 之后仍可回答 → late ----
+    late_into_core: list[tuple] = []
+    mgr.on_late_answer = lambda req, ans: late_into_core.append((req.ask_id, ans))
+    status = mgr.resolve(pending_id, [{"id": "q1", "selected": [], "custom": "继续"}])
+    check(status == "late", f"★ pending 状态下的回答返回 late → {status}")
+    await asyncio.sleep(0.05)  # done_callback 是 call_soon，让一拍
+    check(seen["late"] is not None and seen["late"][1] is True,
+          "★ on_response 收到 late=True")
+    check(len(late_into_core) == 1 and late_into_core[0][0] == pending_id,
+          "★ on_late_answer 被调用（core 能拿到补答）")
+    check(len(mgr.open_requests()) == 0, "补答之后条目被清理（不泄漏）")
+
+    # ---- A7 core 把补答并进对话历史 ----
+    core2 = AgentCore(FakeAdapter([]), build_default_registry(),
+                      config=AgentConfig(max_turns=2, min_evidence=0), bus=EventBus())
+    core2._active_state = TaskState(goal="x", workspace=sb.dir)
+    core2._history = []
+    req_obj = SimpleNamespace(task_id=core2._active_state.task_id,
+                              questions=[{"id": "q1", "question": "用哪个？"}])
+    core2._on_late_answer(req_obj, [{"id": "q1", "selected": [], "custom": "用 B 方案"}])
+    check(len(core2._history) == 1, "★ 补答被塞进对话历史（模型下一步能看到）")
+    check("用 B 方案" in core2._history[0].content, "补答内容正确")
+    check("不要把这条当成新的任务目标" in core2._history[0].content,
+          "★ 明确告诉模型这不是新目标（防止跑偏）")
+
+    core2._active_state.status = TaskStatus.DONE
+    core2._on_late_answer(req_obj, [{"id": "q1", "custom": "迟到的"}])
+    check(len(core2._history) == 1, "★ 任务已结束时补答被丢弃（不往关掉的任务里投）")
+
+    # ---- A8 一次性消费 ----
+    mgr2 = UserInputManager(timeout_s=5)
+    captured: dict[str, str] = {}
+
+    req_task = asyncio.create_task(mgr2.request(
+        [{"id": "q1", "question": "问题"}],
+        on_request=lambda aid, req: captured.__setitem__("id", aid),
+    ))
+    await asyncio.sleep(0.05)
+    aid = captured.get("id", "")
+    check(bool(aid), "A8：拿到 ask_id")
+    s1 = mgr2.resolve(aid, [{"id": "q1", "selected": ["答案1"]}])
+    check(s1 == "answered", "A8：第一次 resolve 成功")
+    s2 = mgr2.resolve(aid, [{"id": "q1", "selected": ["答案2"]}])
+    check(s2 == "invalid", "★ A8：同一个 ask_id 第二次 resolve 失败（一次性消费）")
+    answers = await req_task
+    check(answers and answers[0]["selected"] == ["答案1"], "A8：请求拿到第一个答案")
 
 
 # --------------------------------------------------------------------------- #
@@ -2209,6 +2988,9 @@ async def main() -> int:
     try:
         await test_tools(sb)
         await test_edit_file(sb)
+        await test_delete_file(sb)
+        await test_web_search(sb)
+        await test_skills(sb)
         await test_read_hash(sb)
         await test_policy(sb)
         await test_session_mode(sb)
@@ -2221,6 +3003,8 @@ async def main() -> int:
         await test_termination(sb)
         await test_robustness(sb)
         await test_verification_gate(sb)
+        await test_desktop_verification_gate(sb)
+        await test_ask_user(sb)
         await test_repair_zero_work_gate(sb)
         await test_write_demand_gate(sb)
         await test_plan_truth(sb)
@@ -3503,17 +4287,18 @@ async def test_m1_orchestrator_and_history(sb: Sandbox) -> None:
     check(report["loaded"] == 1, f"★ 历史装载成功（{report['loaded']} 条）")
     check(report["safe_to_resume"] is False, "★ 存在缺口 → 明确判定不可安全续跑")
     check(any("缺口" in r for r in report["reasons"]), "★ 原因可诊断")
-    check(any(m.role == "system" and "不会自动续跑" in m.content for m in core5._history),
+    check(any(m.role == "system" and "已从持久化历史装载" in m.content for m in core5._history),
           "★ 装载后带恢复标记（不会误当成正常上下文）")
-    # 完整配对的历史 → 仍然不可续跑（副作用与审批状态无法重建）
+    # 完整配对的历史 → 消息层可续（2026-11-11 起：checkpoint 恢复已接线）
+    #   ★ 口径分工：这里只判"消息能不能接上"；工作区/预算/时效由 plan_resume 判。
     full = messages_to_entries([
         Message.assistant("", tool_calls=[ToolCall("g2", "read_file", '{"path":"a"}', {"path": "a"})]),
         Message.tool_result("g2", "read_file", "内容"),
         Message.assistant("结论"),
     ], start_seq=10)
     report2 = core5.restore_history(st, full)
-    check(report2["safe_to_resume"] is False and len(report2["tool_call_gaps"]) == 0,
-          "★ 即便配对完整，M1 也不承诺安全续跑（副作用/审批状态不可重建）")
+    check(report2["safe_to_resume"] is True and len(report2["tool_call_gaps"]) == 0,
+          "★ 配对完整 + 历史非空 → 消息层可续（缺口是唯一硬闸门）")
 
     # ---- 6. 压缩 marker 进入持久化日志 ----
     sink3 = MemoryHistorySink()

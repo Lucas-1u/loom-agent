@@ -231,7 +231,8 @@ async def main() -> int:
     print("\n[12] 枚举取值与设计文档一致")
     # 第五批新增 context.compacted（压缩）→ 17；M3 新增 rag.retrieve/rag.result → 19
     # M6 workflow.state → 20；步骤 6 permission.mode → 21
-    check(len(EventType) == 21, f"事件类型共 21 种（实际 {len(EventType)}）")
+    # ask_user → user_input.request/response/expired → 24
+    check(len(EventType) == 24, f"事件类型共 24 种（实际 {len(EventType)}）")
     check(EventType.RAG_RETRIEVE.value == "rag.retrieve"
           and EventType.RAG_RESULT.value == "rag.result",
           "★ M3 检索事件已注册（命名遵循 <域>.<动作>）")
