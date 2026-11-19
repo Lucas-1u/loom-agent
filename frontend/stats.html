@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>会话统计 · Loom</title>
+  </head>
+  <body>
+    <!--
+      独立页面入口：dev 访问 /stats.html，build 后产物 dist/stats.html。
+      配色跟随主应用深色令牌；本页不依赖 LoomProvider，只拉一次 /api/stats。
+    -->
+    <div id="root"></div>
+    <script type="module" src="/src/stats/main.tsx"></script>
+  </body>
+</html>

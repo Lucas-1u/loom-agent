@@ -204,6 +204,7 @@ def build_default_registry(
     include_mutating: bool = True,
     sandbox: "SandboxManager | None" = None,
     knowledge: "KnowledgeBase | None" = None,
+    history: Any = None,
     mcp: "McpManager | None" = None,
     spawner: Any = None,
     terminal: bool | None = None,
@@ -235,6 +236,7 @@ def build_default_registry(
     spawner 允许注入子任务派生器（M5）：**不传就不注册 spawn_subtask**。
     vision 允许注入视觉模型配置：**不配置就不注册 vision_look / desktop_locate**。
     search 允许注入联网搜索配置（对比表 #21）：**不注入或未配 key 就不注册 web_search**。
+    history 允许注入会话历史查询器（对比表 #25）：**不传就不注册 session_history**。
     skills 控制是否注册 load_skill（对比表 #24）：LOOM_SKILLS=0 时传 False。
       ★ 这里只决定"有没有这个入口"，具体能看到哪些技能是**按任务工作区**扫描的
         （library 挂在 ToolContext 上），所以注册表不必为每个任务重建。
@@ -273,6 +275,15 @@ def build_default_registry(
     if knowledge is not None and getattr(knowledge, "usable", False):
         from .readonly.search_docs import make as make_search
         reg.register(make_search(knowledge), group="readonly")
+
+    # ★ 对比表 #25：会话历史查询（翻自己做过什么）。
+    #   不注入 / 库不可用 → 不注册，工具清单与历史一致。
+    #   和 RAG 一样是"只读叶子依赖"，自己开只读连接，不碰 server/。
+    if history is not None:
+        from .readonly.session_history import make as make_history
+        make_h = make_history(history)
+        if make_h is not None:
+            reg.register(make_h, group="readonly")
 
     # ★ 对比表 #21：联网搜索（DeepSeek Search API）。
     #   不注入 / 未开总开关 / 未配 key → 不注册，工具清单与历史完全一致。

@@ -178,12 +178,35 @@ FINAL_ANSWER_PROMPT = """工具观测已经结束。现在请**基于已观测�
 # --------------------------------------------------------------------------- #
 DESKTOP_PROTOCOL = """
 # 桌面操作协议（desktop 模式已授权）
-你拥有操控桌面的权限。操作桌面元素的标准流程：
-1. **先观察**：用 `desktop_snapshot` 抓 UIA 树看有哪些元素，或用 `desktop_locate` 让视觉模型找元素坐标。
-2. **优先 ref 点击**：如果 UIA 树里有目标元素，用 `desktop_click` 传 `ref_id`（来自 snapshot 的 `@快照ID:eN`）——比像素坐标更稳，界面挪了也有效。
-3. **像素点击兜底**：UIA 树里没有的元素（画布/自定义控件），用 `desktop_locate` 拿截图像素坐标，再用 `desktop_mouse_click` 的 `xy` 参数点。坐标是截图原始像素（2560×1600）。
-4. **点击后必须验证**：`desktop_click` 之后，收尾前要再观察一次（`desktop_snapshot` 或 `desktop_locate`）确认结果。点没点到就如实报告，不要假装成功。
-5. 输入文本用 `desktop_type`，按 `desktop_press` 组合键。拖拽用 `desktop_drag`。
+你拥有操控桌面的权限。**优先按元素点，不到万不得已不要用像素坐标。**
+
+## 启动程序（★ 不要点图标）
+- 用 `mcp__agent_desktop__desktop_launch` 启动应用（传可执行文件完整路径最可靠）。
+- **绝对不要用像素坐标去双击桌面图标**。实测两个独立问题：
+  ① 桌面图标在 UIA 树里搜不到，`desktop_find` 返回 0 个匹配；
+  ② 视觉定位（`desktop_locate`）对桌面图标有**系统性偏差**——连续两次都
+     偏到同一个空白点位（约偏 65 像素），双击落空。
+  点空还只是没打开；桌面图标挨着别的东西时，误点会打开**完全无关的程序**。
+  这条没有例外：启动程序只用 `desktop_launch` / `terminal` 的 `Start-Process`。
+
+## 路线 A：按元素点（首选）
+1. `mcp__agent_desktop__desktop_list_windows` 看当前有哪些窗口。
+2. `mcp__agent_desktop__desktop_snapshot`（或 `..._desktop_find` 按名字查）
+   拿到目标元素的 ref，形如 `@s20b07:e12`。
+3. `mcp__agent_desktop__desktop_click` 传 `ref_id` —— 点的是元素中心，
+   界面移动/缩放都不影响。**注意它和 `desktop_click_at` 是两个工具**：这个只要 ref，不要坐标。
+4. 输入文本用 `..._desktop_type` / `..._desktop_set_value`，组合键用 `..._desktop_press`。
+
+## 路线 B：按像素点（仅当路线 A 走不通）
+只有 UIA 树里根本没有的元素（画布、游戏画面、H5 渲染区）才用：
+5. `desktop_locate` 让视觉模型给截图像素坐标（它会先截图，并在 prompt 里带上图片尺寸）。
+6. `desktop_click_at` 传 `x`/`y`（内部自动做 DPI 换算，**你不要自己乘缩放比**）。
+   ★ 视觉坐标有误差（实测可达上百像素）。目标小于 100×100 像素时不要用这条路。
+
+## 两条通用纪律
+7. **点击后必须验证**：再 snapshot 或截图确认结果；没命中就换路线，
+   不要对着同一个坐标反复点。
+8. 点没点到、程序有没有起来，如实报告，**不要假装成功**。
 """
 
 # 非 desktop 模式下的一行提示：告知 agent 桌面操控需要 desktop 模式

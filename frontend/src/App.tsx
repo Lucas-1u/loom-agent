@@ -14,6 +14,7 @@ import {
   useActiveSession,
   useActiveTask,
   useActiveTasks,
+  useActiveUsage,
   useLoom,
 } from "./features/session/store";
 import { disambiguateGroupLabels, groupSessionsByWorkspace } from "./features/session/selectors";
@@ -285,6 +286,21 @@ export default function App() {
     [state.activeTaskId, state.taskModes],
   );
 
+  /** 当前任务的 token 累计（对比表 #4）；null = 还没有 llm.usage 事件 */
+  const activeUsage = useActiveUsage();
+
+  /**
+   * 会话已在后端删除成功 → 本地摘掉。
+   * ★ 只做本地清理，不再请求后端：删都删了，再拉一次列表只是多一次往返，
+   *   而且中间可能出现"列表里还有它"的闪烁。
+   */
+  const handleSessionDeleted = useCallback(
+    (sessionId: string) => {
+      dispatch({ type: "DELETE_SESSION", sessionId });
+    },
+    [dispatch],
+  );
+
   const handleNewSession = useCallback(async () => {
     if (state.mode !== "real") {
       const now = Date.now() / 1000;
@@ -508,6 +524,7 @@ export default function App() {
         demo={state.mode === "demo"}
         sessionMode={state.sessionMode}
         taskMode={activeTaskMode}
+        usage={activeUsage}
       />
 
       {showBanner && (
@@ -537,6 +554,7 @@ export default function App() {
           onToggleGroup={handleToggleGroup}
           onSelectSession={handleSelectSession}
           onNewSession={() => void handleNewSession()}
+          onSessionDeleted={handleSessionDeleted}
           runningSessionIds={runningSessionIds}
           busy={false}
         />

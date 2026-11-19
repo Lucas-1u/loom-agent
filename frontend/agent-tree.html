@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent 工作树 · Loom</title>
+  </head>
+  <body>
+    <!--
+      独立页面入口：dev 下访问 /agent-tree.html，build 后产物同样是 dist/agent-tree.html。
+      ★ 配色跟随主应用的深色令牌（ink-950 底 / #dbe3ef 字），
+        与 index.html 的 class="dark" 一致；这里不设也不影响，因为本页样式自带 color-scheme。
+    -->
+    <div id="root"></div>
+    <script type="module" src="/src/agent-tree/main.tsx"></script>
+  </body>
+</html>

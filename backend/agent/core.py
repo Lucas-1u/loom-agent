@@ -75,7 +75,7 @@ from typing import Any, Callable
 from ..events import Event, EventBus, EventType
 from ..prompts.system import RISK_REVIEW_PROMPT
 from ..config import MAX_TOOL_RESULT_CHARS
-from ..models.adapter import Message, ModelAdapter, ModelError, ToolCall
+from ..models.adapter import ImageRef, Message, ModelAdapter, ModelError, ToolCall
 from ..tools.base import ErrorKind, ToolContext, ToolResult
 from ..tools.path_safety import normalize_root
 from ..tools.registry import ToolRegistry, execute
@@ -161,10 +161,27 @@ class AgentConfig:
         compact_max_chars: int = 60_000,
         compact_keep_turns: int = 3,
         compact_long_turn_chars: int = 20_000,
+        # ---- 主模型视觉（对比表 #12）------------------------------------
+        # False = 图片不进上下文（当前 spark-x2.6 就是这样）；
+        # True  = 工具产出的图片以引用形式进主对话，超出 keep 张数的自动卸载。
+        main_vision: bool = False,
+        image_keep_recent: int = 2,
         # ---- 预算续期（第六批）-------------------------------------
         # 有界续期：只续一次，幅度固定。出现循环/停滞/冲突时绝不续。
         budget_extend_turns: int = 10,
         budget_extend_enabled: bool = True,
+        # ---- 桌面模式专属预算（desktop 权限模式用）----------------------
+        # ★ 桌面控制是多轮"截图→定位→点击→验证"往返，300s 天然偏紧。
+        #   desktop 模式启动时覆盖 config 的 max_seconds/turns/tool_calls。
+        #   **0 = 不设上限**（用户 2026-11-13 要求）：仍有软熔断/连续错误/
+        #   无进展终止三个刹车，它们只看"有没有推进"，不看跑了多久。
+        desktop_max_seconds: float = 0.0,
+        desktop_max_turns: int = 0,
+        desktop_max_tool_calls: int = 0,
+        # ---- 秒数预算有界续期（大任务长思考兜底）------------------------
+        # ★ 轮次续期已有；秒数此前无续期，一过墙钟上限直接砍。补一个同构的
+        #   有界续期：仍在推进且无循环/冲突/停滞就续一次 +budget_extend_seconds。
+        budget_extend_seconds: float = 120.0,
         # ---- 编排引擎（M1 / M4.3）：graph 默认；legacy 为显式兜底 ----
         orchestrator: str = "graph",
         # ---- 项目知识检索（M3）：任务开始时是否自动检索用户目标 ----------
@@ -197,8 +214,14 @@ class AgentConfig:
         self.compact_max_chars = compact_max_chars
         self.compact_keep_turns = compact_keep_turns
         self.compact_long_turn_chars = compact_long_turn_chars
+        self.main_vision = main_vision
+        self.image_keep_recent = image_keep_recent
         self.budget_extend_turns = budget_extend_turns
         self.budget_extend_enabled = budget_extend_enabled
+        self.desktop_max_seconds = desktop_max_seconds
+        self.desktop_max_turns = desktop_max_turns
+        self.desktop_max_tool_calls = desktop_max_tool_calls
+        self.budget_extend_seconds = budget_extend_seconds
         self.orchestrator = orchestrator
         self.rag_auto = rag_auto
         self.checkpoint = checkpoint
@@ -210,6 +233,8 @@ class AgentConfig:
             orchestrator=getattr(b, "orchestrator", "graph"),
             compact_max_chars=getattr(b, "compact_max_chars", 60_000),
             compact_keep_turns=getattr(b, "compact_keep_turns", 3),
+            main_vision=getattr(b, "main_vision", False),
+            image_keep_recent=getattr(b, "image_keep_recent", 2),
             max_turns=b.max_turns,
             max_seconds=b.max_seconds,
             max_tool_calls=b.max_tool_calls,
@@ -217,6 +242,12 @@ class AgentConfig:
             max_errors=b.max_errors,
             approval_timeout_s=b.approval_timeout_s,
             min_evidence=b.min_evidence,
+            budget_extend_turns=getattr(b, "budget_extend_turns", 10),
+            budget_extend_enabled=getattr(b, "budget_extend_enabled", True),
+            desktop_max_seconds=getattr(b, "desktop_max_seconds", 0.0),
+            desktop_max_turns=getattr(b, "desktop_max_turns", 0),
+            desktop_max_tool_calls=getattr(b, "desktop_max_tool_calls", 0),
+            budget_extend_seconds=getattr(b, "budget_extend_seconds", 120.0),
         )
         for k, v in overrides.items():
             if hasattr(cfg, k):
@@ -384,7 +415,10 @@ class AgentCore:
         self.config = config or AgentConfig()
         self.bus = bus or EventBus()
         self.policy = Policy(registry)
-        self.context = ContextBuilder()
+        # 对比表 #12：keep_images 控制"上下文里最多留几张图"，更早的卸载成占位符
+        self.context = ContextBuilder(
+            keep_images=getattr(self.config, "image_keep_recent", 2)
+        )
         self.extra_rules = extra_rules
         # M1：历史落盘的抽象出口（runtime 传 StoreHistorySink；单测不传 → 不持久化）
         self.history_sink = history_sink
@@ -821,24 +855,46 @@ class AgentCore:
             violation = state.budget_violation()
             if violation is not None:
                 kind, limit, used = violation
-                # ---- 第六批：先给耗尽原因分类，再做一次**有界**续期评估 ----
+                # ---- 第六/七批：先给耗尽原因分类，再做一次**有界**续期评估 ----
                 verdict = self._budget_verdict(state, kind)
-                if kind == "turns" and verdict["extend"] and not state.budget_extended:
-                    # ★ 续期条件（全部是可观测事实，不是模型自述）：
-                    #   有效进展 + 无重复循环 + 无范围冲突 + 允许续期的意图。
-                    #   只续一次、有明确上限，并且记录原因 —— 不是无上限加轮次。
-                    state.budget_extended = True
-                    extra = self.config.budget_extend_turns
-                    state.budgets.max_turns += extra
-                    state.budget_reason = f"{verdict['label']}（续期 +{extra} 轮）"
-                    log.info("任务 %s 预算续期 +%d 轮：%s", state.task_id, extra, verdict["label"])
-                    self.bus.error(
-                        "budget_extended",
-                        f"预算续期 +{extra} 轮：{verdict['label']}（仍在推进且无循环/冲突）",
-                        fatal=False, turn=state.turn,
-                    )
-                    # 续期后不再走终止分支
-                else:
+                # ★ 轮次续期与秒数续期共用 budget_extended 标志：
+                #   整个任务生命周期**只续一次**，续的是轮次还是秒数由 kind 决定。
+                #   这样不会"轮次续了又秒数续"无限加预算，是有界续期的关键。
+                extended = False
+                if not state.budget_extended:
+                    if kind == "turns" and verdict["extend"]:
+                        # ★ 续期条件（全部是可观测事实，不是模型自述）：
+                        #   有效进展 + 无重复循环 + 无范围冲突 + 允许续期的意图。
+                        #   只续一次、有明确上限，并且记录原因 —— 不是无上限加轮次。
+                        state.budget_extended = True
+                        extra = self.config.budget_extend_turns
+                        state.budgets.max_turns += extra
+                        state.budget_reason = f"{verdict['label']}（续期 +{extra} 轮）"
+                        log.info("任务 %s 预算续期 +%d 轮：%s", state.task_id, extra, verdict["label"])
+                        self.bus.error(
+                            "budget_extended",
+                            f"预算续期 +{extra} 轮：{verdict['label']}（仍在推进且无循环/冲突）",
+                            fatal=False, turn=state.turn,
+                        )
+                        extended = True
+                    elif kind == "seconds" and verdict["extend_seconds"]:
+                        # ★ 秒数续期（第七批，新增）：墙钟预算此前无续期，一过上限
+                        #   直接砍。补一个同构的有界续期：仍在推进、无循环/冲突就
+                        #   续一次 +budget_extend_seconds。不限意图——长思考不是
+                        #   某类任务的专利。与轮次续期共用标志，只续一次。
+                        state.budget_extended = True
+                        extra = self.config.budget_extend_seconds
+                        state.budgets.max_seconds += extra
+                        state.budget_reason = f"{verdict['label']}（秒数续期 +{extra}s）"
+                        log.info("任务 %s 秒数预算续期 +%.0fs：%s",
+                                 state.task_id, extra, verdict["label"])
+                        self.bus.error(
+                            "budget_extended",
+                            f"秒数预算续期 +{extra:.0f}s：{verdict['label']}（仍在推进且无循环/冲突）",
+                            fatal=False, turn=state.turn,
+                        )
+                        extended = True
+                if not extended:
                     state.budget_reason = verdict["label"] if kind == "turns" else f"budget_{kind}"
                     self.bus.budget_exceeded(kind, limit, used, turn=state.turn)
                     reason = f"budget_{kind}"
@@ -1090,7 +1146,16 @@ class AgentCore:
                     )
                     if _ref is not None:
                         self._spill_count += 1
-                tb.add_tool(tc.id, tc.name, content)
+                # ★ 对比表 #12：只有确认主模型能看图时，才把图片放进上下文。
+                #   否则图片会以"模型看不见的内容"占着请求体积，纯粹浪费。
+                _imgs = []
+                if getattr(self.config, "main_vision", False):
+                    _imgs = [
+                        ImageRef.from_dict(d)
+                        for d in (getattr(res, "images", None) or [])
+                        if isinstance(d, dict)
+                    ]
+                tb.add_tool(tc.id, tc.name, content, images=_imgs or None)
 
         # ★ 补齐缺失的 tool 消息 —— 保证 OpenAI 协议不变量
         tb.add_missing_tools(
@@ -1981,10 +2046,16 @@ class AgentCore:
           unknown              证据不足
 
         ★ 续期规则（全部有界）：
-          只对 repair / implementation / test_authoring 续一次；
+          轮次续期：只对 repair / implementation / test_authoring 续一次；
           diagnostic 不续（诊断拖得久通常是在原地打转）；
           有范围冲突、有重复循环、计划停滞 → 一律不续。
           续期幅度 = budget_extend_turns（默认 +10），只续一次。
+          ★ 秒数续期（第七批，新增）：墙钟预算此前**完全没有续期**，一过
+            上限直接砍，长思考的大任务（尤其桌面多轮往返）必被误杀。补一个
+            同构的有界续期：只要仍在有效推进、无循环/冲突/停滞就续一次，
+            幅度 = budget_extend_seconds（默认 +120s）。**不限意图**——
+            "思考久"不是某类任务的专利，桌面/诊断都可能长。轮次续期与秒数
+            续期共用 budget_extended 标志，整个任务生命周期只续一次。
         """
         last_n = state.tool_events[-6:]
         # ---- 重复循环：最近 6 次调用里出现 ≥3 次完全相同的 (tool, args) ----
@@ -2024,7 +2095,19 @@ class AgentCore:
         else:
             label, extend = "unknown", False
 
-        return {"label": label, "extend": extend and not state.budget_extended}
+        # ---- 秒数续期判定（第七批）-------------------------------------
+        # ★ productive 为真时，repeated_loop 已被置 False，所以这里只需再排除
+        #   范围冲突。只要还在推进、没卡在冲突里，就给一次秒数续期——
+        #   这正是"大任务长思考"需要的兜底，不按 intent 设限。
+        extend_seconds = (
+            productive and not state.scope_conflicts and not state.budget_extended
+        )
+
+        return {
+            "label": label,
+            "extend": extend and not state.budget_extended,
+            "extend_seconds": extend_seconds,
+        }
 
 
     async def _finalize_text_reply(self, state: TaskState, reply: Any) -> str:
@@ -2226,13 +2309,24 @@ class AgentCore:
         tools = self.registry.to_specs() if allow_tools else None
 
         if not self.config.stream:
-            return await self.adapter.chat(msgs, tools)
+            reply = await self.adapter.chat(msgs, tools)
+            # 非流式没有"首 token"概念（一次性拿到完整回复）：
+            # 用总耗时近似，语义上等于"用户等了这么久才看到东西"。
+            self._record_llm_usage(reply, turn, first_token_ms=int(reply.duration_ms))
+            return reply
 
         think_buf: list[str] = []
         last_emit = 0.0
+        t_call = time.time()
+        first_token_ms: int | None = None
 
         async def on_delta(delta: Any) -> None:
-            nonlocal last_emit
+            nonlocal last_emit, first_token_ms
+            # ★ 首个增量到达的时刻 = 首 token 延迟（TTFT）。
+            #   reasoning 也算：推理模型的第一个字就是思考内容，
+            #   用户确实是这时候开始在界面上看到东西的。
+            if first_token_ms is None:
+                first_token_ms = int((time.time() - t_call) * 1000)
             if delta.kind == "reasoning":
                 think_buf.append(delta.text)
                 now = time.time()
@@ -2256,7 +2350,48 @@ class AgentCore:
         #   配置里的主模型名已经不是真相，任务快照必须显示真正用的那个。
         if getattr(reply, "model", ""):
             self._state.model = reply.model
+        self._record_llm_usage(reply, turn, first_token_ms=first_token_ms)
         return reply
+
+    def _record_llm_usage(self, reply: Any, turn: int, *, first_token_ms: int | None = None) -> None:
+        """
+        累计一次模型调用的 token，并发 `llm.usage` 事件（对比表 #4）。
+
+        ★ 为什么放在 Core 而不是 adapter 里发事件：
+          adapter 只负责"拿到回复"，它不该知道事件总线（模型层不能反向依赖 agent 层）。
+          这里同时拿得到 reply 和 state，是唯一合适的位置。
+        ★ 为什么 token 全为 0 时不发事件：
+          有些 OpenAI 兼容端点不返回 usage。发一条全 0 的记录会让人误以为
+          "这次真的没花 token"，比不发更误导 —— 宁可不显示，也不显示假数字。
+        """
+        prompt = int(getattr(reply, "prompt_tokens", 0) or 0)
+        completion = int(getattr(reply, "completion_tokens", 0) or 0)
+        reasoning = int(getattr(reply, "reasoning_tokens", 0) or 0)
+        if prompt <= 0 and completion <= 0:
+            return
+        state = self._state
+        if state is None:
+            return
+
+        state.llm_calls += 1
+        state.prompt_tokens += prompt
+        state.completion_tokens += completion
+        state.reasoning_tokens += reasoning
+
+        self.bus.llm_usage(
+            prompt, completion, reasoning,
+            model=str(getattr(reply, "model", "") or ""),
+            duration_ms=int(getattr(reply, "duration_ms", 0) or 0),
+            turn=turn,
+            total_prompt=state.prompt_tokens,
+            total_completion=state.completion_tokens,
+            total_reasoning=state.reasoning_tokens,
+            total_calls=state.llm_calls,
+            # 首 token 缺失（模型直接给 tool_calls、没有正文/思考）时用总耗时兜底，
+            # 不要写 0 —— 0 会被读成"瞬间响应"，是假数据。
+            first_token_ms=int(first_token_ms) if first_token_ms is not None
+            else int(getattr(reply, "duration_ms", 0) or 0),
+        )
 
     def _fail_on_model_error(self, state: TaskState, exc: ModelError) -> None:
         """模型层失败的处理：发 ERROR 事件 + 收尾。"""

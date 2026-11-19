@@ -156,14 +156,32 @@ class GraphTaskEngine:
         if violation is not None:
             kind, limit, used = violation
             verdict = core._budget_verdict(st, kind)
-            if kind == "turns" and verdict["extend"] and not st.budget_extended:
-                st.budget_extended = True
-                extra = core.config.budget_extend_turns
-                st.budgets.max_turns += extra
-                st.budget_reason = f"{verdict['label']}（续期 +{extra} 轮）"
-                core.bus.error("budget_extended",
-                               f"预算续期 +{extra} 轮：{verdict['label']}",
-                               fatal=False, turn=st.turn)
+            # ★ 轮次续期与秒数续期共用 budget_extended：整个任务生命周期
+            #   只续一次，续的是轮次还是秒数由 kind 决定。与 legacy _loop 同源。
+            extended = False
+            if not st.budget_extended:
+                if kind == "turns" and verdict["extend"]:
+                    st.budget_extended = True
+                    extra = core.config.budget_extend_turns
+                    st.budgets.max_turns += extra
+                    st.budget_reason = f"{verdict['label']}（续期 +{extra} 轮）"
+                    core.bus.error("budget_extended",
+                                   f"预算续期 +{extra} 轮：{verdict['label']}",
+                                   fatal=False, turn=st.turn)
+                    extended = True
+                elif kind == "seconds" and verdict["extend_seconds"]:
+                    # ★ 秒数续期（第七批，新增）：墙钟预算此前无续期，一过上限
+                    #   直接砍。补一个同构的有界续期：仍在推进、无循环/冲突就
+                    #   续一次 +budget_extend_seconds。与轮次续期共用标志，只续一次。
+                    st.budget_extended = True
+                    extra = core.config.budget_extend_seconds
+                    st.budgets.max_seconds += extra
+                    st.budget_reason = f"{verdict['label']}（秒数续期 +{extra}s）"
+                    core.bus.error("budget_extended",
+                                   f"秒数预算续期 +{extra:.0f}s：{verdict['label']}",
+                                   fatal=False, turn=st.turn)
+                    extended = True
+            if extended:
                 return {"phase": "budget", "route": "act",
                         "note": verdict["label"], "turns": st.turn}
             st.budget_reason = verdict["label"] if kind == "turns" else f"budget_{kind}"

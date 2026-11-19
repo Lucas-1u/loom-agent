@@ -1,6 +1,8 @@
+import { useState } from "react";
 import type { Session, WorkspaceGroup } from "../features/session/types";
 import { displayTitle, relativeTime } from "../features/session/selectors";
 import { UNSET_WORKSPACE_KEY } from "../features/session/workspace";
+import { DeleteSessionDialog } from "./DeleteSessionDialog";
 
 /**
  * 左侧历史会话栏（按工作目录分组）
@@ -19,6 +21,7 @@ export function SessionSidebar({
   onToggleGroup,
   onSelectSession,
   onNewSession,
+  onSessionDeleted,
   runningSessionIds,
   busy,
 }: {
@@ -28,9 +31,14 @@ export function SessionSidebar({
   onToggleGroup: (key: string) => void;
   onSelectSession: (s: Session) => void;
   onNewSession: () => void;
+  /** 会话删除成功后的回调（由 App 负责把 state 里的这条摘掉并切换选中） */
+  onSessionDeleted: (sessionId: string) => void;
   runningSessionIds: Set<string>;
   busy: boolean;
 }) {
+  /** 正在确认删除的会话；null = 没打开弹窗 */
+  const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
+
   return (
     <aside className="flex w-[264px] shrink-0 flex-col border-r border-ink-700 bg-ink-900">
       {/* 头部：新建会话 */}
@@ -99,40 +107,54 @@ export function SessionSidebar({
                     const running = runningSessionIds.has(s.session_id);
 
                     return (
-                      <button
-                        key={s.session_id}
-                        type="button"
-                        disabled={busy && !active}
-                        onClick={() => onSelectSession(s)}
-                        title={`${displayTitle(s)}\n${s.workspace_path || "（未设置工作区）"}`}
-                        className={[
-                          "mb-0.5 flex w-full items-start gap-1.5 rounded px-2 py-1.5 text-left transition-colors",
-                          active
-                            ? "bg-tone-blue/12 text-slate-100"
-                            : "text-slate-400 hover:bg-ink-850 hover:text-slate-200",
-                          busy && !active ? "cursor-not-allowed opacity-50" : "",
-                        ].join(" ")}
-                      >
-                        <span
-                          className={`mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full ${
-                            running
-                              ? "loom-blink bg-tone-amber"
-                              : active
-                                ? "bg-tone-blue"
-                                : "bg-slate-700"
-                          }`}
-                        />
+                      // ★ 外层用 div 而不是继续用 button：删除按钮不能嵌在 button 里
+                      //   （HTML 不允许嵌套交互元素，点击行为会互相吞掉）。
+                      //   删除按钮靠 group-hover 显示，不占常驻空间。
+                      <div key={s.session_id} className="group relative mb-0.5">
+                        <button
+                          type="button"
+                          disabled={busy && !active}
+                          onClick={() => onSelectSession(s)}
+                          title={`${displayTitle(s)}\n${s.workspace_path || "（未设置工作区）"}`}
+                          className={[
+                            "flex w-full items-start gap-1.5 rounded px-2 py-1.5 text-left transition-colors",
+                            active
+                              ? "bg-tone-blue/12 text-slate-100"
+                              : "text-slate-400 hover:bg-ink-850 hover:text-slate-200",
+                            busy && !active ? "cursor-not-allowed opacity-50" : "",
+                          ].join(" ")}
+                        >
+                          <span
+                            className={`mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full ${
+                              running
+                                ? "loom-blink bg-tone-amber"
+                                : active
+                                  ? "bg-tone-blue"
+                                  : "bg-slate-700"
+                            }`}
+                          />
 
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-[12px] leading-[1.4]">
-                            {displayTitle(s)}
+                          <span className="min-w-0 flex-1">
+                            <span className="block truncate pr-4 text-[12px] leading-[1.4]">
+                              {displayTitle(s)}
+                            </span>
+                            <span className="block text-[10px] text-slate-600">
+                              {running ? "运行中 · " : ""}
+                              {relativeTime(s.updated_at)}
+                            </span>
                           </span>
-                          <span className="block text-[10px] text-slate-600">
-                            {running ? "运行中 · " : ""}
-                            {relativeTime(s.updated_at)}
-                          </span>
-                        </span>
-                      </button>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setPendingDelete(s)}
+                          title="删除会话"
+                          aria-label={`删除会话 ${displayTitle(s)}`}
+                          className="absolute right-1 top-1 rounded px-1 text-[13px] leading-none text-slate-600 opacity-0 transition-all hover:text-tone-red focus-visible:opacity-100 group-hover:opacity-100"
+                        >
+                          ×
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -149,6 +171,18 @@ export function SessionSidebar({
           <span>Phase 2</span>
         </div>
       </div>
+
+      {/* 删除确认弹窗（fixed 定位，不受侧栏滚动影响） */}
+      {pendingDelete && (
+        <DeleteSessionDialog
+          session={pendingDelete}
+          onCancel={() => setPendingDelete(null)}
+          onDeleted={(id) => {
+            setPendingDelete(null);
+            onSessionDeleted(id);
+          }}
+        />
+      )}
     </aside>
   );
 }

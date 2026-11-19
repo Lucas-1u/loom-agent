@@ -1,6 +1,14 @@
 import type { ConnectionState, ViewMode } from "../types/chat";
 import type { PermissionModeData, SessionMode } from "../types/events";
+import type { TokenUsage } from "../features/session/store";
 import { ViewSwitcher } from "./ViewSwitcher";
+
+/** token 数的人类可读格式：≥1M 用 M，≥1000 用 k，否则原样 */
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
 
 /**
  * 已知但**未接入**的模型（仅作占位展示）。
@@ -28,6 +36,7 @@ export function AppHeader({
   demo,
   sessionMode,
   taskMode,
+  usage,
 }: {
   viewMode: ViewMode;
   onViewChange: (m: ViewMode) => void;
@@ -38,6 +47,8 @@ export function AppHeader({
   sessionMode: SessionMode;
   /** 当前选中任务**实际**生效的模式（来自 permission.mode 事件）；null = 尚未收到 */
   taskMode: PermissionModeData | null;
+  /** 当前任务的 token 累计（来自 llm.usage 事件）；null = 这个任务还没有用量数据 */
+  usage: TokenUsage | null;
 }) {
   // 真实模型可能为空（演示 / 未连接），此时不伪造一个模型名
   const active = (model || "").trim();
@@ -61,8 +72,9 @@ export function AppHeader({
         <ViewSwitcher mode={viewMode} onChange={onViewChange} />
       </div>
 
-      {/* ---- 右：权限模式 / 模型 / 状态 ---- */}
+      {/* ---- 右：token / 权限模式 / 模型 / 状态 ---- */}
       <div className="flex shrink-0 items-center gap-3">
+        <UsageBadge usage={usage} />
         <PermissionBadge sessionMode={sessionMode} taskMode={taskMode} demo={demo} />
         <label className="flex items-center gap-1.5 text-[11px] text-slate-500">
           <span className="hidden xl:inline">模型</span>
@@ -89,6 +101,42 @@ export function AppHeader({
         <StatusBadge demo={demo} connection={connection} />
       </div>
     </header>
+  );
+}
+
+/**
+ * 当前任务的 token 累计（对比表 #4）。
+ *
+ * ★ 只显示「入 / 出」两个数，详情放 title 里：
+ *   顶部空间有限，而 reasoning、调用次数属于"想看才看"的信息。
+ * ★ 拿不到数据时**不渲染**，绝不显示 0 ——
+ *   端点不返回 usage 时，0 会被误读成"这个任务没花 token"，实际是"没有数据"。
+ * ★ 窄屏（<sm）隐藏：小窗口顶部本来就挤，token 不是第一优先级。
+ */
+function UsageBadge({ usage }: { usage: TokenUsage | null }) {
+  if (!usage) return null;
+
+  const total = usage.prompt + usage.completion;
+  const lines = [
+    `模型调用 ${usage.calls} 次`,
+    `输入 ${usage.prompt.toLocaleString()} tokens`,
+    `输出 ${usage.completion.toLocaleString()} tokens`,
+  ];
+  if (usage.reasoning > 0) lines.push(`其中思考 ${usage.reasoning.toLocaleString()} tokens`);
+  lines.push(`合计 ${total.toLocaleString()}`, "", "来自 provider 返回的 usage（精确值，不是字符估算）");
+
+  return (
+    <span
+      title={lines.join("\n")}
+      className="hidden items-center gap-1 rounded-md border border-ink-700 bg-ink-850 px-2 py-1 text-[11px] text-slate-500 sm:flex"
+    >
+      <span aria-hidden="true">∑</span>
+      <span className="font-mono text-slate-200">{fmtTokens(usage.prompt)}</span>
+      <span>入</span>
+      <span className="text-slate-600">/</span>
+      <span className="font-mono text-slate-200">{fmtTokens(usage.completion)}</span>
+      <span>出</span>
+    </span>
   );
 }
 

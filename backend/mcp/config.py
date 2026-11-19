@@ -31,6 +31,23 @@ MCP Server 配置（M4.1）。
    工具自己的描述/schema 是**不可信输入**，不能用来降低风险等级。
 4. **配置无效就拒绝启动**：缺 id / 缺 command / args 不是字符串列表 / id 非法，
    一律在加载阶段报错，错误信息里不回显 env 的值（只回显键名）。
+
+★ 关于 command 能不能只写名字（`agent-desktop` 这种）
+--------------------------------
+**能写，但必须在 PATH 或 `LOOM_MCP_EXTRA_PATH` 里找得到真身。**
+MCP 子进程是 `CreateProcess` 直起的（不过 shell），这意味着：
+  · 它不会补 `PATHEXT`（写 `xxx` 不会自动试 `xxx.exe`）；
+  · 它用的是**当前进程**的 PATH —— 服务由 .bat / Tauri / 桌面快捷方式拉起时，
+    这个 PATH 常常比你的交互式 shell 短（实测：shell 里有 node 目录，服务里没有）。
+两者的组合就是那个很难查的现象：**同一条命令 shell 里能跑、服务里报
+`FileNotFoundError [WinError 2]`**，而且错误里不告诉你它在找什么。
+所以这里加一层显式解析，把"找没找到、解析到哪"写进连接状态里。
+
+★ 为什么解析到 `.cmd`/`.bat` 直接拒绝，而不套一层 `cmd /c`
+--------------------------------
+`cmd /c` 会把 shell 语义（`&` `|` `>` 变量展开）重新引进来，破掉上面第 1 条硬规则。
+npm 全局包的 `.cmd` 只是个三行包装，真身通常是
+`node_modules/<pkg>/bin/<pkg>-win32-x64.exe`；请直接把 command 指向它。
 """
 
 from __future__ import annotations
@@ -38,6 +55,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -75,6 +93,9 @@ class McpServerConfig:
     # 细粒度授权：这些工具当只读（仅当 trust=prompt 时生效）
     read_tools: tuple[str, ...] = ()
     timeout_s: float = 30.0
+    # 命令解析的诊断信息（空 = 没问题）。连接失败时拼进 error，
+    # 让"找不到命令"这类问题一眼能看出是配置还是环境。
+    resolve_note: str = ""
 
     def risk_for(self, tool_name: str):
         """按配置决定工具的风险等级（默认 WRITE = 需要审批）。"""
@@ -118,6 +139,71 @@ class McpConfig:
         return cfg
 
 
+def _extra_search_dirs() -> list[str]:
+    """`LOOM_MCP_EXTRA_PATH` 里额外要搜的目录（os.pathsep 分隔，空项忽略）。"""
+    raw = os.environ.get("LOOM_MCP_EXTRA_PATH", "")
+    return [p for p in raw.split(os.pathsep) if p.strip()]
+
+
+def _looks_like_path(command: str) -> bool:
+    """带目录分隔符就当路径看（含 ./x 与 C:/x 两种写法）。"""
+    seps = [os.sep]
+    if os.altsep:
+        seps.append(os.altsep)
+    seps.append("/")          # Windows 上 subprocess 也认正斜杠，这里一并当路径
+    return any(s in command for s in seps)
+
+
+def _reject_script_wrapper(requested: str, found: str) -> tuple[str, str]:
+    """
+    `.cmd` / `.bat` 不能直接 CreateProcess —— 与其让它失败成 WinError 2，
+    不如在这里说清楚该改什么。（只在 Windows 上判，别的平台没有这个后缀约定。）
+    """
+    if os.name == "nt" and found.lower().endswith((".cmd", ".bat")):
+        return requested, (
+            f"命令 {requested!r} 指向 {found}，但 .cmd/.bat 必须经 shell 才能执行，"
+            f"而 MCP 子进程刻意不经过 shell（模块 docstring 第 1 条硬规则）。"
+            f"请改成该脚本内部真正的 .exe —— npm 包一般在 "
+            f"node_modules/<包名>/bin/ 下有个原生可执行文件。"
+        )
+    return found, ""
+
+
+def resolve_command(command: str) -> tuple[str, str]:
+    """
+    把配置里的 command 解析成**可直接 CreateProcess 的路径**。
+
+    返回 `(要执行的命令, 诊断信息)`；诊断信息为空表示一切正常。
+    ★ 不抛异常：解析失败也要让 Server 进"可诊断的 failed"，而不是拖垮整个配置文件。
+
+    顺序：显式路径（只查存在性）→ 当前 PATH → `LOOM_MCP_EXTRA_PATH`。
+    `.cmd`/`.bat` 一律拒绝（原因见模块 docstring）。
+    """
+    if _looks_like_path(command):
+        if not os.path.isfile(command):
+            return command, (
+                f"command 指向的文件不存在：{command}。"
+                f"（子进程不过 shell，不会做任何路径/后缀补全，必须写真实存在的绝对路径）"
+            )
+        return _reject_script_wrapper(command, command)
+
+    found = shutil.which(command)
+    if found is None:
+        for d in _extra_search_dirs():
+            found = shutil.which(command, path=d)
+            if found:
+                break
+    if found is None:
+        extra = _extra_search_dirs()
+        where = f"PATH 与 LOOM_MCP_EXTRA_PATH（{len(extra)} 个目录）" if extra else "当前 PATH"
+        return command, (
+            f"在{where}里都找不到命令 {command!r}。"
+            f"★ 注意：服务进程的 PATH 常常比你的 shell 短（.bat / Tauri 拉起时尤其明显）。"
+            f"请把 command 改成绝对路径，或把该命令所在目录加进 LOOM_MCP_EXTRA_PATH。"
+        )
+    return _reject_script_wrapper(command, found)
+
+
 def load_servers(path: str) -> list[McpServerConfig]:
     """读配置文件；任何结构问题都抛 McpConfigError（不回显 env 值）。"""
     p = Path(path)
@@ -153,6 +239,8 @@ def load_servers(path: str) -> list[McpServerConfig]:
             raise McpConfigError(
                 f"servers[{sid}] 的 command 含 shell 控制符；请把参数放进 args，不要拼命令行"
             )
+        # 解析成可直接执行的路径（失败不抛，记进 resolve_note 供连接失败时展示）
+        resolved_command, resolve_note = resolve_command(command)
 
         args = item.get("args", [])
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
@@ -184,7 +272,7 @@ def load_servers(path: str) -> list[McpServerConfig]:
 
         out.append(McpServerConfig(
             server_id=sid,
-            command=command,
+            command=resolved_command,
             args=list(args),
             env=clean_env,
             cwd=cwd,
@@ -192,6 +280,7 @@ def load_servers(path: str) -> list[McpServerConfig]:
             trust=trust,
             read_tools=tuple(read_tools),
             timeout_s=float(item.get("timeout_s") or 0) or 0.0,
+            resolve_note=resolve_note,
         ))
     return out
 

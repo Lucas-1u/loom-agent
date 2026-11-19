@@ -65,7 +65,10 @@ IDEM_MAX_ROWS = 1000
 
 # M5：tasks 增加 parent_task_id（子任务指向父任务；根任务为 NULL）
 # v3：新增 task_events（事件流落盘，#49）
-SCHEMA_VERSION = 3
+# v4：新增 task_projections（会话投影，#51）——从事件流派生的可重建查询表
+# v5：投影表补 token 用量列（对比表 #4）——来自 llm.usage 事件
+# v6：投影表补墙钟分解列（对比表 #52）——llm_ms / tool_ms / first_token_ms
+SCHEMA_VERSION = 6
 
 # 导出文件格式标识（改结构就换它，导入端据此拒绝旧文件）
 EXPORT_FORMAT = "loom.task.v1"
@@ -108,6 +111,64 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 CREATE INDEX IF NOT EXISTS idx_task_events_id ON task_events(id);
 """
+
+# --------------------------------------------------------------------------- #
+# 会话投影建表语句（v4，#51）
+# --------------------------------------------------------------------------- #
+# ★ 投影 ≠ 事实档案（#49 的 task_events 才是事实）：
+#   投影是**从事实派生**的查询表，删掉它随时能从 task_events 全量重放重建，
+#   重建后逐行一致 —— 这是验收标准，也是"投影"和"快照"的本质区别。
+#
+# ★ 为什么要投影：
+#   列表页/统计要频繁按 status、tool_call 数、是否有 final_answer 等条件筛任务。
+#   每次都从 task_events 全量重放推导太重；投影表把这些派生字段物化下来，
+#   查询走索引，O(1) 拿到。代价是多一张表 + 一个维护点，换来的是查询快。
+#
+# ★ 派生字段全部可从事件流推导，不存任何"只有当时才知道"的信息：
+#   - status / end_reason / result：task.end 事件（data.status / data.reason / data.answer）
+#   - tool_call_count / tool_result_count：tool.call / tool.result 事件计数
+#   - has_final_answer / final_answer_len：final_answer 事件
+#   - has_error / error_count：error 事件
+#   - turn_max / event_count：事件外壳的 turn / 总数
+#   - first_ts / last_ts：事件时间跨度
+#   - budget_exceeded：budget.exceeded 是否出现过
+#
+# ★ rebuilt_at 是元数据（记录上次重建时间），**不参与一致性验收**：
+#   两次重建的 rebuilt_at 必然不同，若把它算进"逐行一致"就永远过不了。
+PROJECTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS task_projections (
+  task_id            TEXT PRIMARY KEY,
+  status             TEXT NOT NULL DEFAULT '',
+  end_reason         TEXT NOT NULL DEFAULT '',
+  result             TEXT NOT NULL DEFAULT '',
+  tool_call_count    INTEGER NOT NULL DEFAULT 0,
+  tool_result_count  INTEGER NOT NULL DEFAULT 0,
+  has_final_answer   INTEGER NOT NULL DEFAULT 0,
+  final_answer_len   INTEGER NOT NULL DEFAULT 0,
+  has_error          INTEGER NOT NULL DEFAULT 0,
+  error_count        INTEGER NOT NULL DEFAULT 0,
+  budget_exceeded    INTEGER NOT NULL DEFAULT 0,
+  turn_max           INTEGER NOT NULL DEFAULT 0,
+  event_count        INTEGER NOT NULL DEFAULT 0,
+  -- v5（对比表 #4）：token 用量。来自 llm.usage 事件，provider 返回的精确值。
+  -- ★ 不存"估算值"：估算和精确混在一列里，就再也分不清哪个能信了。
+  prompt_tokens      INTEGER NOT NULL DEFAULT 0,
+  completion_tokens  INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
+  llm_calls          INTEGER NOT NULL DEFAULT 0,
+  -- v6（对比表 #52）：墙钟时间分解。任务"慢"到底慢在等模型还是跑工具，
+  -- 只能靠这两列回答；单看任务总时长会把两种完全不同的瓶颈混成一个数。
+  llm_ms             INTEGER NOT NULL DEFAULT 0,
+  tool_ms            INTEGER NOT NULL DEFAULT 0,
+  first_token_ms     INTEGER NOT NULL DEFAULT 0,
+  first_ts           REAL NOT NULL DEFAULT 0,
+  last_ts            REAL NOT NULL DEFAULT 0,
+  rebuilt_at         REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_projections_status
+  ON task_projections(status);
+"""
+
 
 
 class StoreError(RuntimeError):
@@ -341,6 +402,8 @@ class TaskStore:
         ★ 顺带清理孤儿事件（任务行已经没了的事件）——
           `sessions` 删除是 ON DELETE CASCADE，tasks 会跟着删，
           但 task_events 没有外键（跨表级联会让写入变慢），所以会留下孤儿。
+        ★ 删事件时**同步删投影行**：投影的契约是"可从事实重建"，
+          事实被删了，留着投影行就是假数据 —— 删事件必须删投影。
         """
         with self._tx() as conn:
             cur = conn.execute(
@@ -357,10 +420,315 @@ class TaskStore:
             )
             if cur2.rowcount and cur2.rowcount > 0:
                 deleted += cur2.rowcount
+            # 投影表同步清理：被删事件的任务，其投影行也必须删
+            conn.execute(
+                "DELETE FROM task_projections"
+                " WHERE task_id NOT IN (SELECT task_id FROM tasks)"
+            )
+            conn.execute(
+                "DELETE FROM task_projections"
+                " WHERE task_id IN (SELECT task_id FROM tasks"
+                "   WHERE created_at < ? AND status IN ('done', 'aborted', 'failed'))",
+                (float(before_ts),),
+            )
         return deleted
 
     async def prune_events(self, before_ts: float) -> int:
         return await asyncio.to_thread(self.prune_events_sync, before_ts)
+
+    # ------------------------------------------------------------------ #
+    # 会话投影（#51）：从 task_events 派生的可重建查询表
+    # ------------------------------------------------------------------ #
+    # ★ 设计原则：投影行**不存任何事实之外的东西**。
+    #   每一列都能从 task_events 全量重放推导出来 —— 删掉整张表，
+    #   调 rebuild_projections_sync() 就能逐行重建回来（验收标准）。
+    #   rebuilt_at 是元数据，不参与一致性验收（两次重建必然不同）。
+    def _derive_projection(
+        self, task_id: str, events: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """
+        从一条任务的事件流推导投影行。
+
+        纯函数：只读 events，不碰数据库。这是"可重建"的根基 ——
+        重建 = 重新调用本方法，输入相同则输出逐字段一致。
+        """
+        p: dict[str, Any] = {
+            "task_id": task_id,
+            "status": "",
+            "end_reason": "",
+            "result": "",
+            "tool_call_count": 0,
+            "tool_result_count": 0,
+            "has_final_answer": 0,
+            "final_answer_len": 0,
+            "has_error": 0,
+            "error_count": 0,
+            "budget_exceeded": 0,
+            "turn_max": 0,
+            "event_count": len(events),
+            # v5：token 用量（对比表 #4）。全为 0 表示"这个任务没有 usage 数据"，
+            # 不能当成"真的没花 token"——查的时候要能区分这两种。
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "llm_calls": 0,
+            # v6：墙钟分解（毫秒）。first_token_ms 记的是**每次调用的 TTFT 之和**，
+            # 平均值要除以 llm_calls —— 直接看总和没有意义。
+            "llm_ms": 0,
+            "tool_ms": 0,
+            "first_token_ms": 0,
+            "first_ts": 0.0,
+            "last_ts": 0.0,
+        }
+        if not events:
+            return p
+
+        first_ts = float("inf")
+        last_ts = 0.0
+        for ev in events:
+            ts = float(ev.get("ts") or 0.0)
+            if ts < first_ts:
+                first_ts = ts
+            if ts > last_ts:
+                last_ts = ts
+            turn = int(ev.get("turn") or 0)
+            if turn > p["turn_max"]:
+                p["turn_max"] = turn
+
+            type_ = ev.get("type") or ""
+            data = ev.get("data") or {}
+            if type_ == "task.end":
+                p["status"] = str(data.get("status") or "")
+                p["end_reason"] = str(data.get("reason") or "")
+                p["result"] = str(data.get("answer") or "")
+            elif type_ == "tool.call":
+                p["tool_call_count"] += 1
+            elif type_ == "tool.result":
+                p["tool_result_count"] += 1
+                # v6：工具墙钟。旧数据没有 duration_ms 就是 0（不猜）
+                try:
+                    p["tool_ms"] += int(data.get("duration_ms") or 0)
+                except (TypeError, ValueError):
+                    pass
+            elif type_ == "final_answer":
+                p["has_final_answer"] = 1
+                p["final_answer_len"] = len(str(data.get("text") or ""))
+            elif type_ == "error":
+                p["has_error"] = 1
+                p["error_count"] += 1
+            elif type_ == "budget.exceeded":
+                p["budget_exceeded"] = 1
+            elif type_ == "llm.usage":
+                # 对比表 #4：累计一次模型调用的用量。
+                # 字段转换用 try 兜住 —— 导入外部任务时 data 可能不是纯数字，
+                # 不能因为一条脏数据就让整个投影重建失败。
+                p["llm_calls"] += 1
+                for _k in ("prompt_tokens", "completion_tokens", "reasoning_tokens"):
+                    try:
+                        p[_k] += int(data.get(_k) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                # v6：模型墙钟 + 首 token 延迟（累加，平均要除 llm_calls）
+                for _k in ("duration_ms", "first_token_ms"):
+                    try:
+                        p["llm_ms" if _k == "duration_ms" else "first_token_ms"] += int(
+                            data.get(_k) or 0
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+        p["first_ts"] = first_ts if first_ts != float("inf") else 0.0
+        p["last_ts"] = last_ts
+        return p
+
+    def upsert_projection_sync(self, p: dict[str, Any]) -> None:
+        """
+        写入/更新一条投影行。
+
+        ★ 用 `INSERT ... ON CONFLICT DO UPDATE`：重建时重复写同一 task_id
+          是幂等的，不会因为"已存在"而报错，也不会残留旧列。
+        """
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO task_projections
+                  (task_id, status, end_reason, result, tool_call_count,
+                   tool_result_count, has_final_answer, final_answer_len,
+                   has_error, error_count, budget_exceeded, turn_max,
+                   event_count, prompt_tokens, completion_tokens,
+                   reasoning_tokens, llm_calls, llm_ms, tool_ms, first_token_ms,
+                   first_ts, last_ts, rebuilt_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                  status            = excluded.status,
+                  end_reason        = excluded.end_reason,
+                  result            = excluded.result,
+                  tool_call_count   = excluded.tool_call_count,
+                  tool_result_count = excluded.tool_result_count,
+                  has_final_answer  = excluded.has_final_answer,
+                  final_answer_len  = excluded.final_answer_len,
+                  has_error         = excluded.has_error,
+                  error_count       = excluded.error_count,
+                  budget_exceeded   = excluded.budget_exceeded,
+                  turn_max          = excluded.turn_max,
+                  event_count       = excluded.event_count,
+                  prompt_tokens     = excluded.prompt_tokens,
+                  completion_tokens = excluded.completion_tokens,
+                  reasoning_tokens  = excluded.reasoning_tokens,
+                  llm_calls         = excluded.llm_calls,
+                  llm_ms            = excluded.llm_ms,
+                  tool_ms           = excluded.tool_ms,
+                  first_token_ms    = excluded.first_token_ms,
+                  first_ts          = excluded.first_ts,
+                  last_ts           = excluded.last_ts,
+                  rebuilt_at        = excluded.rebuilt_at
+                """,
+                (
+                    p["task_id"],
+                    p.get("status", ""),
+                    p.get("end_reason", ""),
+                    p.get("result", ""),
+                    int(p.get("tool_call_count", 0)),
+                    int(p.get("tool_result_count", 0)),
+                    int(p.get("has_final_answer", 0)),
+                    int(p.get("final_answer_len", 0)),
+                    int(p.get("has_error", 0)),
+                    int(p.get("error_count", 0)),
+                    int(p.get("budget_exceeded", 0)),
+                    int(p.get("turn_max", 0)),
+                    int(p.get("event_count", 0)),
+                    int(p.get("prompt_tokens", 0)),
+                    int(p.get("completion_tokens", 0)),
+                    int(p.get("reasoning_tokens", 0)),
+                    int(p.get("llm_calls", 0)),
+                    int(p.get("llm_ms", 0)),
+                    int(p.get("tool_ms", 0)),
+                    int(p.get("first_token_ms", 0)),
+                    float(p.get("first_ts", 0.0)),
+                    float(p.get("last_ts", 0.0)),
+                    float(p.get("rebuilt_at", 0.0)),
+                ),
+            )
+
+    async def upsert_projection(self, p: dict[str, Any]) -> None:
+        await asyncio.to_thread(self.upsert_projection_sync, p)
+
+    def rebuild_projection_sync(self, task_id: str, *, rebuilt_at: float | None = None) -> dict[str, Any] | None:
+        """
+        重建单个任务的投影行：从 task_events 全量重放 → 推导 → 写入。
+
+        返回重建出来的投影行（dict），任务不存在或没有事件时返回 None。
+        这是"投影可重建"的核心实现，验收测试直接调它。
+        """
+        events = self.load_events_sync(task_id)
+        if not events:
+            return None
+        p = self._derive_projection(task_id, events)
+        p["rebuilt_at"] = rebuilt_at if rebuilt_at is not None else time.time()
+        self.upsert_projection_sync(p)
+        return p
+
+    async def rebuild_projection(self, task_id: str, **kw: Any) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self.rebuild_projection_sync, task_id, **kw)
+
+    def rebuild_projections_sync(self, *, rebuilt_at: float | None = None) -> int:
+        """
+        全量重建所有任务的投影表。
+
+        遍历 tasks 表里每个任务，从它的 task_events 重放推导，逐行写入。
+        返回重建的任务数。启动时调一次，保证投影表与事实同步；
+        也是验收测试"删掉 → 重建 → 逐行一致"的标准入口。
+        """
+        with self._tx() as conn:
+            task_ids = [
+                r["task_id"]
+                for r in conn.execute("SELECT task_id FROM tasks").fetchall()
+            ]
+        now = rebuilt_at if rebuilt_at is not None else time.time()
+        count = 0
+        for tid in task_ids:
+            p = self.rebuild_projection_sync(tid, rebuilt_at=now)
+            if p is not None:
+                count += 1
+        return count
+
+    async def rebuild_projections(self, **kw: Any) -> int:
+        return await asyncio.to_thread(self.rebuild_projections_sync, **kw)
+
+    def get_projection_sync(self, task_id: str) -> dict[str, Any] | None:
+        """读单条投影行。"""
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_projections WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    async def get_projection(self, task_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self.get_projection_sync, task_id)
+
+    def list_projections_sync(
+        self,
+        *,
+        status: str = "",
+        session_id: str = "",
+        has_final_answer: int | None = None,
+        order: str = "desc",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        按条件查投影表（列表/统计接口用）。
+
+        ★ 支持按 status / session_id / 是否有 final_answer 过滤，
+          这是投影存在的意义 —— 不用扫事件流就能筛任务。
+        """
+        sql = "SELECT * FROM task_projections"
+        where: list[str] = []
+        args: list[Any] = []
+        if status:
+            where.append("status = ?")
+            args.append(status)
+        if has_final_answer is not None:
+            where.append("has_final_answer = ?")
+            args.append(int(has_final_answer))
+        if session_id:
+            where.append("task_id IN (SELECT task_id FROM tasks WHERE session_id = ?)")
+            args.append(session_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        direction = "DESC" if str(order).lower() == "desc" else "ASC"
+        sql += f" ORDER BY last_ts {direction}"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        if offset:
+            sql += " OFFSET ?"
+            args.append(int(offset))
+        with self._tx() as conn:
+            rows = conn.execute(sql, tuple(args)).fetchall()
+        return [dict(r) for r in rows]
+
+    async def list_projections(self, **kw: Any) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self.list_projections_sync, **kw)
+
+    def projections_count_sync(self) -> int:
+        with self._tx() as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM task_projections").fetchone()
+        return int(row["n"]) if row else 0
+
+    async def projections_count(self) -> int:
+        return await asyncio.to_thread(self.projections_count_sync)
+
+    def clear_projections_sync(self) -> int:
+        """清空投影表（验收测试用：删掉 → 重建 → 逐行一致）。返回删除行数。"""
+        with self._tx() as conn:
+            cur = conn.execute("DELETE FROM task_projections")
+            n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        return n
+
+    async def clear_projections(self) -> int:
+        return await asyncio.to_thread(self.clear_projections_sync)
+
 
     # ------------------------------------------------------------------ #
     # 导出 / 导入（一个任务的全套材料：行 + 快照 + 历史 + 事件）
@@ -511,6 +879,10 @@ class TaskStore:
                     ],
                 )
 
+        # 事务已提交，事件已落盘 —— 现在重建该任务的投影行
+        # （投影是派生的，导入事件后必须同步重建，否则查询不到）
+        self.rebuild_projection_sync(target_id)
+
         return {
             "task_id": target_id,
             "source_task_id": str(src["task_id"]),
@@ -605,6 +977,8 @@ class TaskStore:
                 #   会在 `EventArchive.load_seq_cache_sync()` 直接
                 #   `sqlite3.OperationalError: no such table: task_events`。
                 conn.executescript(EVENTS_DDL)
+                # v4：投影表（#51）—— 新库走这条路径，必须一并建好
+                conn.executescript(PROJECTIONS_DDL)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
 
@@ -658,6 +1032,36 @@ class TaskStore:
             # v3 才加的表；老库可能停在 v2，迁移分支只在"当时没跑过"时生效，
             # 所以这里也无条件补一次（成本为零，`IF NOT EXISTS`）。
             conn.executescript(EVENTS_DDL)
+
+            # ---- 补齐投影表（任何版本都跑一次）--------------------------------
+            # v4 才加的表（#51）；老库停在 v3 时上面两个迁移分支都不触发，
+            # 必须在这里无条件补一次，否则启动后投影查询直接 "no such table"。
+            conn.executescript(PROJECTIONS_DDL)
+
+            # ---- v5 迁移：投影表补 token 列（对比表 #4）-----------------------
+            # ★ 用"缺列就补"而不是 `if ver < 5`：
+            #   ① `executescript(PROJECTIONS_DDL)` 用的是 `IF NOT EXISTS`，
+            #      表已存在时**不会**补新列 —— 老库必须走 ALTER；
+            #   ② 无条件判断天然幂等，也顺手能修好被手工改过结构的库。
+            proj_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(task_projections)").fetchall()
+            }
+            if proj_cols:
+                for _col, _ddl in (
+                    ("prompt_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                    ("completion_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                    ("reasoning_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                    ("llm_calls", "INTEGER NOT NULL DEFAULT 0"),
+                    ("llm_ms", "INTEGER NOT NULL DEFAULT 0"),
+                    ("tool_ms", "INTEGER NOT NULL DEFAULT 0"),
+                    ("first_token_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if _col not in proj_cols:
+                        conn.execute(
+                            f"ALTER TABLE task_projections ADD COLUMN {_col} {_ddl}"
+                        )
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     async def init(self) -> None:
         await asyncio.to_thread(self.init_sync)
@@ -864,6 +1268,50 @@ class TaskStore:
 
     async def list_tasks(self, session_id: str | None = None) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.list_tasks_sync, session_id)
+
+    def delete_session_sync(self, session_id: str) -> dict[str, int]:
+        """
+        删除一个会话及其**全部派生数据**（不碰工作区文件）。
+
+        ★ 为什么每张表都显式删，而不是只删 sessions 靠 CASCADE：
+          `tasks.session_id` 有 `ON DELETE CASCADE`，但 `task_events`、
+          `task_projections`、`task_history` **都没有外键**。
+          只删 sessions 会留下孤儿事件；更糟的是投影重建时会把已删的任务
+          重新"算"出来（投影的行是 task_id 驱动的，不看 tasks 是否存在）。
+        ★ 顺序从叶子到根：先删派生数据，再删任务，最后删会话。
+          中途失败也不会出现"会话没了但任务还挂着"的悬挂状态。
+        ★ 先 COUNT 再 DELETE：sqlite3 的 `rowcount` 对 DELETE 不一定可靠，
+          这里要的是**能报给用户的准确数字**。
+        """
+        with self._tx() as conn:
+            ids = [
+                r["task_id"]
+                for r in conn.execute(
+                    "SELECT task_id FROM tasks WHERE session_id = ?", (session_id,)
+                ).fetchall()
+            ]
+            counts = {"tasks": len(ids), "events": 0, "projections": 0, "history": 0}
+            if ids:
+                ph = ",".join("?" * len(ids))
+                args = tuple(ids)
+                for key, table in (
+                    ("events", "task_events"),
+                    ("projections", "task_projections"),
+                    ("history", "task_history"),
+                ):
+                    counts[key] = int(
+                        conn.execute(
+                            f"SELECT COUNT(*) AS n FROM {table} WHERE task_id IN ({ph})", args
+                        ).fetchone()["n"]
+                    )
+                    conn.execute(f"DELETE FROM {table} WHERE task_id IN ({ph})", args)
+            conn.execute("DELETE FROM tasks WHERE session_id = ?", (session_id,))
+            cur = conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            counts["sessions"] = int(cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0)
+        return counts
+
+    async def delete_session(self, session_id: str) -> dict[str, int]:
+        return await asyncio.to_thread(self.delete_session_sync, session_id)
 
     # ===================================================================== #
     # M5：父子任务

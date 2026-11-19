@@ -64,6 +64,7 @@ class EventType(str, Enum):
     # ---- 五阶段状态机的阶段标志 --------------------------------------------
     PLAN = "plan"                      # ★ PLAN 阶段：产出/更新计划
     THINKING = "thinking"              # 模型推理片段（含思维链 delta）
+    LLM_USAGE = "llm.usage"            # 一次模型调用的 token 用量（对比表 #4）
     ACT = "act"                        # ★ ACT 阶段：决定要调哪个工具（工具调用前的宣告）
     OBSERVE = "observe"                # ★ OBSERVE 阶段：工具结果已到手，准备喂回模型
 
@@ -342,6 +343,40 @@ class EventBus:
     def thinking(self, text: str, phase: str = "", turn: int = 0, done: bool = False) -> Event:
         return self.emit(
             Event.make(EventType.THINKING, {"text": text, "phase": phase, "done": done}, turn=turn)
+        )
+
+    def llm_usage(self, prompt_tokens: int, completion_tokens: int, reasoning_tokens: int,
+                  *, model: str = "", duration_ms: int = 0, turn: int = 0,
+                  total_prompt: int = 0, total_completion: int = 0,
+                  total_reasoning: int = 0, total_calls: int = 0,
+                  first_token_ms: int = 0) -> Event:
+        """
+        一次模型调用的 token 用量（对比表 #4）。
+
+        ★ 为什么单独发一条事件，而不是塞进 ACT：
+          投影表是"从事件流重建"的，token 必须能落到事件里才有得算。
+          塞进 ACT 会让"这一轮做了什么"的语义被数据字段污染，也不方便按调用聚合。
+        ★ 为什么同时带 total_*：单次用量和任务累计都得能看 ——
+          看单次能判断"这次上下文多大"，看累计才是"这个任务烧了多少"。
+          前端拿 total 直接覆盖即可，不用自己累加（少一处算错的机会）。
+        """
+        return self.emit(
+            Event.make(
+                EventType.LLM_USAGE,
+                {
+                    "prompt_tokens": int(prompt_tokens),
+                    "completion_tokens": int(completion_tokens),
+                    "reasoning_tokens": int(reasoning_tokens),
+                    "model": model,
+                    "duration_ms": int(duration_ms),
+                    "first_token_ms": int(first_token_ms),
+                    "total_prompt_tokens": int(total_prompt),
+                    "total_completion_tokens": int(total_completion),
+                    "total_reasoning_tokens": int(total_reasoning),
+                    "total_calls": int(total_calls),
+                },
+                turn=turn,
+            )
         )
 
     def act(self, intent: str, tool: str = "", turn: int = 0) -> Event:

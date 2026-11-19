@@ -106,6 +106,15 @@ class _Worker:
     async def start(self, startup_timeout: float) -> None:
         if self._task is not None:
             return
+        # ★ 配置阶段就知道命令跑不起来（找不到 / 指向 .cmd）——
+        #   不必真去 CreateProcess 撞 FileNotFoundError，也别白等 startup_timeout。
+        note = getattr(self.cfg, "resolve_note", "")
+        if note:
+            self.error = note
+            self.state = "failed"
+            self._ready.set()
+            log.warning("MCP Server %s 配置不可用：%s", self.server_id, note)
+            return
         self.state = "connecting"
         self._task = asyncio.create_task(self._run(), name=f"mcp-{self.server_id}")
         try:
@@ -161,7 +170,10 @@ class _Worker:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 任何失败都要落成"可诊断状态"
-            self.error = describe_exc(exc)
+            msg = describe_exc(exc)
+            if getattr(self.cfg, "resolve_note", ""):
+                msg = f"{msg} —— {self.cfg.resolve_note}"
+            self.error = msg
             self.state = "failed"
             log.warning("MCP Server %s 连接失败：%s", self.server_id, self.error)
         finally:

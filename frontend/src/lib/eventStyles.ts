@@ -51,6 +51,9 @@ export const EVENT_STYLES: Record<EventType, EventVisualStyle> = {
   "task.end":          { label: "任务结束", tone: "green",  icon: "■", emphasis: true },
   plan:                { label: "计划",     tone: "violet", icon: "◆", emphasis: true },
   thinking:            { label: "思考",     tone: "slate",  icon: "…" },
+  // 对比表 #4：一次模型调用的 token 用量。用 slate 保持低调 ——
+  // 它是元数据，不该跟工具调用、错误抢注意力。
+  "llm.usage":         { label: "用量",     tone: "slate",  icon: "∑" },
   act:                 { label: "决定行动", tone: "slate",  icon: "→" },
   observe:             { label: "观察",     tone: "slate",  icon: "◎" },
   "tool.call":         { label: "工具调用", tone: "cyan",   icon: "⚙" },

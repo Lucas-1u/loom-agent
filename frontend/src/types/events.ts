@@ -33,6 +33,7 @@ export const EVENT_TYPES = [
   "task.end",
   "plan",
   "thinking",
+  "llm.usage",
   "act",
   "observe",
   "tool.call",

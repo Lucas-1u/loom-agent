@@ -450,6 +450,23 @@ class OpenAICompatAdapter(ModelAdapter):
 
             try:
                 async for chunk in stream:
+                    # ★ usage 必须在判 choices **之前**取。
+                    #   它出现在收尾帧里，而那一帧的 choices 是空数组 ——
+                    #   旧代码 `if not chunk.choices: continue` 正好把它跳过了，
+                    #   这就是流式路径（默认走的路径）一直拿不到 token 的原因。
+                    _u = getattr(chunk, "usage", None)
+                    if _u is not None:
+                        # 推理 token 各家字段名不一，两级兜底（与非流式一致）
+                        _rt = getattr(_u, "reasoning_tokens", None)
+                        if _rt is None:
+                            _det = getattr(_u, "completion_tokens_details", None)
+                            _rt = getattr(_det, "reasoning_tokens", 0) if _det else 0
+                        yield StreamDelta("usage", usage={
+                            "prompt": _to_int(getattr(_u, "prompt_tokens", 0)),
+                            "completion": _to_int(getattr(_u, "completion_tokens", 0)),
+                            "reasoning": _to_int(_rt),
+                        })
+
                     if not getattr(chunk, "choices", None):
                         continue
                     delta = getattr(chunk.choices[0], "delta", None)

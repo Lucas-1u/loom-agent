@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -37,7 +38,7 @@ from ..agent.core import AgentConfig
 from ..models.adapter import ModelAdapter
 from ..tools.registry import ToolRegistry
 from .hub import EventHub
-from .runtime import TaskRuntime
+from .runtime import FORCE_CANCEL_GRACE_S, TaskRuntime
 from .store import TaskStore
 
 log = logging.getLogger("loom.server.scheduler")
@@ -407,6 +408,28 @@ class TaskScheduler:
                 self._running.discard(task_id)
             return
 
+        # ---- 预算：desktop 模式用专属预算 --------------------------------
+        # ★ 桌面控制是"截图→定位→点击→验证"的多轮往返，默认 300s 天然偏紧，
+        #   会被墙钟预算中途砍掉。用副本覆盖，**不直接改**共享的 self._config
+        #   （否则会污染其他模式的预算）。
+        # ★ 三个上限的默认值都是 0 = 不设上限（用户 2026-11-13 要求）。
+        #   真正兜底的刹车仍在：软熔断（同参重复）、连续错误、无进展终止。
+        mode = self._mode_of.get(task_id, "")
+        task_config = self._config
+        if mode == "desktop":
+            task_config = copy.copy(self._config)
+            task_config.max_seconds = getattr(self._config, "desktop_max_seconds", 0.0)
+            task_config.max_turns = getattr(self._config, "desktop_max_turns", 0)
+            task_config.max_tool_calls = getattr(self._config, "desktop_max_tool_calls", 0)
+            log.info(
+                "任务 %s 桌面模式：预算覆盖为 max_seconds=%s / max_turns=%s / max_tool_calls=%s"
+                "（0 = 不限制；软熔断/连续错误/无进展终止仍然生效）",
+                task_id,
+                "不限" if task_config.max_seconds <= 0 else f"{task_config.max_seconds:.0f}",
+                "不限" if task_config.max_turns <= 0 else task_config.max_turns,
+                "不限" if task_config.max_tool_calls <= 0 else task_config.max_tool_calls,
+            )
+
         rt = TaskRuntime(
             task_id=task_id,
             session_id=session_id,
@@ -415,11 +438,11 @@ class TaskScheduler:
             model=row["model"],
             allowed_paths=allowed_paths,
             forbidden_paths=forbidden_paths,
-            session_mode=self._mode_of.get(task_id, ""),
+            session_mode=mode,
             adapter=self._adapter,
             # 步骤 7：read-only 任务拿到的是只读视图（写工具未注册）
             registry=self._registry_for(task_id),
-            config=self._config,
+            config=task_config,
             hub=self._hub,
             store=self._store,
             knowledge=self._knowledge,
@@ -481,9 +504,11 @@ class TaskScheduler:
             return {
                 "accepted": ok,
                 "state": rt.status,
-                "note": "取消请求已接受，将在下一次循环边界生效；最终以 status=aborted 为准"
-                if ok
-                else "取消请求未被接受",
+                "note": (
+                    f"已请求中止：先让循环在下一个检查点收尾，"
+                    f"{FORCE_CANCEL_GRACE_S:.0f}s 内没停下来就强制取消；"
+                    f"最终以 status=aborted 为准"
+                ) if ok else "取消请求未被接受",
             }
 
         # ---- 不在内存：可能还在排队，或已经结束 ----

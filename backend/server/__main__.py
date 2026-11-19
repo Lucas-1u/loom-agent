@@ -233,8 +233,19 @@ async def amain(args: argparse.Namespace) -> int:
     else:
         log.info("联网搜索未启用（LOOM_WEB_SEARCH=0 或未配 DEEPSEEK_API_KEY）—— web_search 不注册")
 
+    # ★ 对比表 #25：会话历史查询。只读叶子模块，自己开 mode=ro 连接，
+    #   和 RAG 一样不依赖 server 层 —— 所以 registry 和 app 都能安全注入。
+    from ..history.query import HistoryQuery
+
+    history = HistoryQuery(db_path)
+    if history.usable:
+        log.info("会话历史查询已启用（session_history 工具 + /api/history）")
+    else:
+        log.info("会话历史库不存在（%s）—— session_history 不注册", db_path)
+
     registry = build_default_registry(
         sandbox=sandbox, knowledge=knowledge, mcp=mcp_manager,
+        history=history,
         workflow=workflow_store, workflow_allow_local=workflow_allow_local,
         workflow_parallel=workflow_parallel,
         vision=vision_cfg if vision_cfg.usable else None,
@@ -314,6 +325,17 @@ async def amain(args: argparse.Namespace) -> int:
             print(f"[清理] 事件保留 {cfg.events.retention_days} 天，"
                   f"删掉 {pruned_events} 条过期事件")
 
+    # ---- ③d 会话投影全量重建（#51）-------------------------------------
+    #   投影是派生的查询表（从 task_events 推导），不是事实档案。
+    #   启动时重建一次，保证投影表与事件流一致 —— 上次运行可能因为
+    #   进程被杀、投影维护失败等原因留下滞后的投影行。
+    try:
+        proj_count = await store.rebuild_projections()
+        if proj_count:
+            print(f"[投影] 全量重建 {proj_count} 个任务的投影行（#51）")
+    except Exception as exc:  # noqa: BLE001 —— 投影重建失败不该拦住启动
+        print(f"[!] 投影重建失败（不影响启动，可手动重建）：{type(exc).__name__}: {exc}")
+
     # ---- 工作流恢复：启动时扫一遍未终结的 Workflow ---------------------
     #   · 幂等步骤（http GET / 只读工具）→ 退回 pending，后台继续跑
     #   · 有副作用的步骤（shell）→ 标 unknown + 工作流转 needs_attention，绝不自动重跑
@@ -364,6 +386,8 @@ async def amain(args: argparse.Namespace) -> int:
         skills=skills_info,
         # 对比表 #49：事件落盘（lifespan 里启动后台刷盘；退出前 flush）
         archive=archive if archive.enabled else None,
+        # 对比表 #25：会话历史查询（/api/history、/api/tasks/{id}/replay）
+        history=history,
         retention_days=cfg.events.retention_days if archive.enabled else 0,
     )
 

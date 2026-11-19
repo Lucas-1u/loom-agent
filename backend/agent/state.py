@@ -225,19 +225,23 @@ class Budgets:
 
         ★ 上限与用量都还原：续跑不是"重新领一份预算"，
           否则断一次就能无限续命，轮数上限形同虚设。
+        ★ 用 `is None` 判断缺字段，不用 `or`：`0` 是合法值（0 = 不设上限），
+          `or base.x` 会把 0 悄悄换回默认上限 —— "不限"变成"照旧限"。
         """
         base = cls()
+
+        def _pick(key: str, default: Any, cast: Any) -> Any:
+            raw = data.get(key)
+            return default if raw is None else cast(raw)
+
         return cls(
-            max_turns=int(data.get("max_turns", base.max_turns) or base.max_turns),
-            max_seconds=float(data.get("max_seconds", base.max_seconds) or base.max_seconds),
-            max_tool_calls=int(data.get("max_tool_calls", base.max_tool_calls) or base.max_tool_calls),
-            max_same_call_repeat=int(data.get("max_same_call_repeat", base.max_same_call_repeat)
-                                     or base.max_same_call_repeat),
-            max_errors=int(data.get("max_errors", base.max_errors) or base.max_errors),
-            approval_timeout_s=float(data.get("approval_timeout_s", base.approval_timeout_s)
-                                     or base.approval_timeout_s),
-            min_evidence=int(data.get("min_evidence", base.min_evidence)
-                             if data.get("min_evidence") is not None else base.min_evidence),
+            max_turns=_pick("max_turns", base.max_turns, int),
+            max_seconds=_pick("max_seconds", base.max_seconds, float),
+            max_tool_calls=_pick("max_tool_calls", base.max_tool_calls, int),
+            max_same_call_repeat=_pick("max_same_call_repeat", base.max_same_call_repeat, int),
+            max_errors=_pick("max_errors", base.max_errors, int),
+            approval_timeout_s=_pick("approval_timeout_s", base.approval_timeout_s, float),
+            min_evidence=_pick("min_evidence", base.min_evidence, int),
             turns_used=int(data.get("turns_used") or 0),
             tool_calls_used=int(data.get("tool_calls_used") or 0),
             errors_used=int(data.get("errors_used") or 0),
@@ -249,15 +253,22 @@ class Budgets:
 
         返回 None 表示全部通过；否则返回 (kind, limit, used)：
             ("turns", 20, 20) / ("seconds", 300, 312.4) / ("tool_calls", 40, 41)
+
+        ★ `0` / 负数 = **不设上限**（2026-11-13 用户要求）。
+          桌面模式是"截图→定位→点击→验证"的长往返，墙钟/轮次一刀切会在
+          任务做到一半时砍掉（实测 18 轮被 300s 砍）。设 0 表示这一类不再设限，
+          真正兜底的刹车是：软熔断（同参重复）、连续错误、无进展终止 ——
+          它们看的是"有没有在推进"，不是"跑了多久"。
+          ⚠️ 注意不能沿用"0 就立刻超限"的旧语义，否则"不限"会变成"立即死"。
         """
-        if self.turns_used >= self.max_turns:
+        if self.max_turns > 0 and self.turns_used >= self.max_turns:
             return ("turns", self.max_turns, self.turns_used)
-        if self.tool_calls_used >= self.max_tool_calls:
+        if self.max_tool_calls > 0 and self.tool_calls_used >= self.max_tool_calls:
             return ("tool_calls", self.max_tool_calls, self.tool_calls_used)
-        if self.errors_used >= self.max_errors:
+        if self.max_errors > 0 and self.errors_used >= self.max_errors:
             return ("errors", self.max_errors, self.errors_used)
         elapsed = time.time() - started_at
-        if elapsed >= self.max_seconds:
+        if self.max_seconds > 0 and elapsed >= self.max_seconds:
             return ("seconds", self.max_seconds, round(elapsed, 1))
         return None
 
@@ -740,6 +751,16 @@ class TaskState:
     # 读取复用命中次数（同文件同 hash，折叠成标记而不是再贴一遍全文）
     read_reuse_hits: int = 0
 
+    # ---- 对比表 #4：模型 token 用量 ----------------------------------------
+    # ★ 这里存的是 provider 返回的**精确值**（usage），不是字符估算。
+    #   流式收尾帧本来就带 usage，之前被 `if not choices: continue` 扔掉了。
+    #   reasoning_tokens 单独记：推理模型的思考量往往是 completion 的大头，
+    #   合并进去就看不出"输出其实很短、是思考很长"。
+    llm_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+
     # ---- M3：项目知识检索 --------------------------------------------------
     # 本次任务用到的索引统计（文件数/片段数/耗时/跳过原因），供快照与报告用
     rag_index: dict[str, Any] = field(default_factory=dict)
@@ -1146,6 +1167,11 @@ class TaskState:
             "context_last": self.context_last,
             "context_peak_chars": self.context_peak_chars,
             "read_reuse_hits": self.read_reuse_hits,
+            # 对比表 #4：token 用量（精确值，来自 provider usage）
+            "llm_calls": self.llm_calls,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
             "reflect_reloop": {
                 "streak": self.reflect_streak,
                 "recoveries": self.reflect_recoveries,
@@ -1206,6 +1232,11 @@ class TaskState:
             budget_reason=str(data.get("budget_reason") or ""),
             context_peak_chars=_as_int(data.get("context_peak_chars")),
             read_reuse_hits=_as_int(data.get("read_reuse_hits")),
+            # 对比表 #4：续跑时沿用已用掉的 token（不是"重新领一份"）
+            llm_calls=_as_int(data.get("llm_calls")),
+            prompt_tokens=_as_int(data.get("prompt_tokens")),
+            completion_tokens=_as_int(data.get("completion_tokens")),
+            reasoning_tokens=_as_int(data.get("reasoning_tokens")),
             consecutive_errors=_as_int(data.get("consecutive_errors")),
             final_answer=str(data.get("final_answer") or ""),
             error=data.get("error") if isinstance(data.get("error"), dict) else None,

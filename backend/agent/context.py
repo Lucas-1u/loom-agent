@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..models.adapter import Message, ToolCall
+from ..models.adapter import ImageRef, Message, ToolCall
 from ..config import MAX_TOOL_RESULT_CHARS
 from .state import TaskState, TaskStatus
 
@@ -63,6 +63,8 @@ class TurnBuilder:
 
     def __init__(self) -> None:
         self._assistant: Message | None = None
+        # 本轮工具产出的图片引用（#12）：tool 消息装不下，build() 时单独补一条 user
+        self._pending_images: list[ImageRef] = []
         self._tool_msgs: list[Message] = []
         self._expected_ids: list[str] = []
         self._seen_ids: set[str] = set()
@@ -79,8 +81,18 @@ class TurnBuilder:
         return self
 
     # ---- 添加一条 tool 结果 ----------------------------------------------
-    def add_tool(self, call_id: str, name: str, content: str) -> "TurnBuilder":
+    def add_tool(self, call_id: str, name: str, content: str,
+                 images: list[ImageRef] | None = None) -> "TurnBuilder":
+        """
+        追加一条工具结果消息。
+
+        ★ `images` 先收着、不挂在 tool 消息上：OpenAI 的 tool 消息**只允许文本 part**，
+          带 image_url 会被拒。图片统一在 build() 末尾作为一条 user 消息补上
+          （tool 消息全部覆盖完之后再插 user 是合法的）。
+        """
         self._tool_msgs.append(Message.tool_result(call_id, name, content))
+        if images:
+            self._pending_images.extend(images)
         self._seen_ids.add(call_id)
         return self
 
@@ -130,7 +142,64 @@ class TurnBuilder:
             if extra.tool_call_id in by_id:
                 out.append(extra)
 
+        # ---- 图片观察（对比表 #12）----------------------------------------
+        # ★ 为什么单开一条 user 消息，而不是塞进 tool 消息：
+        #   OpenAI 的 tool 消息 content 只接受文本 part，带 image_url 会被拒。
+        #   此刻 assistant 的 tool_calls 已全部被 tool 消息覆盖，
+        #   在其后插一条 user 是合法序列。
+        if self._pending_images:
+            labels = "、".join(img.label or "截图" for img in self._pending_images)
+            out.append(
+                Message.user(
+                    f"（以下是本轮工具产出的图片：{labels}。请按图上的实际内容判断，"
+                    f"不要凭文字描述猜测。）",
+                    images=self._pending_images,
+                )
+            )
+
         return out
+
+
+# --------------------------------------------------------------------------- #
+# 图像块卸载（对比表 #12）
+# --------------------------------------------------------------------------- #
+def offload_images(msgs: list[Message], keep_recent: int) -> int:
+    """
+    把上下文里"过早"的图片卸载成文本占位符。返回卸载了多少张。
+
+    ★ 策略：保留**最近** keep_recent 张，更早的全部卸载。
+      为什么按张数而不是字节/token：各家的图片计价口径不一致（按张/按像素/
+      按 token 推算），按张数最可预测；单张过大另由 ImageRef.to_part 的
+      max_bytes 拦（读不出来就降级成一句说明）。
+
+    ★ 为什么从后往前数：模型对"最近的观察"最敏感，旧的截图往往已经过时
+      （点了三次、截了三次，前两张描述的是同一个界面）。
+
+    ★ 卸载 ≠ 删除：原文件还在磁盘上，占位符里写明路径，模型需要时可以
+      按路径再读（capture 的文件本来就在工作区里）。
+
+    ★ 这是"请求前主动卸载"，不是 DSH 那种"被 Provider 拒绝后再重试"：
+      Loom 拿不到明确的图片预算信号，等报错再改代价更大（一次完整请求
+      已经白花了）。宁可早卸一张。
+    """
+    if keep_recent < 0:
+        return 0
+    slots = [(i, j) for i, m in enumerate(msgs) for j in range(len(m.images))]
+    if len(slots) <= keep_recent:
+        return 0
+
+    drop = slots[: len(slots) - keep_recent]
+    by_msg: dict[int, set[int]] = {}
+    for i, j in drop:
+        by_msg.setdefault(i, set()).add(j)
+
+    for i, idxs in by_msg.items():
+        m = msgs[i]
+        dropped = [img for j, img in enumerate(m.images) if j in idxs]
+        m.images = [img for j, img in enumerate(m.images) if j not in idxs]
+        note = "；".join(f"{img.label or '截图'}（{img.path}）" for img in dropped)
+        m.content = (m.content + f"\n\n［图片已卸载，原文件仍在：{note}］").strip()
+    return len(drop)
 
 
 # --------------------------------------------------------------------------- #
@@ -149,10 +218,16 @@ class ContextBuilder:
         *,
         max_tool_result_chars: int = MAX_TOOL_RESULT_CHARS,
         keep_full_results: int = 3,
+        keep_images: int = 2,
     ) -> None:
         # 最近 N 个工具结果喂完整内容，更早的降级成摘要
         self.max_tool_result_chars = max_tool_result_chars
         self.keep_full_results = keep_full_results
+        # 上下文里最多保留几张图（#12）：更早的卸载成文本占位符。
+        # 默认 2 —— 够模型"看当前界面 + 对照上一张"，又不至于把请求撑爆。
+        self.keep_images = keep_images
+        # 最近一次 build 卸载了几张图（观测用，不影响行为）
+        self.last_offloaded_images = 0
 
     # ===================================================================== #
     # 主入口
@@ -201,6 +276,11 @@ class ContextBuilder:
         # ---- 阶段提示（如 PLAN / REFLECT 要求 JSON）----------------------
         if phase_hint:
             msgs.append(Message.system(phase_hint))
+
+        # ---- 图像块卸载（#12）--------------------------------------------
+        # ★ 放在**最后一刻**执行：前面的压缩/裁剪都可能改变图片数量，
+        #   只有这里才是"真正要发给模型的那一份"。
+        self.last_offloaded_images = offload_images(msgs, self.keep_images)
 
         return msgs
 

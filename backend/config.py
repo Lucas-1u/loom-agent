@@ -194,6 +194,36 @@ class BudgetConfig:
     approval_timeout_s: float = 180.0
     min_evidence: int = 1
 
+    # ---- 桌面模式专属预算（desktop 权限模式用）------------------------
+    # ★ 桌面控制是"截图→定位→点击→验证"的多轮往返，300s 天然偏紧。
+    #   单独给桌面模式一套预算，不污染其他模式的默认。
+    # ★ **0 = 不设上限**（2026-11-13 用户明确要求）：桌面任务做到一半被墙钟
+    #   砍掉，比多烧一点 token 更难接受。取消硬上限后仍有三个刹车，且都
+    #   只看"有没有在推进"、不看跑了多久：
+    #     ① 软熔断：同工具同参数重复 max_same_call_repeat 次
+    #     ② 连续错误：errors_used ≥ max_errors
+    #     ③ 无进展终止：反思连续判定零进展（streak≥3）
+    #   想恢复上限就设环境变量，例如 LOOM_DESKTOP_MAX_SECONDS=900。
+    desktop_max_seconds: float = 0.0
+    desktop_max_turns: int = 0
+    desktop_max_tool_calls: int = 0
+
+    # ---- 秒数预算有界续期（大任务长思考兜底）--------------------------
+    # ★ 轮次预算耗尽已有续期；秒数预算此前**完全没有续期**——一过墙钟上限
+    #   直接砍，长思考的大任务（尤其桌面多轮往返）必被误杀。这里补一个
+    #   与轮次续期同构的有界续期：仍在推进且无循环/冲突/停滞就续一次。
+    budget_extend_seconds: float = 120.0
+
+    # ---- 主模型视觉输入（对比表 #12）-------------------------------------
+    # ★ 默认 **False**：本机实测 spark-x2.6 接受 image_url 的请求格式（200），
+    #   但模型自述"无法读取该图像的视觉内容" —— 协议通、模型没有视觉能力。
+    #   打开前请确认目标模型真的支持图片输入，否则只会白占请求体积。
+    # ★ 换成视觉模型（如 qwen-vl / gpt-4o）后，把 LOOM_MAIN_VISION 设成 1 即可启用，
+    #   图片会直接进主对话，不必再经 vision_look 中转。
+    main_vision: bool = False
+    # 上下文里最多保留几张图；更早的卸载成文本占位符（#12 的卸载策略）
+    image_keep_recent: int = 2
+
     # ---- 上下文压缩（第五批）-------------------------------------------
     # ★ 阈值用**字符数**表达：没有可靠 tokenizer，不假装精确 token 数。
     #   60k 字符 ≈ 40k token（按 1.5 字符/token 估算）。
@@ -216,6 +246,8 @@ class BudgetConfig:
             compact_max_chars=_env_int("LOOM_COMPACT_CHARS", 60_000),
             compact_keep_turns=_env_int("LOOM_COMPACT_KEEP_TURNS", 3),
             compact_long_turn_chars=_env_int("LOOM_COMPACT_LONG_TURN", 20_000),
+            main_vision=_env_int("LOOM_MAIN_VISION", 0) != 0,
+            image_keep_recent=_env_int("LOOM_IMAGE_KEEP", 2),
             max_turns=_env_int("LOOM_MAX_TURNS", 20),
             max_seconds=_env_float("LOOM_MAX_SECONDS", 300.0),
             max_tool_calls=_env_int("LOOM_MAX_TOOL_CALLS", 40),
@@ -223,6 +255,10 @@ class BudgetConfig:
             max_errors=_env_int("LOOM_MAX_ERRORS", 5),
             approval_timeout_s=_env_float("LOOM_APPROVAL_TIMEOUT", 180.0),
             min_evidence=_env_int("LOOM_MIN_EVIDENCE", 1),
+            desktop_max_seconds=_env_float("LOOM_DESKTOP_MAX_SECONDS", 0.0),
+            desktop_max_turns=_env_int("LOOM_DESKTOP_MAX_TURNS", 0),
+            desktop_max_tool_calls=_env_int("LOOM_DESKTOP_MAX_TOOL_CALLS", 0),
+            budget_extend_seconds=_env_float("LOOM_BUDGET_EXTEND_SECONDS", 120.0),
         )
 
 

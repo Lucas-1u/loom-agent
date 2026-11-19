@@ -37,3 +37,9 @@ mcp>=2.3,<3
 # 本地 ONNX embedding（fastembed 自带 onnxruntime + tokenizers）
 # 模型权重默认缓存在 sandbox/models（已 gitignore），首次启用需下载 ~90MB
 fastembed>=0.4,<1
+
+# ---- 视觉定位（Computer-Use 方案2，可选：不配 LOOM_VISION_MODEL 就不用）----
+# 把截图缩到 VLM 的像素上限内再发送。超过上限的图会被服务端悄悄降采样，
+# 模型按缩小图给坐标、harness 按原图执行 → 系统性点偏（2026-11-13 定位偏移事故的根因）。
+# 没装也能跑：backend/tools/computer/locate.py 会退回原图发送并在结果里提示。
+pillow>=10.0

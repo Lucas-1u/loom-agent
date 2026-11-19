@@ -46,7 +46,8 @@ from typing import Any
 from backend.agent.core import AgentConfig, AgentCore
 from backend.events import EventBus, collect
 from backend.mcp.client import McpManager
-from backend.mcp.config import (McpConfig, McpConfigError, build_child_env, load_servers)
+from backend.mcp.config import (McpConfig, McpConfigError, build_child_env, load_servers,
+                                resolve_command)
 from backend.mcp.tool import McpTool, qualify, register_mcp_tools
 from backend.models.adapter import FakeAdapter, ModelReply, ToolCall
 from backend.tools.base import ToolContext
@@ -145,6 +146,53 @@ def suite_config(tmp: Path) -> None:
     bad({"servers": "nope"}, "servers 非数组")
     check(not (tmp / "cfg_ok" / "mcp_servers.json").read_text(encoding="utf-8").count("sk-"),
           "配置文件里没有密钥字面量")
+
+    # ---- [A2] command 解析（2026-11-13）------------------------------------
+    # 事故：mcp_servers.json 写 "agent-desktop"，shell 里能跑、服务里
+    # FileNotFoundError[WinError 2]（服务 PATH 没有 node 目录）→ MCP failed
+    # → desktop_click 不注册 → 模型全程用 terminal 手搓鼠标。
+    # 这一组的用途：以后任何"裸名字"故障都能从错误信息里直接看出原因。
+    print("\n[A2] command 解析与可诊断性")
+
+    got, note = resolve_command(sys.executable)
+    check(got == sys.executable and not note, "绝对路径 + 文件存在 → 原样通过，无诊断信息")
+
+    missing = str(tmp / "definitely-not-here.exe")
+    got, note = resolve_command(missing)
+    check(got == missing and "不存在" in note, "★ 绝对路径不存在 → 明确说'文件不存在'（不是裸 WinError 2）")
+
+    got, note = resolve_command("loom-no-such-command-xyz")
+    check("找不到" in note and "PATH" in note,
+          "★ 裸名字找不到 → 诊断信息点明 PATH 可能比 shell 短，并给出两种改法")
+
+    # 兜底搜索目录：把 python 所在目录挂到 LOOM_MCP_EXTRA_PATH，
+    # 用"裸名字"去解析它（PATH 里本来就有也行，断言只看结果是否绝对化）。
+    py_dir = os.path.dirname(sys.executable)
+    py_name = os.path.basename(sys.executable)
+    old_extra = os.environ.get("LOOM_MCP_EXTRA_PATH")
+    os.environ["LOOM_MCP_EXTRA_PATH"] = py_dir
+    try:
+        got, note = resolve_command(py_name)
+        check(os.path.isabs(got) and os.path.isfile(got) and not note,
+              "LOOM_MCP_EXTRA_PATH 能让裸名字解析成绝对路径")
+    finally:
+        if old_extra is None:
+            os.environ.pop("LOOM_MCP_EXTRA_PATH", None)
+        else:
+            os.environ["LOOM_MCP_EXTRA_PATH"] = old_extra
+
+    if os.name == "nt":
+        fake = tmp / "fake_wrapper.cmd"
+        fake.write_text("@echo off\n", encoding="utf-8")
+        got, note = resolve_command(str(fake))
+        check(".cmd" in note and "shell" in note,
+              "★ .cmd 绝对路径 → 拒绝并解释'子进程不过 shell'，不套 cmd /c")
+        # 配置加载层也要把 note 带到 McpServerConfig 上（连接失败时能显示）
+        p = tmp / "cfg_badcmd.json"
+        p.write_text(json.dumps({"servers": [{"id": "x", "command": str(fake)}]}),
+                     encoding="utf-8")
+        check("shell" in load_servers(str(p))[0].resolve_note,
+              "load_servers 把解析诊断挂到 resolve_note（不抛异常、不拖垮整份配置）")
 
 
 # --------------------------------------------------------------------------- #

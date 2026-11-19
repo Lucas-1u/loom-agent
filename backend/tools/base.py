@@ -121,6 +121,10 @@ class ToolResult:
     error: dict[str, Any] | None = None
     side_effects: list[dict[str, Any]] = field(default_factory=list)
     duration_ms: int = 0
+    # 本轮产出的图片引用（对比表 #12）：`[{path, mime, bytes, label}]`。
+    # ★ 用 dict 而不是 models.ImageRef：tools 层不该依赖 models 层，
+    #   由 AgentCore 在组装上下文时转换成 ImageRef。
+    images: list[dict[str, Any]] = field(default_factory=list)
 
     # ---- 构造 --------------------------------------------------------------
     @staticmethod
@@ -130,12 +134,14 @@ class ToolResult:
         data: Any = None,
         side_effects: list[dict[str, Any]] | None = None,
         duration_ms: int = 0,
+        images: list[dict[str, Any]] | None = None,
     ) -> "ToolResult":
         return ToolResult(
             ok=True,
             tool=tool,
             summary=summary,
             data=data,
+            images=list(images or []),
             side_effects=side_effects or [],
             duration_ms=duration_ms,
         )

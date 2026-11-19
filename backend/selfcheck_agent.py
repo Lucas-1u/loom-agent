@@ -3004,6 +3004,10 @@ async def main() -> int:
         await test_robustness(sb)
         await test_verification_gate(sb)
         await test_desktop_verification_gate(sb)
+        await test_desktop_click_dpi(sb)
+        await test_desktop_locate_helpers(sb)
+        await test_history_tool(sb)
+        await test_image_offload(sb)
         await test_ask_user(sb)
         await test_repair_zero_work_gate(sb)
         await test_write_demand_gate(sb)
@@ -4046,6 +4050,33 @@ async def test_budget_and_read_index(sb: Sandbox) -> None:
     st = mk("diagnostic", events=ev_ok)
     check(verdict(AgentCore, st, "turns")["extend"] is False, "★ 诊断任务不续期")
 
+    # ---- 1b. 秒数续期判定（第七批）：仍在推进且无循环/冲突就续，不限意图 ----
+    # 有效进展 → 秒数续期（不限意图：诊断/桌面长思考同样适用）
+    st = mk("diagnostic", events=ev_ok)
+    check(verdict(AgentCore, st, "seconds")["extend_seconds"] is True,
+          "★ 有效进展 → 秒数续期一次（不限意图）")
+
+    # 范围冲突 → 秒数不续期
+    st = mk("repair", conflicts=True, events=ev_ok)
+    check(verdict(AgentCore, st, "seconds")["extend_seconds"] is False,
+          "★ 有范围冲突 → 秒数不续期")
+
+    # 重复循环 → 秒数不续期
+    st = mk("repair", events=ev_dup)
+    check(verdict(AgentCore, st, "seconds")["extend_seconds"] is False,
+          "★ 重复循环 → 秒数不续期")
+
+    # 已续过（budget_extended=True）→ 秒数不再续（共用标志，只续一次）
+    st = mk("repair", events=ev_ok)
+    st.budget_extended = True
+    check(verdict(AgentCore, st, "seconds")["extend_seconds"] is False,
+          "★ 已续过 → 秒数不再续（共用 budget_extended，只续一次）")
+
+    # 停滞（无任何进展/证据/命令）→ 秒数不续期
+    st = mk("repair")
+    check(verdict(AgentCore, st, "seconds")["extend_seconds"] is False,
+          "★ 计划停滞 → 秒数不续期")
+
     # ---- 2. 端到端：有效进展的任务获得一次续期并完成 ----
     reg = ToolRegistry()
     reg.register(build_default_registry().get("read_file"), group="readonly")
@@ -4649,6 +4680,282 @@ async def test_tool_chain_m21(sb: Sandbox) -> None:
     check(len(box_ok.calls) == 1, "★ 熔断前也没有任何无效参数进入沙箱")
 
 
+
+
+async def test_desktop_click_dpi(sb: Sandbox) -> None:
+    """[CU] desktop_click_at 必须把截图逻辑像素换算成物理像素再点。
+
+    ★ 真实事故：截图是逻辑像素（1707×1067 @150%），agent-desktop 要物理像素
+      （2560×1600）。旧版写死 2560×1600 且不做换算，模型被 DPI 换算烧光预算。
+    现在换算下沉到工具内部，这里验证它确实乘了 scale。
+    """
+    print("\n[CU] desktop_click_at 的 DPI 缩放换算")
+    from backend.mcp.client import CallOutcome, DiscoveredTool
+    from backend.tools.computer.click_pixel import DesktopClickTool
+
+    # 假 MCP：list_displays 返回 2560×1600 / scale 1.5（与本机实测一致）
+    # 记录 desktop_mouse_click 收到的 xy，供断言。
+    captured: dict[str, str] = {}
+
+    class _FakeMcp:
+        def tools(self):
+            return [DiscoveredTool(server_id="agent_desktop", name="desktop_mouse_click",
+                                   description="", input_schema={})]
+
+        async def call(self, server_id, tool, args, timeout=None):
+            if tool == "desktop_list_displays":
+                return CallOutcome(ok=True, structured={"command": "list-displays", "ok": True,
+                    "data": [{"id": "m1", "is_primary": True,
+                              "bounds": {"width": 2560, "height": 1600, "x": 0, "y": 0},
+                              "scale": 1.5}]})
+            if tool == "desktop_mouse_click":
+                captured["xy"] = args["xy"]
+                return CallOutcome(ok=True, structured={"action": "click", "ok": True})
+            return CallOutcome(ok=False, kind="protocol", error=f"unexpected {tool}")
+
+    tool = DesktopClickTool(_FakeMcp(), server_id="agent_desktop")
+    ctx = ToolContext(workspace=sb.dir)
+
+    # 截图逻辑坐标 (1490, 237) × 1.5 → 物理 (2235, 356)（round 语义）
+    res = await tool.run({"x": 1490, "y": 237}, ctx)
+    check(res.ok, f"★ 点击成功（{res.error if not res.ok else ''}）")
+    check(captured.get("xy") == "2235,356",
+          f"★ 传给 desktop_mouse_click 的是物理坐标（xy={captured.get('xy')}，应为 2235,356）")
+    check(res.data.get("physical_x") == 2235 and res.data.get("physical_y") == 356,
+          "★ 结果里回传了换算后的物理坐标")
+    check(res.data.get("scale") == 1.5, "★ 结果里回传了缩放比")
+
+    # 越界：截图坐标换算后超出物理空间 → 拒绝，不假装点
+    res2 = await tool.run({"x": 2000, "y": 1000}, ctx)
+    # 2000×1.5=3000 ≥ 2560 → 越界
+    check(not res2.ok, "★ 换算后越界的坐标被拒绝")
+    _err_text = (res2.error or {}).get("message") if isinstance(res2.error, dict) else str(res2.error)
+    check("越界" in _err_text, f"★ 拒绝原因明确写了越界（{_err_text}）")
+
+    # 缩放比读不到时回退 scale=1.0（不崩、不乱乘）
+    class _EmptyMcp:
+        def tools(self):
+            return [DiscoveredTool(server_id="agent_desktop", name="desktop_mouse_click",
+                                   description="", input_schema={})]
+        async def call(self, server_id, tool, args, timeout=None):
+            if tool == "desktop_list_displays":
+                return CallOutcome(ok=False, kind="protocol", error="no displays")
+            if tool == "desktop_mouse_click":
+                captured["xy2"] = args["xy"]
+                return CallOutcome(ok=True, structured={"ok": True})
+            return CallOutcome(ok=False, kind="protocol", error="x")
+
+    tool2 = DesktopClickTool(_EmptyMcp(), server_id="agent_desktop")
+    res3 = await tool2.run({"x": 100, "y": 100}, ctx)
+    check(res3.ok, "★ list_displays 读不到时回退 scale=1.0，点击仍成功")
+    check(captured.get("xy2") == "100,100",
+          f"★ 回退时不乱乘（xy2={captured.get('xy2')}，应为 100,100）")
+
+
+async def test_image_offload(sb: Sandbox) -> None:
+    """[IV] 图像块卸载（#12）：多模态消息 / 坏图降级 / 只保留最近 N 张。
+
+    ★ 为什么这条要测"坏图"：图片是**引用**，文件可能被删/被移走。
+      如果那时整个请求崩掉，一个无关的文件删除就能让任务失败。
+    """
+    print("\n[IV] 图像块卸载（#12）")
+    import os
+    import shutil
+    import tempfile
+
+    from PIL import Image
+
+    from backend.agent.context import TurnBuilder, offload_images
+    from backend.models.adapter import ImageRef, Message
+
+    d = tempfile.mkdtemp(prefix="loom_iv_")
+    try:
+        paths = []
+        for i in range(3):
+            p = os.path.join(d, f"s{i}.png")
+            Image.new("RGB", (8, 8), (i * 40, 0, 0)).save(p)
+            paths.append(p)
+        refs = [ImageRef(path=p, bytes=os.path.getsize(p), label=f"图{i}")
+                for i, p in enumerate(paths)]
+
+        # ---- 多模态消息格式 ----
+        m = Message.user("看这几张图", images=refs)
+        d0 = m.to_dict()
+        check(isinstance(d0["content"], list), "★★ 有图时 content 变成 part 数组（多模态格式）")
+        kinds = [p["type"] for p in d0["content"]]
+        check(kinds[0] == "text" and kinds.count("image_url") == 3, f"1 段文本 + 3 张图（{kinds}）")
+        check(str(d0["content"][1]["image_url"]["url"]).startswith("data:image/png;base64,"),
+              "图片以 data URL 内联发出")
+
+        # ---- 坏图降级 ----
+        bad = Message.user("坏图", images=[ImageRef(path=os.path.join(d, "nope.png"), label="缺失")])
+        db = bad.to_dict()
+        types = [p["type"] for p in db["content"]]
+        check("image_url" not in types, "★★ 读不到的图不发出去（不会让整个请求失败）")
+        check(any("无法读取" in p.get("text", "") for p in db["content"]), "并在文本里留了说明")
+
+        # ---- 卸载：5 张只留 2 张 ----
+        refs5 = [ImageRef(path=paths[i % 3], label=f"图{i}") for i in range(5)]
+        msgs = [Message.user("a", images=refs5[:2]), Message.user("b", images=refs5[2:])]
+        n = offload_images(msgs, 2)
+        check(n == 3, f"★ 卸载掉 3 张（实际 {n}）")
+        check(len(msgs[0].images) == 0 and len(msgs[1].images) == 2,
+              "★★ 只保留最后 2 张，更早的清空")
+        check("图片已卸载" in msgs[0].content, "被卸载的位置留下占位说明")
+        check("原文件仍在" in msgs[0].content, "占位符写明路径（模型可以按路径再读）")
+
+        m2 = [Message.user("x", images=refs[:1])]
+        check(offload_images(m2, 2) == 0 and len(m2[0].images) == 1,
+              "图没超过上限时一张都不动")
+
+        # ---- TurnBuilder：图片不能挂在 tool 消息上（协议限制）----
+        tb = TurnBuilder()
+        tb.add_assistant("", [ToolCall(id="c1", name="capture_screen", arguments_raw="{}")])
+        tb.add_tool("c1", "capture_screen", "已截图", images=refs[:1])
+        built = tb.build()
+        check(len(built) == 3, f"assistant + tool + 图片观察 = 3 条（实际 {len(built)}）")
+        check(built[1].role == "tool" and not built[1].images,
+              "★ tool 消息本身不带图（OpenAI 只允许文本 part）")
+        check(built[-1].role == "user" and len(built[-1].images) == 1,
+              "★ 图片单独作为一条 user 消息补在末尾")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+async def test_history_tool(sb: Sandbox) -> None:
+    """[H2] session_history 工具（#25）：注册门槛 / 参数校验 / 工作区授权。
+
+    ★ 用假 HistoryQuery 而不是真库：这一组要验的是**工具边界**（谁允许看、
+      参数怎么校验、给下游传了什么），不是 SQL。SQL 在 selfcheck_server 的
+      [HQ] 段用真库验过。
+    """
+    print("\n[H2] session_history 工具（注册 / 校验 / 授权）")
+    from backend.tools.readonly.session_history import make as make_history
+
+    class _FakeHistory:
+        usable = True
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+            self.task_ws = "D:/proj-a"
+
+        def get_task(self, tid: str):
+            return {"task_id": tid, "goal": "某个历史任务", "status": "done",
+                    "end_reason": "agent_done", "workspace": self.task_ws,
+                    "session_id": "s1", "created_at": 1000.0, "ended_at": 1010.0, "turn": 2}
+
+        def search(self, **kw):
+            self.calls.append(("search", kw))
+            return {"total": 1, "returned": 1, "truncated": False, "items": [{
+                "task_id": "t_hist", "goal": "分析项目架构", "status": "done",
+                "end_reason": "agent_done", "workspace": kw.get("workspace") or "D:/proj-a",
+                "session_id": "s1", "created_at": 1000.0, "last_event_ts": 1010.0,
+                "turn": 3, "tool_calls": 5, "event_count": 20,
+                "has_error": False, "error_count": 0, "budget_exceeded": False,
+                "answer_preview": "已完成",
+            }]}
+
+        def replay(self, tid: str, **kw):
+            self.calls.append(("replay", {"task_id": tid, **kw}))
+            return {"task": self.get_task(tid), "total": 1, "returned": 1,
+                    "truncated": False,
+                    "events": [{"seq": 1, "type": "task.start", "turn": 0, "data": {"goal": "g"}}]}
+
+    fake = _FakeHistory()
+
+    # ---- 注册门槛 ----
+    reg_with = build_default_registry(include_mutating=False, history=fake)
+    check("session_history" in reg_with.names, "★ 注入 history 时注册 session_history")
+    tool = reg_with.get("session_history")
+    check(tool is not None and tool.risk == RiskLevel.READ, "★ risk=READ（只读，不会写任何东西）")
+
+    reg_without = build_default_registry(include_mutating=False)
+    check("session_history" not in reg_without.names, "不注入 history 时工具清单不变")
+    check(make_history(None) is None, "history=None 时工厂返回 None")
+    check(make_history(type("X", (), {"usable": False})()) is None, "库不可用时工厂返回 None")
+
+    ctx = ToolContext(workspace="D:/proj-a", task_id="t_self")
+
+    # ---- 参数校验 ----
+    check(tool.validate_args({"action": "nope"}) != "", "非法 action 被拒")
+    check(tool.validate_args({"action": "replay"}) != "", "replay 缺 task_id 被拒")
+    check(tool.validate_args({"action": "search", "limit": 0}) != "", "limit=0 被拒")
+    check(tool.validate_args({"action": "search", "limit": 500}) != "", "limit 超上限被拒")
+    check(tool.validate_args({"action": "search", "days": 0}) != "", "days=0 被拒")
+    check(tool.validate_args({"action": "search"}) == "", "合法参数通过")
+
+    # ---- search：默认只查当前工作区 + 排除自己 ----
+    fake.calls.clear()
+    res = await tool.run({"action": "search", "query": "架构"}, ctx)
+    check(res.ok, f"search 成功（{res.error if not res.ok else ''}）")
+    _, kw = fake.calls[-1]
+    check(kw.get("workspace") == "D:/proj-a", "★ 默认把当前工作区传给查询（不跨项目）")
+    check(kw.get("exclude_task_id") == "t_self", "★ 自动排除当前任务自己")
+    check(kw.get("q") == "架构", "关键词原样传给查询")
+
+    fake.calls.clear()
+    res_all = await tool.run({"action": "search", "scope": "all"}, ctx)
+    check(res_all.ok and fake.calls[-1][1].get("workspace") == "",
+          "★ scope=all 时不加工作区过滤（跨项目是显式选择）")
+
+    # ---- replay：先授权再读 ----
+    fake.calls.clear()
+    ok_rp = await tool.run({"action": "replay", "task_id": "t_hist"}, ctx)
+    check(ok_rp.ok, f"同工作区回放成功（{ok_rp.error if not ok_rp.ok else ''}）")
+    check(any(c[0] == "replay" for c in fake.calls), "授权通过后才真的去读事件")
+
+    fake.calls.clear()
+    bad_rp = await tool.run({"action": "replay", "task_id": "t_hist"},
+                            ToolContext(workspace="D:/proj-b"))
+    check(not bad_rp.ok, "★ 跨工作区回放被拒")
+    kind = (bad_rp.error or {}).get("kind") if isinstance(bad_rp.error, dict) else ""
+    check(kind == "permission_denied", f"★ 拒绝原因是 permission_denied（{kind}）")
+    check(not any(c[0] == "replay" for c in fake.calls),
+          "★★ 被拒时**根本没读事件**（授权在读取之前）")
+
+    forced = await tool.run({"action": "replay", "task_id": "t_hist", "scope": "all"},
+                            ToolContext(workspace="D:/proj-b"))
+    check(forced.ok, "scope=all 时允许跨工作区回放（显式授权）")
+
+
+async def test_desktop_locate_helpers(sb: Sandbox) -> None:
+    """[CU2] desktop_locate 的坐标解析与图片尺寸。
+
+    ★ 两个真实事故：
+      ① 模型回 {"action":"none"}（没找到）时，旧解析只认 x/y，
+         结果被误报成"输出格式不合法"——错误信息指向错的地方；
+      ② 视觉模型的 prompt 里没有图片尺寸，它凭感觉给绝对像素，
+         实测偏了约 100px，双击落到图标间隙（点空了）。
+    """
+    print("\n[CU2] desktop_locate 的坐标解析与尺寸基准")
+    from backend.tools.computer.locate import _parse_coords, _png_size
+
+    none_res = _parse_coords('{"action":"none","reason":"图里没有"}')
+    check(none_res is not None and none_res.get("action") == "none",
+          "★ 模型说'没找到'时能识别成 action=none（不会再误报成格式不合法）")
+
+    ok_res = _parse_coords('{"action":"click","x":102,"y":855,"reason":"左下"}')
+    check(ok_res and ok_res["x"] == 102 and ok_res["y"] == 855, "正常坐标能解析")
+
+    bare = _parse_coords('{"x":12,"y":34}')
+    check(bare and bare.get("action") == "click", "缺 action 字段时默认按 click 处理")
+
+    # 造一个最小 PNG 头：签名 + IHDR 长度 + "IHDR" + 宽 + 高
+    png = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x0d" + b"IHDR"
+           + (1707).to_bytes(4, "big") + (1067).to_bytes(4, "big"))
+    check(_png_size(png) == (1707, 1067),
+          "★ 能从 PNG 头读出真实宽高（capture_screen 输出被截断时的兜底）")
+    check(_png_size(b"not a png") is None, "非 PNG 不会瞎猜尺寸")
+
+    # ---- 发送前降采样（2026-11-13：超限图被服务端悄悄缩 → 坐标系统性偏移）----
+    from backend.tools.computer.locate import _fit_size
+
+    nw, nh, sc = _fit_size(1707, 1067)
+    check(nw <= 1280 and nh <= 1280, f"★ 长边超限的截图被缩到 ≤1280（{nw}×{nh}）")
+    check(nw * nh <= 1_000_000, f"★ 总像素压到 ≤1MP（{nw * nh}），不触发服务端降采样")
+    check(sc < 1.0 and abs(nw / nh - 1707 / 1067) < 0.02, "缩放保持宽高比，不变形")
+    check(_fit_size(800, 600) == (800, 600, 1.0), "本来就不超限的图不缩放")
+    check(_fit_size(0, 0) == (0, 0, 1.0), "尺寸未知时不瞎缩（交给上层兜底）")
 
 
 async def test_history_task_id_m21(sb: Sandbox) -> None:

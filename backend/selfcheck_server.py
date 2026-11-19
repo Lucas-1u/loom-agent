@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import itertools
 import shutil
 import sqlite3
 import sys
@@ -472,6 +473,394 @@ async def test_runtime(db: TmpDB) -> None:
 # --------------------------------------------------------------------------- #
 # [C2] 落盘失败时的投递可靠性
 # --------------------------------------------------------------------------- #
+async def test_budget_unlimited(db: TmpDB) -> None:
+    """[BU] 预算 0 = 不设上限（桌面模式取消硬上限，2026-11-13 用户要求）。"""
+    print("\n[BU] 预算 0 = 不设上限")
+    import time as _t
+    from backend.agent.state import Budgets
+
+    b = Budgets(max_turns=0, max_seconds=0, max_tool_calls=0)
+    b.turns_used = 500
+    b.tool_calls_used = 5000
+    check(b.check(_t.time()) is None, "★ 三项为 0 时不判超限（跑多久都不砍）")
+
+    strict = Budgets(max_turns=3, max_tool_calls=5)
+    strict.turns_used = 3
+    check(strict.check(_t.time()) == ("turns", 3, 3), "正数上限照旧生效（只有 0 才代表不限）")
+
+    sec = Budgets(max_seconds=1)
+    check(sec.check(_t.time() - 5) == ("seconds", 1, 5.0), "秒数上限照旧生效")
+
+    rt = Budgets.from_dict({"max_turns": 0, "max_seconds": 0, "turns_used": 7})
+    check(rt.max_turns == 0 and rt.max_seconds == 0,
+          "★ from_dict 不会把 0 换回默认上限（否则'不限'会静默变回'照旧限'）")
+    check(rt.turns_used == 7, "用量仍然原样还原")
+
+
+async def test_force_cancel(db: TmpDB) -> None:
+    """[FC] 强制中止：协作式取消超时后，直接 cancel 掉 asyncio task。"""
+    print("\n[FC] 强制中止（取消的第二段）")
+    import asyncio as _a
+    from backend.server.runtime import FORCE_CANCEL_GRACE_S, TaskRuntime
+
+    rt = object.__new__(TaskRuntime)     # 只测看门狗，不构造完整运行时
+    rt.task_id = "fake-force-cancel"
+    rt._force_cancel_task = None
+
+    hit: list[bool] = []
+
+    async def _forever() -> None:
+        try:
+            await _a.sleep(30)
+        except _a.CancelledError:
+            hit.append(True)
+            raise
+
+    t = _a.create_task(_forever())
+    await rt._force_cancel_later(t, 0.05)
+    await _a.sleep(0.05)
+    check(t.cancelled() or bool(hit),
+          "★ 宽限期到点后 task 真的被 cancel（不等它自己结束）")
+
+    done = _a.create_task(_a.sleep(0))
+    await done
+    await rt._force_cancel_later(done, 0.01)
+    check(done.done(), "已经结束的 task 不会被再动一次（幂等）")
+
+    check(FORCE_CANCEL_GRACE_S <= 2.0,
+          f"宽限期足够短（{FORCE_CANCEL_GRACE_S}s），用户按停止不会等太久")
+
+
+async def test_history(db: TmpDB) -> None:
+    """[HQ] 会话历史查询（#25）：搜索条件 / 回放切片 / 工作区隔离。"""
+    print("\n[HQ] 会话历史查询（搜索 + 回放）")
+    import itertools
+
+    from backend.history.query import HistoryQuery
+
+    store = db.store()
+    await store.init()
+    # ★ 用两个专供本测试的临时工作区：TmpDB 是共享的，前面的用例已经造过任务，
+    #   不带 workspace 过滤就会把别人的数据一起查出来（第一版就栽在这）。
+    ws_hq = tempfile.mkdtemp(prefix="loom_hq_a_")
+    ws_other = tempfile.mkdtemp(prefix="loom_hq_b_")
+    try:
+        await store.upsert_session(mk_session("sHQ1", ws=ws_hq))
+        await store.upsert_session(mk_session("sHQ2", ws=ws_other))
+        now = time.time()
+        eid = itertools.count(1)
+        plans = [
+            ("hq_1", "sHQ1", "分析 backend 架构并给出优化建议", ws_hq, "done", now - 3 * 86400),
+            ("hq_2", "sHQ1", "修复 sandbox 启动失败的问题", ws_hq, "failed", now - 2 * 86400),
+            ("hq_3", "sHQ2", "分析另一个项目的架构", ws_other, "done", now - 1 * 86400),
+        ]
+        for tid, sid, goal, ws, st, created in plans:
+            await store.create_task(
+                mk_task(tid, sid, goal=goal, workspace=ws, status=st, created_at=created)
+            )
+            await store.append_events([
+                {"task_id": tid, "id": next(eid), "seq": 1, "ts": created, "turn": 0,
+                 "type": "task.start", "data": {"goal": goal, "workspace": ws}},
+                {"task_id": tid, "id": next(eid), "seq": 2, "ts": created + 5, "turn": 1,
+                 "type": "tool.call", "data": {"tool": "read_file", "args": {"path": "a"}}},
+                {"task_id": tid, "id": next(eid), "seq": 3, "ts": created + 9, "turn": 1,
+                 "type": "task.end", "data": {"status": st, "reason": "x", "answer": goal}},
+            ])
+            store.rebuild_projection_sync(tid)
+
+        h = HistoryQuery(db.path)
+        check(h.usable, "库存在时 usable=True")
+
+        mine = h.search(workspace=ws_hq)
+        check(mine["total"] == 2, f"按工作区只查到本测试的 2 条（{mine['total']}）")
+        check(mine["items"][0]["task_id"] == "hq_2", "★ 按最后事件时间倒序（最近的在前）")
+
+        kw = h.search(q="架构", workspace=ws_hq)
+        check(kw["total"] == 1 and kw["items"][0]["task_id"] == "hq_1",
+              f"★ 关键词命中目标里含'架构'的（{kw['total']}）")
+
+        st = h.search(status="failed", workspace=ws_hq)
+        check(st["total"] == 1 and st["items"][0]["task_id"] == "hq_2", "按状态过滤")
+
+        check(h.search(workspace=ws_other)["total"] == 1, "★ 工作区隔离：查不到本测试以外的数据")
+
+        # 界限落在 hq_1（3 天前）与 hq_2（2 天前）之间
+        recent = h.search(workspace=ws_hq, since=now - 2.5 * 86400)
+        check(recent["total"] == 1 and recent["items"][0]["task_id"] == "hq_2",
+              "★ 时间范围过滤（since）")
+
+        excl = h.search(workspace=ws_hq, exclude_task_id="hq_1")
+        check(excl["total"] == 1, "★ exclude_task_id 能排除自己")
+
+        lim = h.search(workspace=ws_hq, limit=1)
+        check(lim["returned"] == 1 and lim["truncated"] is True,
+              f"★ 截断标记：returned={lim['returned']} truncated={lim['truncated']}")
+
+        # ---- 回放 ----
+        rp = h.replay("hq_1")
+        check(rp is not None and rp["total"] == 3, f"回放拿到全部事件（{rp and rp['total']}）")
+        check([e["type"] for e in rp["events"]] == ["task.start", "tool.call", "task.end"],
+              "★ 事件按 seq 顺序")
+        check(rp["task"]["workspace"] == ws_hq, "回放带任务摘要（含所属工作区）")
+
+        only_start = h.replay("hq_1", kinds=["task.start"])
+        check(only_start["total"] == 1, "★ kinds 只回放指定类型")
+
+        by_turn = h.replay("hq_1", from_turn=1)
+        check(by_turn["total"] == 2, f"★ 按轮次切片（turn>=1 有 {by_turn['total']} 条）")
+
+        check(h.replay("nope") is None, "★ 不存在的任务返回 None（上层好判 404）")
+        check(h.get_task("hq_2")["workspace"] == ws_hq, "get_task 能单独取任务行（回放前授权用）")
+    finally:
+        shutil.rmtree(ws_hq, ignore_errors=True)
+        shutil.rmtree(ws_other, ignore_errors=True)
+
+
+async def test_token_usage(db: TmpDB) -> None:
+    """[TK] token 计量（#4）：llm.usage 事件 → 投影 → 查询，以及重建一致性。
+
+    ★ 为什么这条链要单独测：token 是**投影派生字段**，它的可信度完全取决于
+      "事件里写对了 + 推导时算对了 + 重建后还一样"。任何一环松了，
+      统计出来的数字就是编的。
+    """
+    print("\n[TK] token 计量（llm.usage → 投影 → 查询）")
+    from backend.history.query import HistoryQuery
+
+    store = db.store()
+    await store.init()
+    ws = tempfile.mkdtemp(prefix="loom_tk_")
+    try:
+        await store.upsert_session(mk_session("sTK", ws=ws))
+        await store.create_task(
+            mk_task("tk_1", "sTK", goal="算 token", workspace=ws, status="done")
+        )
+        await store.append_events([
+            {"task_id": "tk_1", "id": 9001, "seq": 1, "ts": 1.0, "turn": 0,
+             "type": "task.start", "data": {"goal": "算 token"}},
+            {"task_id": "tk_1", "id": 9002, "seq": 2, "ts": 2.0, "turn": 1,
+             "type": "llm.usage",
+             "data": {"prompt_tokens": 1200, "completion_tokens": 300, "reasoning_tokens": 200}},
+            {"task_id": "tk_1", "id": 9003, "seq": 3, "ts": 3.0, "turn": 2,
+             "type": "llm.usage",
+             "data": {"prompt_tokens": 1800, "completion_tokens": 150, "reasoning_tokens": 100}},
+            # 脏数据：导入外部任务时可能出现，不能让整个投影崩
+            {"task_id": "tk_1", "id": 9004, "seq": 4, "ts": 4.0, "turn": 3,
+             "type": "llm.usage",
+             "data": {"prompt_tokens": "bad", "completion_tokens": None, "reasoning_tokens": 50}},
+            {"task_id": "tk_1", "id": 9005, "seq": 5, "ts": 5.0, "turn": 3,
+             "type": "task.end",
+             "data": {"status": "done", "reason": "agent_done", "answer": "ok"}},
+        ])
+
+        p = store.rebuild_projection_sync("tk_1")
+        check(p["llm_calls"] == 3, f"★ 统计模型调用次数（{p['llm_calls']}）")
+        check(p["prompt_tokens"] == 3000, f"★ prompt token 累加（{p['prompt_tokens']}）")
+        check(p["completion_tokens"] == 450, f"completion token 累加（{p['completion_tokens']}）")
+        check(p["reasoning_tokens"] == 350, f"reasoning token 累加（{p['reasoning_tokens']}）")
+
+        # ---- 重建一致性：删表 → 全量重放 → 数值必须一样 ----
+        before = dict(store.get_projection_sync("tk_1"))
+        store.clear_projections_sync()
+        store.rebuild_projections_sync()
+        after = dict(store.get_projection_sync("tk_1"))
+        for k in ("prompt_tokens", "completion_tokens", "reasoning_tokens", "llm_calls"):
+            check(before[k] == after[k], f"★ 重建后 {k} 逐值一致（{before[k]}）")
+
+        # ---- 查询层能带出来 ----
+        h = HistoryQuery(db.path)
+        item = h.search(workspace=ws)["items"][0]
+        check(item["prompt_tokens"] == 3000, "★ /api/history 的条目带 token")
+        check(item["llm_calls"] == 3, "★ 条目也带调用次数")
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_stats_agg(db: TmpDB) -> None:
+    """[ST] 统计聚合（#52）：总量 / 成功率 / token / 按天分组 / 工作区过滤。"""
+    print("\n[ST] 统计聚合（/api/stats 的底层）")
+    from backend.history.query import HistoryQuery
+
+    store = db.store()
+    await store.init()
+    ws = tempfile.mkdtemp(prefix="loom_st_")
+    try:
+        await store.upsert_session(mk_session("sST", ws=ws))
+        now = time.time()
+        eid = itertools.count(5001)
+        # 今天 2 个（1 成 1 败），昨天 1 个（成）
+        plan = [
+            ("st_1", "done", now - 60, 1000, 200),
+            ("st_2", "failed", now - 30, 500, 100),
+            ("st_3", "done", now - 86400, 2000, 400),
+        ]
+        for tid, st, ts, pt, ct in plan:
+            await store.create_task(
+                mk_task(tid, "sST", goal=f"任务 {tid}", workspace=ws, status=st)
+            )
+            await store.append_events([
+                {"task_id": tid, "id": next(eid), "seq": 1, "ts": ts, "turn": 1,
+                 "type": "task.start", "data": {}},
+                {"task_id": tid, "id": next(eid), "seq": 2, "ts": ts + 1, "turn": 1,
+                 "type": "llm.usage",
+                 "data": {"prompt_tokens": pt, "completion_tokens": ct, "reasoning_tokens": 0,
+                          # #52：墙钟分解所需字段
+                          "duration_ms": 1000, "first_token_ms": 300}},
+                {"task_id": tid, "id": next(eid), "seq": 3, "ts": ts + 2, "turn": 1,
+                 "type": "tool.result",
+                 "data": {"tool": "read_file", "ok": True, "duration_ms": 200}},
+                {"task_id": tid, "id": next(eid), "seq": 4, "ts": ts + 3, "turn": 1,
+                 "type": "task.end", "data": {"status": st, "reason": "x", "answer": "a"}},
+            ])
+            store.rebuild_projection_sync(tid)
+
+        h = HistoryQuery(db.path)
+        s = h.stats(days=7, workspace=ws)
+        t = s["totals"]
+        check(t["tasks"] == 3, f"窗口内任务数（{t['tasks']}）")
+        check(t["done"] == 2 and t["failed"] == 1, "完成/失败分别计数")
+        check(abs(t["success_rate"] - 0.667) < 0.01, f"★ 成功率 = 完成/总数（{t['success_rate']}）")
+        check(t["prompt_tokens"] == 3500, f"★ token 汇总（{t['prompt_tokens']}）")
+        check(t["completion_tokens"] == 700, f"输出 token 汇总（{t['completion_tokens']}）")
+        check(t["llm_calls"] == 3, "模型调用次数汇总")
+
+        # ---- 墙钟分解（#52）----
+        check(t["llm_ms"] == 3000, f"★ 模型墙钟累加（{t['llm_ms']}ms）")
+        check(t["tool_ms"] == 600, f"★ 工具墙钟累加（{t['tool_ms']}ms）")
+        check(t["busy_ms"] == 3600, f"两项之和（{t['busy_ms']}ms）")
+        check(abs(t["llm_ratio"] - 0.833) < 0.01,
+              f"★★ 模型占比 = llm/(llm+tool)（{t['llm_ratio']}）")
+        check(abs(t["avg_first_token_ms"] - 300) < 0.1,
+              f"★ 首 token 取平均而不是总和（{t['avg_first_token_ms']}ms）")
+        check(abs(t["avg_llm_ms"] - 1000) < 0.1, f"单次模型调用平均（{t['avg_llm_ms']}ms）")
+        check(abs(t["avg_tool_ms"] - 200) < 0.1, f"单次工具平均（{t['avg_tool_ms']}ms）")
+
+        days = s["by_day"]
+        check(len(days) >= 1, f"按天分组有数据（{len(days)} 天）")
+        check(sum(d["tasks"] for d in days) == 3, "★ 按天分组后总数与总量一致")
+        # 跨天：今天 2、昨天 1（若测试恰好在午夜跑，可能并成一天）
+        today_rows = [d for d in days if d["tasks"] == 2]
+        check(bool(today_rows) or len(days) == 1,
+              "★ 今天的两条归到同一天（日期分组按最后事件时间）")
+
+        other = h.stats(days=7, workspace="D:/nowhere-else")
+        check(other["totals"]["tasks"] == 0, "★ 别的工作区查不到本测试的数据")
+
+        empty = h.stats(days=7, workspace=ws)["by_day"]
+        check(all(d["date"] for d in empty), "每行都带日期键（前端补零要用）")
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_session_delete(db: TmpDB) -> None:
+    """[SD] 删除会话：级联清理 + 产物三判据（新建 / 被改过 / 原本就有）。
+
+    ★ 这个功能会真删文件，所以自检必须覆盖"什么不该删"——
+      错删用户原有文件是不可逆伤害，比漏删严重得多。
+    """
+    print("\n[SD] 删除会话（级联清理 + 产物判定）")
+    import os as _os
+
+    from backend.server.session_delete import build_plan, execute_plan
+    from backend.tools.hashing import sha256_file
+
+    _EID_SD = itertools.count(7001)
+
+    store = db.store()
+    await store.init()
+    ws = tempfile.mkdtemp(prefix="loom_sd_")
+    try:
+        await store.upsert_session(mk_session("sDel", ws=ws))
+
+        made = _os.path.join(ws, "made.md")          # 本会话新建、未改 → 应删
+        edited = _os.path.join(ws, "edited.md")      # 本会话新建、后来被改 → 不删
+        existed = _os.path.join(ws, "orig.txt")      # 会话前就存在 → 不删
+        for p, txt in ((made, "A"), (edited, "B"), (existed, "C")):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(txt)
+
+        h_made, h_edited, h_orig = (sha256_file(p) for p in (made, edited, existed))
+
+        await store.create_task(
+            mk_task("sd_1", "sDel", goal="写几个文件", workspace=ws, status="done")
+        )
+        # 写 state（change_records 是产物判定的唯一依据）
+        store.save_task_sync(
+            "sd_1",
+            status="done",
+            state={
+                "change_records": [
+                    {"path": "made.md", "action": "create", "before_hash": "",
+                     "after_hash": h_made, "ts": 1.0},
+                    {"path": "edited.md", "action": "create", "before_hash": "",
+                     "after_hash": h_edited, "ts": 2.0},
+                    {"path": "orig.txt", "action": "overwrite", "before_hash": h_orig,
+                     "after_hash": h_orig, "ts": 3.0},
+                ]
+            },
+            end_reason="agent_done",
+            result="ok",
+        )
+        await store.append_events([
+            {"task_id": "sd_1", "id": next(_EID_SD), "seq": 1, "ts": 1.0, "turn": 1,
+             "type": "task.start", "data": {}},
+            {"task_id": "sd_1", "id": next(_EID_SD), "seq": 2, "ts": 2.0, "turn": 1,
+             "type": "task.end", "data": {"status": "done", "reason": "agent_done", "answer": "ok"}},
+        ])
+        store.rebuild_projection_sync("sd_1")
+
+        # 模拟"会话结束后用户又改了这个文件"
+        with open(edited, "a", encoding="utf-8") as f:
+            f.write("\n后面加的")
+
+        plan = build_plan(store, "sDel")
+        check(plan is not None and plan["tasks"] == 1, "★ 预案统计到 1 个任务")
+        check(plan["artifacts"]["total"] == 1, f"★ 只有 1 个可删产物（{plan['artifacts']['total']}）")
+        check([f["path"] for f in plan["artifacts"]["files"]] == ["made.md"], "可删的是 made.md")
+        reasons = {s["path"]: s["reason"] for s in plan["artifacts"]["skipped"]}
+        check("edited.md" in reasons and "已被后续修改" in reasons["edited.md"],
+              f"★★ 被改过的文件不进删除列表（{reasons.get('edited.md')}）")
+        check("orig.txt" in reasons and "已存在" in reasons["orig.txt"],
+              f"★★ 本来就有的文件不进删除列表（{reasons.get('orig.txt')}）")
+
+        res = execute_plan(store, "sDel", with_artifacts=True)
+        check(not _os.path.exists(made), "★ 本会话新建的文件已删除")
+        check(_os.path.exists(edited), "★★ 被改过的文件仍然在")
+        check(_os.path.exists(existed), "★★ 原有文件仍然在")
+        check(bool(res["removed_files"]) and _os.path.isfile(res["removed_files"][0]["backup"]),
+              "★ 删除前留了备份")
+        check(store.get_session_sync("sDel") is None, "★ 会话行已删")
+        check(store.events_count_sync("sd_1") == 0, "★ 事件已清（没有外键，必须显式删）")
+        check(store.get_projection_sync("sd_1") is None, "★ 投影已清")
+        check(store.get_task_sync("sd_1") is None, "★ 任务已删")
+
+        # ---- 仅删会话：文件一个都不动 ----
+        ws2 = tempfile.mkdtemp(prefix="loom_sd2_")
+        try:
+            await store.upsert_session(mk_session("sDel2", ws=ws2))
+            await store.create_task(
+                mk_task("sd_2", "sDel2", goal="写文件", workspace=ws2, status="done")
+            )
+            keep = _os.path.join(ws2, "keep.md")
+            with open(keep, "w", encoding="utf-8") as f:
+                f.write("x")
+            h_keep = sha256_file(keep)
+            store.save_task_sync(
+                "sd_2", status="done",
+                state={"change_records": [
+                    {"path": "keep.md", "action": "create", "before_hash": "",
+                     "after_hash": h_keep, "ts": 1.0},
+                ]},
+            )
+            res2 = execute_plan(store, "sDel2", with_artifacts=False)
+            check(_os.path.exists(keep), "★★ with_artifacts=False 时文件一个不动")
+            check(res2["removed_files"] == [], "没有删除任何文件")
+            check(store.get_session_sync("sDel2") is None, "会话行仍然删掉了")
+        finally:
+            shutil.rmtree(ws2, ignore_errors=True)
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
 async def test_runtime_persist_failure(db: TmpDB) -> None:
     """
     ★ 回归用例：落盘失败曾经会**吞掉事件**。
@@ -639,8 +1028,15 @@ async def run_async_suites(db: TmpDB) -> None:
     await test_store_concurrent_sqlite(db)
     await test_hub()
     await test_runtime(db)
+    await test_budget_unlimited(db)
+    await test_force_cancel(db)
     await test_runtime_persist_failure(db)
     await test_event_archive(db)
+    await test_projections(db)
+    await test_history(db)
+    await test_token_usage(db)
+    await test_stats_agg(db)
+    await test_session_delete(db)
     await test_scheduler(db)
 
 
@@ -744,6 +1140,48 @@ def test_events_http(db: TmpDB) -> None:
             check("events" in h and h["events"]["enabled"] is True,
                   "health 暴露事件落盘状态")
             check(h["events"]["retention_days"] == 30, "health 带保留天数")
+
+            # ---- 投影接口（#51）----------------------------------------
+            # t_evh 已有 3 条 thinking 事件，先补一条 task.end 让投影有 status
+            store.append_events_sync([
+                {"task_id": tid, "id": 100, "seq": 4, "ts": time.time(),
+                 "turn": 1, "type": "task.end",
+                 "data": {"status": "done", "reason": "agent_done", "answer": "完成"}},
+            ])
+            # 直接写事件不走 runtime，投影行不会自动维护 —— 先手动重建
+            store.rebuild_projection_sync(tid)
+
+            # 单任务投影
+            rp = client.get(f"/api/tasks/{tid}/projection")
+            check(rp.status_code == 200, f"投影接口 200（{rp.status_code}）")
+            pb = rp.json()
+            check(pb.get("status") == "done", f"★ 投影 status 从 task.end 推导（{pb.get('status')}）")
+            check(pb.get("event_count") == 4, f"★ 投影 event_count=4（{pb.get('event_count')}）")
+            check(pb.get("has_final_answer") == 0, f"无 final_answer（{pb.get('has_final_answer')}）")
+
+            # 不存在的任务 → 404
+            rp404 = client.get("/api/tasks/nonexistent/projection")
+            check(rp404.status_code == 404, f"无投影任务 → 404（{rp404.status_code}）")
+
+            # 列表查询：按 status 过滤
+            rlist = client.get("/api/projections", params={"status": "done"}).json()
+            check(any(item["task_id"] == tid for item in rlist["items"]),
+                  f"★ 列表按 status=done 过滤到 t_evh（{len(rlist['items'])} 行）")
+            check(rlist["total"] >= 1, f"列表 total 正确（{rlist['total']}）")
+
+            # 全量重建
+            rreb = client.post("/api/maintenance/rebuild-projections").json()
+            check(rreb.get("ok") is True and rreb.get("rebuilt") >= 1,
+                  f"★ 全量重建接口可用（rebuilt={rreb.get('rebuilt')}）")
+
+            # 单任务重建
+            rsingle = client.post(f"/api/tasks/{tid}/rebuild-projection").json()
+            check(rsingle.get("status") == "done",
+                  f"★ 单任务重建接口可用（status={rsingle.get('status')}）")
+
+            # health 里有投影计数
+            check("projections" in h and "count" in h["projections"],
+                  f"★ health 暴露投影计数（{h.get('projections')}）")
     finally:
         try:
             store.close_sync()
@@ -1454,6 +1892,180 @@ async def test_event_archive(db: TmpDB) -> None:
 
     await archive.stop()
     await store.close()
+
+
+async def test_projections(db: TmpDB) -> None:
+    """[EV] 会话投影（#51）：从事件流派生的可重建查询表。"""
+    print("\n[EV] 会话投影（#51）")
+
+    # ★ 用独立数据库：db 在多个测试间共享，前面的测试已经建了 t1/t_old_* 等任务，
+    #   全量重建会把它们一起算进来，断言"重建了 2 个"就会失败。投影测试要自洽。
+    isolated = TmpDB()
+    store = isolated.store()
+    await store.init()
+    ws = "D:/proj"
+    await store.upsert_session(mk_session("s_p", ws))
+    await store.create_task(mk_task("p1", "s_p"))
+    await store.create_task(mk_task("p2", "s_p"))
+
+    # ---- ① 造事件：覆盖所有被投影推导用到的类型 ----
+    now = time.time()
+    # p1：完整跑通的任务（start → thinking → tool.call → tool.result → final_answer → end）
+    p1_events = [
+        {"task_id": "p1", "id": 1, "seq": 1, "ts": now, "turn": 0, "type": "task.start",
+         "data": {"goal": "做点事"}},
+        {"task_id": "p1", "id": 2, "seq": 2, "ts": now + 1, "turn": 1, "type": "thinking",
+         "data": {"text": "想一下", "phase": "plan"}},
+        {"task_id": "p1", "id": 3, "seq": 3, "ts": now + 2, "turn": 1, "type": "tool.call",
+         "data": {"call_id": "c1", "tool": "read_file"}},
+        {"task_id": "p1", "id": 4, "seq": 4, "ts": now + 3, "turn": 1, "type": "tool.result",
+         "data": {"call_id": "c1", "tool": "read_file", "ok": True}},
+        {"task_id": "p1", "id": 5, "seq": 5, "ts": now + 4, "turn": 1, "type": "tool.call",
+         "data": {"call_id": "c2", "tool": "write_file"}},
+        {"task_id": "p1", "id": 6, "seq": 6, "ts": now + 5, "turn": 1, "type": "tool.result",
+         "data": {"call_id": "c2", "tool": "write_file", "ok": True}},
+        {"task_id": "p1", "id": 7, "seq": 7, "ts": now + 6, "turn": 2, "type": "final_answer",
+         "data": {"text": "完成了"}},
+        {"task_id": "p1", "id": 8, "seq": 8, "ts": now + 7, "turn": 2, "type": "task.end",
+         "data": {"status": "done", "reason": "agent_done", "answer": "完成了"}},
+    ]
+    await store.append_events(p1_events)
+
+    # p2：失败的任务（带 error + budget.exceeded）
+    p2_events = [
+        {"task_id": "p2", "id": 9, "seq": 1, "ts": now + 10, "turn": 0, "type": "task.start",
+         "data": {"goal": "另一个任务"}},
+        {"task_id": "p2", "id": 10, "seq": 2, "ts": now + 11, "turn": 1, "type": "error",
+         "data": {"kind": "internal_error", "message": "boom", "fatal": True}},
+        {"task_id": "p2", "id": 11, "seq": 3, "ts": now + 12, "turn": 1, "type": "budget.exceeded",
+         "data": {"kind": "seconds", "limit": 60, "used": 60}},
+        {"task_id": "p2", "id": 12, "seq": 4, "ts": now + 13, "turn": 1, "type": "task.end",
+         "data": {"status": "aborted", "reason": "budget_seconds", "answer": ""}},
+    ]
+    await store.append_events(p2_events)
+
+    # ---- ② 全量重建 ----
+    count = await store.rebuild_projections()
+    check(count == 2, f"全量重建了 2 个任务（实际 {count}）")
+
+    # ---- ③ 验证派生字段正确性 ----
+    p1 = await store.get_projection("p1")
+    check(p1 is not None, "p1 投影行存在")
+    if p1:
+        check(p1["status"] == "done", f"status 从 task.end 推导（{p1['status']}）")
+        check(p1["end_reason"] == "agent_done", f"end_reason 推导（{p1['end_reason']}）")
+        check(p1["result"] == "完成了", f"result 推导（{p1['result']}）")
+        check(p1["tool_call_count"] == 2, f"tool_call 计数（{p1['tool_call_count']}）")
+        check(p1["tool_result_count"] == 2, f"tool_result 计数（{p1['tool_result_count']}）")
+        check(p1["has_final_answer"] == 1, f"has_final_answer（{p1['has_final_answer']}）")
+        check(p1["final_answer_len"] == 3, f"final_answer 长度（{p1['final_answer_len']}）")
+        check(p1["has_error"] == 0, f"无 error（{p1['has_error']}）")
+        check(p1["error_count"] == 0, f"error 计数（{p1['error_count']}）")
+        check(p1["budget_exceeded"] == 0, f"无预算超限（{p1['budget_exceeded']}）")
+        check(p1["turn_max"] == 2, f"turn 最大值（{p1['turn_max']}）")
+        check(p1["event_count"] == 8, f"事件总数（{p1['event_count']}）")
+        check(p1["first_ts"] == now, f"首事件时间（{p1['first_ts']}）")
+        check(p1["last_ts"] == now + 7, f"末事件时间（{p1['last_ts']}）")
+
+    p2 = await store.get_projection("p2")
+    check(p2 is not None, "p2 投影行存在")
+    if p2:
+        check(p2["status"] == "aborted", f"p2 status 推导（{p2['status']}）")
+        check(p2["has_error"] == 1, f"p2 有 error（{p2['has_error']}）")
+        check(p2["error_count"] == 1, f"p2 error 计数（{p2['error_count']}）")
+        check(p2["budget_exceeded"] == 1, f"p2 预算超限（{p2['budget_exceeded']}）")
+        check(p2["has_final_answer"] == 0, f"p2 无 final_answer（{p2['has_final_answer']}）")
+        check(p2["tool_call_count"] == 0, f"p2 无工具调用（{p2['tool_call_count']}）")
+
+    # ---- ④ ★★★ 验收核心：删掉 → 重建 → 逐行一致（rebuilt_at 除外）----
+    #   投影的契约就是"可从事实重建"，这条测试是这个契约的直接验证。
+    before_p1 = dict(p1) if p1 else {}
+    before_p2 = dict(p2) if p2 else {}
+    deleted = await store.clear_projections()
+    check(deleted == 2, f"清空投影表删掉 2 行（实际 {deleted}）")
+    check(await store.get_projection("p1") is None, "清空后 p1 投影不存在")
+    check(await store.get_projection("p2") is None, "清空后 p2 投影不存在")
+
+    count2 = await store.rebuild_projections()
+    check(count2 == 2, f"重建后又得到 2 行（实际 {count2}）")
+
+    after_p1 = await store.get_projection("p1")
+    after_p2 = await store.get_projection("p2")
+    check(after_p1 is not None and after_p2 is not None, "重建后两行都回来了")
+
+    # 逐行比对：除了 rebuilt_at（元数据，两次重建必然不同），其余字段必须一致
+    fields = [
+        "task_id", "status", "end_reason", "result", "tool_call_count",
+        "tool_result_count", "has_final_answer", "final_answer_len",
+        "has_error", "error_count", "budget_exceeded", "turn_max",
+        "event_count", "first_ts", "last_ts",
+    ]
+    diff_p1 = [f for f in fields if before_p1.get(f) != (after_p1 or {}).get(f)]
+    diff_p2 = [f for f in fields if before_p2.get(f) != (after_p2 or {}).get(f)]
+    check(not diff_p1, f"★★★ p1 重建后逐字段一致（差异：{diff_p1}）")
+    check(not diff_p2, f"★★★ p2 重建后逐字段一致（差异：{diff_p2}）")
+    # rebuilt_at 确实更新了（证明是真实重建，不是缓存）
+    check(after_p1 and after_p1["rebuilt_at"] != before_p1.get("rebuilt_at"),
+          f"★ rebuilt_at 已更新（{before_p1.get('rebuilt_at')} → {after_p1['rebuilt_at'] if after_p1 else '?'}）")
+
+    # ---- ⑤ 单任务重建 ----
+    p1_again = await store.rebuild_projection("p1")
+    check(p1_again is not None and p1_again["status"] == "done",
+          "单任务重建正确")
+
+    # ---- ⑥ 列表查询：按 status / has_final_answer 过滤 ----
+    done_list = await store.list_projections(status="done")
+    check(len(done_list) == 1 and done_list[0]["task_id"] == "p1",
+          f"按 status=done 过滤出 p1（{len(done_list)} 行）")
+    aborted_list = await store.list_projections(status="aborted")
+    check(len(aborted_list) == 1 and aborted_list[0]["task_id"] == "p2",
+          f"按 status=aborted 过滤出 p2（{len(aborted_list)} 行）")
+    with_answer = await store.list_projections(has_final_answer=1)
+    check(len(with_answer) == 1 and with_answer[0]["task_id"] == "p1",
+          f"按 has_final_answer=1 过滤（{len(with_answer)} 行）")
+    no_answer = await store.list_projections(has_final_answer=0)
+    check(len(no_answer) == 1 and no_answer[0]["task_id"] == "p2",
+          f"按 has_final_answer=0 过滤（{len(no_answer)} 行）")
+    by_session = await store.list_projections(session_id="s_p")
+    check(len(by_session) == 2, f"按 session 过滤出 2 行（{len(by_session)}）")
+
+    # ---- ⑦ prune 同步清理投影（事实被删，投影不能留）----
+    #   造一个终态老任务，给它事件 + 投影，prune 后投影必须一起消失
+    old_now = time.time() - 10 * 86400
+    await store.create_task(mk_task("p_old", "s_p",
+                                    status="done", created_at=old_now))
+    await store.append_events([
+        {"task_id": "p_old", "id": 99, "seq": 1, "ts": old_now, "turn": 0,
+         "type": "task.end", "data": {"status": "done", "reason": "x", "answer": "ok"}},
+    ])
+    await store.rebuild_projection("p_old")
+    check(await store.get_projection("p_old") is not None, "老任务投影已建")
+    pruned = await store.prune_events(old_now + 7 * 86400)
+    check(pruned == 1, f"prune 删掉 1 个老任务事件（{pruned}）")
+    check(await store.get_projection("p_old") is None,
+          "★★ prune 同步清掉了老任务的投影行（事实没了投影不能留）")
+    # 运行中任务的投影不受影响
+    check(await store.get_projection("p1") is not None, "运行中任务投影不受影响")
+
+    # ---- ⑧ 导入任务后自动重建投影 ----
+    exp = await store.export_task("p1")
+    check(exp is not None, "p1 可导出")
+    res = await store.import_task(exp)
+    check(res["task_id"] != "p1", f"导入自动改名（{res['task_id']}）")
+    imported_proj = await store.get_projection(res["task_id"])
+    check(imported_proj is not None, "★ 导入后自动重建了投影行")
+    if imported_proj:
+        check(imported_proj["status"] == "done", f"导入投影 status 正确（{imported_proj['status']}）")
+        check(imported_proj["tool_call_count"] == 2, f"导入投影工具计数正确（{imported_proj['tool_call_count']}）")
+
+    # ---- ⑨ 投影行可 JSON 化（接口层要序列化）----
+    for p in (after_p1, after_p2, imported_proj):
+        if p:
+            blob = json.dumps(p, ensure_ascii=False, default=str)
+            check(True, f"投影行 {p['task_id']} 可 JSON 化（{len(blob)} 字节）")
+
+    await store.close()
+    isolated.cleanup()
 
 
 async def test_m1(db: TmpDB) -> None:

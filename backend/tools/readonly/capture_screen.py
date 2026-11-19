@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import os
+import re
 import shutil
 from typing import Any
 
@@ -27,6 +28,11 @@ from ..base import ErrorKind, Tool, ToolContext, ToolResult, timed
 from ...agent.state import RiskLevel
 
 MAX_BYTES = 60 * 1024 * 1024  # 60MB 上限（正常全屏 PNG 远小于此）
+
+# PowerShell 脚本最后一行 `Write-Output "OK $w $h"` —— 截图的真实像素尺寸。
+# ★ 必须把它解析出来并回传：视觉定位（desktop_locate）要拿它当坐标基准，
+#   否则模型不知道图多大，只能凭感觉猜绝对像素，误差可达上百像素（实测点偏过）。
+_OK_SIZE_RE = re.compile(rb"OK\s+(\d+)\s+(\d+)")
 
 _PS_HEAD = r"""
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
@@ -140,12 +146,29 @@ class CaptureScreenTool(Tool):
                     hint="正常全屏 PNG 不会这么大——检查是否截到了奇怪内容。",
                 )
 
+            # 真实像素尺寸（解析失败不致命：定位那边还有 PNG 头兜底）
+            width = height = 0
+            m = _OK_SIZE_RE.search(_stdout or b"")
+            if m:
+                width, height = int(m.group(1)), int(m.group(2))
+
             size_kb = size // 1024
+            dim = f"，{width}×{height}" if width and height else ""
             return ToolResult.success(
                 self.name, 
-                f"已截图：{sub}/screen_{ts}.png（{size_kb} KB），绝对路径 {path}",
-                data={"path": path, "bytes": size},
+                f"已截图：{sub}/screen_{ts}.png（{size_kb} KB{dim}），绝对路径 {path}",
+                data={"path": path, "bytes": size, "width": width, "height": height},
                 duration_ms=t.ms,
+                # 对比表 #12：把图片作为**引用**回传，让主模型（若支持视觉）
+                # 能直接看到屏幕，不必再经 vision_look 中转。
+                # ★ 开不开由 AgentCore 决定（config.main_vision）—— 工具不判断，
+                #   它只负责"我产出了一张什么图"。
+                images=[{
+                    "path": path,
+                    "mime": "image/png",
+                    "bytes": size,
+                    "label": f"屏幕截图 {ts}（{width}×{height}）" if width and height else f"屏幕截图 {ts}",
+                }],
             )
 
 

@@ -76,6 +76,17 @@ class CreateTaskBody(BaseModel):
     web_search: bool = False
 
 
+class DeleteSessionBody(BaseModel):
+    """删除会话的请求体。
+
+    ★ `confirm` 不是可选项：删除不可逆，强制调用方把会话标题回显一遍，
+      挡掉"脚本写错 id 一把清空"这类事故。
+    """
+
+    with_artifacts: bool = False
+    confirm: str = ""
+
+
 class ApprovalBody(BaseModel):
     task_id: str
     decision: str = Field(pattern="^(approved|rejected)$")
@@ -143,6 +154,7 @@ def create_app(
     skills: dict[str, Any] | None = None,
     archive: EventArchive | None = None,
     retention_days: int = 0,
+    history: Any = None,
 ) -> FastAPI:
     """
     ★ `archive` / `retention_days`（对比表 #49）：
@@ -240,6 +252,10 @@ def create_app(
                 **(archive.stats() if archive is not None else {"enabled": False}),
                 "retention_days": retention_days,
             },
+            # #51：会话投影。count 让"投影表有没有在维护"一眼可见。
+            "projections": {
+                "count": await store.projections_count(),
+            },
         }
 
     # ===================================================================== #
@@ -308,6 +324,74 @@ def create_app(
         }
         await store.upsert_session(row)
         return row
+
+    # ------------------------------------------------------------------ #
+    # 删除会话（两级：仅会话 / 连产物一起）
+    # ------------------------------------------------------------------ #
+    @app.get("/api/sessions/{session_id}/delete-preview")
+    async def session_delete_preview(session_id: str) -> dict[str, Any]:
+        """
+        删除预案（只读）：将删多少任务/事件、哪些文件会被删、哪些"看着像但不能删"。
+
+        ★ 为什么必须有这一步：删除不可逆。让用户先看到清单再点确认，
+          比事后解释"为什么你的文件没了"便宜得多。
+        ★ 预览和实际删除共用 `build_plan` —— 保证"看到的就是会删的"。
+        """
+        from .session_delete import build_plan
+
+        plan = await asyncio.to_thread(build_plan, store, session_id)
+        if plan is None:
+            raise HTTPException(404, f"会话不存在：{session_id}")
+        return {"ok": True, **plan}
+
+    @app.post("/api/sessions/{session_id}/delete")
+    async def session_delete(
+        session_id: str,
+        body: DeleteSessionBody,
+    ) -> dict[str, Any]:
+        """
+        删除会话。
+
+        `with_artifacts=false` → 只清库（会话/任务/事件/投影/历史），文件一个不动。
+        `with_artifacts=true`  → 额外删除「本会话创建、且内容未变」的文件（先备份）。
+
+        ★ 必须带 `confirm`，且等于会话标题（标题为空时等于 session_id）——
+          防止脚本/误操作一把清空。
+        ★ 删除前会再查一次会话是否存在：并发删除时给个明确的 404，而不是静默成功。
+        """
+        from .session_delete import build_plan, execute_plan
+
+        plan = await asyncio.to_thread(build_plan, store, session_id)
+        if plan is None:
+            raise HTTPException(404, f"会话不存在：{session_id}")
+
+        expect = str(plan.get("confirm_text") or session_id)
+        if (body.confirm or "").strip() != expect:
+            raise HTTPException(
+                400,
+                detail={
+                    "accepted": False,
+                    "reason": "confirm_mismatch",
+                    "note": f"请输入会话标题确认：{expect}",
+                },
+            )
+
+        # 正在跑的任务不能删 —— 否则删完事件流还在往里写，产生孤儿数据
+        for t in await store.list_tasks(session_id):
+            if str(t.get("status") or "") in ("running", "queued", "created"):
+                raise HTTPException(
+                    409,
+                    detail={
+                        "accepted": False,
+                        "reason": "session_busy",
+                        "note": f"会话里还有未结束的任务（{t['task_id']}），先停下来再删。",
+                    },
+                )
+
+        res = await asyncio.to_thread(
+            execute_plan, store, session_id, with_artifacts=bool(body.with_artifacts)
+        )
+        return {"ok": True, **res}
 
     @app.get("/api/sessions/{session_id}/messages")
     async def session_messages(session_id: str) -> dict[str, Any]:
@@ -561,6 +645,150 @@ def create_app(
         cutoff = time.time() - keep * 86400
         deleted = await store.prune_events(cutoff)
         return {"deleted": deleted, "retention_days": keep, "cutoff": cutoff}
+
+    # ------------------------------------------------------------------ #
+    # 会话投影（#51）：从事件流派生的可重建查询表
+    # ------------------------------------------------------------------ #
+    # ★ 投影 ≠ 事实档案：task_events 是"发生了什么"的事实，
+    #   投影是"从事实推导出来的查询视图"。删掉投影表随时能从事件流重建，
+    #   重建后逐行一致（rebuilt_at 除外，它是元数据）。
+    #   这些接口让前端/外部不用扫事件流就能按状态/工具数等条件筛任务。
+
+    @app.get("/api/tasks/{task_id}/projection")
+    async def task_projection(task_id: str) -> dict[str, Any]:
+        """单个任务的投影行。任务不存在或没有事件时返回 404。"""
+        p = await store.get_projection(task_id)
+        if p is None:
+            raise HTTPException(404, f"任务无投影行（可能没有事件或未重建）：{task_id}")
+        return {"ok": True, **p}
+
+    @app.get("/api/projections")
+    async def list_projections(
+        status: str = Query(default="", description="按状态过滤，如 done/failed/aborted"),
+        session_id: str = Query(default="", description="按会话过滤"),
+        has_final_answer: int | None = Query(
+            default=None, description="1=只看有最终答复的，0=只看没有的"
+        ),
+        order: str = Query(default="desc", description="按 last_ts 排序方向"),
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        """
+        按条件查投影表（列表/统计接口）。
+
+        ★ 这是投影存在的意义：不用扫 task_events 全量重放，
+          直接走索引查派生字段，O(1) 拿到筛选结果。
+        """
+        rows = await store.list_projections(
+            status=status,
+            session_id=session_id,
+            has_final_answer=has_final_answer,
+            order=order,
+            limit=limit,
+            offset=offset,
+        )
+        total = await store.projections_count()
+        return {"ok": True, "total": total, "items": rows}
+
+    @app.get("/api/stats")
+    async def history_stats(
+        days: int = Query(default=30, ge=1, le=3650, description="统计最近多少天"),
+        workspace: str = Query(default="", description="按工作区过滤；空=全部"),
+    ) -> dict[str, Any]:
+        """
+        聚合统计（对比表 #52）：任务量 / 成功率 / token / 工具调用 / 按天趋势。
+
+        ★ 数据来自投影表（#51/#4），一次 GROUP BY 出结果，不扫事件流。
+        ★ 成功率的分母是**该窗口内的全部任务**（含 running）；
+          前端展示时要标明口径，别把"正在跑"算成失败。
+        """
+        if history is None or not getattr(history, "usable", False):
+            raise HTTPException(503, "统计不可用（库不存在或未装配 history）")
+        res = await asyncio.to_thread(history.stats, days=days, workspace=workspace)
+        return {"ok": True, **res}
+
+    # ------------------------------------------------------------------ #
+    # 会话历史（对比表 #25）：按条件翻历史任务 + 回放某次任务的事件
+    # ------------------------------------------------------------------ #
+    @app.get("/api/history")
+    async def search_history(
+        q: str = Query(default="", description="关键词，匹配任务目标与最终答复"),
+        status: str = Query(default="", description="done / failed / aborted / cancelled"),
+        workspace: str = Query(default="", description="按工作区精确过滤"),
+        session_id: str = Query(default=""),
+        since: float | None = Query(default=None, description="时间下限（epoch 秒）"),
+        until: float | None = Query(default=None, description="时间上限（epoch 秒）"),
+        has_error: int | None = Query(default=None, description="1=只看报过错的"),
+        budget_exceeded: int | None = Query(default=None, description="1=只看预算耗尽的"),
+        exclude_task_id: str = Query(default="", description="排除某个任务（通常是当前任务）"),
+        order: str = Query(default="desc", description="按最后事件时间排序"),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        """
+        按条件查历史任务。
+
+        ★ 数据来源是 task_projections JOIN tasks（#51 的投影 + 任务行），
+          不是扫事件流 —— 这就是投影做出来之后"顺势加查询"的地方。
+        ★ 同步 SQLite 查询放 to_thread：快是快，但别拿它堵事件循环。
+        """
+        if history is None or not getattr(history, "usable", False):
+            raise HTTPException(503, "历史查询不可用（库不存在或未装配 history）")
+        res = await asyncio.to_thread(
+            history.search,
+            q=q, status=status, workspace=workspace, session_id=session_id,
+            since=since, until=until, has_error=has_error,
+            budget_exceeded=budget_exceeded, exclude_task_id=exclude_task_id,
+            order=order, limit=limit, offset=offset,
+        )
+        return {"ok": True, **res}
+
+    @app.get("/api/tasks/{task_id}/replay")
+    async def replay_task(
+        task_id: str,
+        kinds: str = Query(default="", description="逗号分隔的事件类型；空=除 thinking 外全部"),
+        from_turn: int | None = Query(default=None),
+        to_turn: int | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict[str, Any]:
+        """
+        回放一个任务的事件时间线（按类型/轮次过滤）。
+
+        ★ 与 `/api/tasks/{id}/events` 的区别：那个是给前端的原始事件流
+          （含内存缓冲、按全局 id 增量拉取）；这个是给"翻历史"场景的
+          **按条件切片**（轮次区间、事件类型），并带任务摘要。
+        """
+        if history is None or not getattr(history, "usable", False):
+            raise HTTPException(503, "历史查询不可用（库不存在或未装配 history）")
+        wanted = [k.strip() for k in (kinds or "").split(",") if k.strip()]
+        res = await asyncio.to_thread(
+            history.replay, task_id,
+            kinds=wanted or None, from_turn=from_turn, to_turn=to_turn,
+            limit=limit, offset=offset,
+        )
+        if res is None:
+            raise HTTPException(404, f"任务不存在：{task_id}")
+        return {"ok": True, **res}
+
+    @app.post("/api/maintenance/rebuild-projections")
+    async def rebuild_projections() -> dict[str, Any]:
+        """
+        全量重建投影表：从 task_events 重放，逐任务推导派生字段。
+
+        ★ 验收入口：删掉投影表后调这个，重建结果与删除前逐行一致
+          （rebuilt_at 除外）。启动时也会自动跑一次，保证投影与事实同步。
+        """
+        count = await store.rebuild_projections()
+        return {"ok": True, "rebuilt": count}
+
+    @app.post("/api/tasks/{task_id}/rebuild-projection")
+    async def rebuild_single_projection(task_id: str) -> dict[str, Any]:
+        """重建单个任务的投影行（任务结束时会自动维护，此接口用于手动修复）。"""
+        p = await store.rebuild_projection(task_id)
+        if p is None:
+            raise HTTPException(404, f"任务无事件可重建投影：{task_id}")
+        return {"ok": True, **p}
 
     @app.post("/api/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str) -> dict[str, Any]:

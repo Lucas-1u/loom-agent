@@ -53,6 +53,9 @@ export const ENDPOINTS = {
   // ---- 询问用户（ask_user）----
   userInput: (taskId: string) => `/api/tasks/${taskId}/user-input`,
 
+  // ---- 统计（对比表 #52）----
+  stats: "/api/stats",
+
   // ---- SSE ----
   stream: "/api/stream",
 } as const;

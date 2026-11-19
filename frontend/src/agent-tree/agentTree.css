@@ -1,0 +1,277 @@
+/* 「Agent 工作树」独立页面的样式（深色，对齐主应用）。
+ *
+ * 不走 Tailwind：这一页的尺寸是逐像素对着规格定的（32×80 色条、1.5px 连线、
+ * 竖排标签），手写 CSS 比一串工具类更直观，也不会被主应用的全局样式干扰。
+ *
+ * ★ 色板直接对齐 src/index.css 的设计令牌（那个文件不在这页的依赖里，
+ *   所以这里把同样的值抄了一份）。主应用改配色时，这几个值要一起改。
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* 背景层级 */
+  --at-bg: #0a0c11;            /* ink-950 页面 */
+  --at-panel: #0e1117;         /* ink-900 面板 */
+  --at-card: #12161e;          /* ink-850 卡片 */
+  --at-hover: #171c25;         /* ink-800 悬浮 */
+  --at-border: #212934;        /* ink-700 边框 */
+  --at-border-strong: #2c3644; /* ink-600 强边框 */
+
+  /* 文字 */
+  --at-ink: #dbe3ef;
+  --at-ink-strong: #eef3fb;
+  --at-ink-soft: #8b9bb4;
+  --at-ink-faint: #64748b;
+
+  /* ---- 悬停卡片 ----
+   * ★ 卡片底用 ink-800 而不是 ink-850：主应用里 ink-850 是"页面里的卡片"，
+   *   而 tooltip 是**浮在最上层的临时层**，对应 ink-800（悬浮/输入框那一档）。
+   *   而且它直接压在 ink-950 上，只差一档会看不出层次。
+   */
+  --at-tip-bg: #171c25;        /* ink-800 */
+  --at-tip-border: #2c3644;    /* ink-600 */
+
+  /* 连线：深底上不能太亮（抢色条），也不能太暗（消失） */
+  --at-line: #3f4a5e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--at-bg);
+  color: var(--at-ink);
+  font-family: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.at-page {
+  min-height: 100vh;
+  padding: 32px 24px 56px;
+}
+
+/* ---- 页头 ---------------------------------------------------------- */
+.at-header {
+  text-align: center;
+}
+
+.at-title {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--at-ink-strong);
+}
+
+.at-sub {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--at-ink-faint);
+}
+
+/* ---- 画布 ----------------------------------------------------------
+ * 横向可滚动：真实数据一宽，页面不能被撑破。
+ * canvas 用 margin:auto 居中；当它比容器宽时 margin 自动失效，转为滚动。
+ */
+.at-scroll {
+  margin-top: 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 8px 0 24px;
+}
+
+.at-canvas {
+  position: relative;
+  margin: 0 auto;
+}
+
+/* ---- 连线 ---------------------------------------------------------- */
+.at-edges {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.at-edges line {
+  stroke: var(--at-line);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+/* ---- 节点 ----------------------------------------------------------
+ * 容器就是色条的尺寸（32×80），标签绝对定位溢出到上方或下方。
+ * 这样 hover 命中区严格等于色条 + 标签本身，不会因为外层留白误触。
+ */
+.at-node {
+  position: absolute;
+  outline: none;
+  cursor: default;
+}
+
+.at-node:hover,
+.at-node:focus-visible {
+  z-index: 3;
+}
+
+.at-node__bar {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 2px;
+}
+
+.at-node:hover .at-node__bar,
+.at-node:focus-visible .at-node__bar {
+  box-shadow: 0 0 0 3px rgba(91, 157, 255, 0.28);
+}
+
+.at-node__label {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  color: var(--at-ink);
+  font-size: 16px;
+  line-height: 1.2;
+  pointer-events: none; /* 事件由容器统一处理，避免 label 溢出部分漏掉 hover */
+}
+
+/* 前两层：横排、色条正上方 */
+.at-node--label-top .at-node__label {
+  bottom: calc(100% + 10px);
+}
+
+/* 更深的层：竖排、色条正下方（每个字自上而下） */
+.at-node--label-bottom .at-node__label {
+  top: calc(100% + 12px);
+  font-size: 14px;
+  letter-spacing: 1px;
+  color: #c3cfe0;
+  writing-mode: vertical-rl;
+  text-orientation: upright;
+}
+
+/* running：轻微呼吸，让"还在跑"一眼可见；不改变颜色语义
+ * ★ 幅度只到 0.78：早期用 0.5 时，截图/扫视的瞬间蓝色会被压成暗蓝，
+ *   看起来像"灰色未启用"，和状态语义冲突。 */
+@keyframes at-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.78;
+  }
+}
+
+.at-node__bar[data-status="running"] {
+  animation: at-breathe 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .at-node__bar[data-status="running"] {
+    animation: none;
+  }
+}
+
+/* ---- 悬停卡片 ------------------------------------------------------
+ * pointer-events:none 很关键：鼠标从节点移向卡片时，卡片不能抢走 hover，
+ * 否则会触发节点的 mouseleave → 卡片刚出现就消失。
+ */
+.at-tip {
+  position: fixed;
+  z-index: 50;
+  width: 260px;
+  max-width: 260px;
+  padding: 12px 14px;
+  background: var(--at-tip-bg);
+  border: 1px solid var(--at-tip-border);
+  border-radius: 10px;
+  /* 深色下阴影要更重才有层次；再补一圈 1px 内高光模拟"浮起来" */
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.55),
+    0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  pointer-events: none;
+}
+
+.at-tip__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.at-tip__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--at-ink-strong);
+}
+
+/* 状态胶囊：半透明底 + 亮色字，比实心色块更贴合深色 UI */
+.at-tip__status {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.at-tip__status[data-status="done"] {
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.12);
+  border-color: rgba(74, 222, 128, 0.32);
+}
+.at-tip__status[data-status="running"] {
+  color: #5b9dff;
+  background: rgba(91, 157, 255, 0.12);
+  border-color: rgba(91, 157, 255, 0.32);
+}
+.at-tip__status[data-status="failed"] {
+  color: #f87272;
+  background: rgba(248, 114, 114, 0.12);
+  border-color: rgba(248, 114, 114, 0.32);
+}
+.at-tip__status[data-status="created"] {
+  color: #8b9bb4;
+  background: rgba(139, 155, 180, 0.12);
+  border-color: rgba(139, 155, 180, 0.32);
+}
+
+.at-tip__detail {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: #9fb0c7;
+  word-break: break-word;
+}
+
+/* 滚动条也跟主应用一致（深色、细） */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3342;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3b4759;
+  background-clip: content-box;
+}

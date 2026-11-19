@@ -41,6 +41,11 @@ from .store import TaskStore
 
 log = logging.getLogger("loom.server.runtime")
 
+# 协作式取消的宽限期（秒）：给主循环一点时间自己收尾（存 checkpoint / 落盘），
+# 超过就强制 cancel 掉 asyncio task。太长用户觉得"按了没反应"，
+# 太短又来不及写终态。1 秒足够走完一次循环边界的收尾。
+FORCE_CANCEL_GRACE_S = 1.0
+
 
 class TaskRuntime:
     """单个任务的生命周期。一个实例只管一个 task_id。"""
@@ -166,6 +171,8 @@ class TaskRuntime:
 
         self._run_task: asyncio.Task[Any] | None = None
         self._cancel_requested = False
+        # 强制中止的看门狗（协作式取消超时后 cancel 掉 _run_task）
+        self._force_cancel_task: asyncio.Task[Any] | None = None
 
     # ===================================================================== #
     # 生命周期
@@ -210,11 +217,36 @@ class TaskRuntime:
             self.ended_at = time.time()
 
         except asyncio.CancelledError:
-            # 任务被外部取消（很少走到这里，core.cancel 是协作式的）
+            # ★ 强制中止（用户按停止，而模型还在长思考 / 工具还在跑）。
+            #
+            #   这里**吞掉 CancelledError、不 re-raise**：抛出去的话，下面
+            #   finally 里的 `await self._persist_final()` 会立刻被再次取消，
+            #   终态就落不了盘 —— 任务会永远停在 running，重启后被当成
+            #   "中断任务"再捞一遍（正是这次要修掉的体验）。
+            #
+            #   代价：`_run_task` 的最终状态是 finished 而不是 cancelled。
+            #   没人 await 它（fire-and-forget），所以没有副作用。
             self.status = "aborted"
             self.end_reason = "cancelled"
             self.ended_at = time.time()
-            raise
+            log.warning("任务 %s 被强制中止（未等到循环边界）", self.task_id)
+            try:
+                await self._hub.publish(
+                    self.task_id,
+                    self.session_id,
+                    Event.make(
+                        "task.end",
+                        {
+                            "status": "aborted",
+                            "answer": "任务被用户强制中止（未等到循环边界）",
+                            "end_reason": "cancelled",
+                            "forced": True,
+                        },
+                        task_id=self.task_id,
+                    ),
+                )
+            except Exception:  # noqa: BLE001 —— 广播失败不能挡住落盘
+                log.debug("强制中止时广播 task.end 失败", exc_info=True)
 
         except Exception as exc:  # noqa: BLE001 —— 服务层不能因为一个任务崩掉
             log.exception("任务 %s 执行异常", self.task_id)
@@ -347,17 +379,54 @@ class TaskRuntime:
     # ===================================================================== #
     def cancel(self) -> bool:
         """
-        请求取消。
+        请求取消。**两段式**（2026-11-13 改）。
 
-        返回 True 表示「请求已被接受」—— **不代表任务已经停了**。
-        真正的终止要看 `status` 变成 aborted。这一点必须在 HTTP 层说清楚。
+        第一段：协作式 —— 置 `cancel_event`，主循环在下一个检查点自己收尾。
+        第二段：看门狗 —— `FORCE_CANCEL_GRACE_S` 秒内还没停，就 `cancel()` 掉
+                asyncio task，`CancelledError` 从当前 await 点直接抛出。
+
+        ★ 为什么需要第二段：只有第一段时，模型正在长思考（一次请求几十秒）
+          或工具正在跑，用户按"停止"要等到那一轮结束才有反应 —— 体感就是
+          "停止被排到下一轮"。强制中止后 `_run` 会吞掉 CancelledError 并把
+          终态落盘，所以任务不会永久卡在 running。
+
+        返回 True 表示「请求已被接受」，**不代表任务已经停了**（终态看 status）。
         """
         if self.status in ("done", "aborted", "failed"):
             return False
 
         self._cancel_requested = True
         self.core.cancel()          # 设置 cancel_event + 取消挂起的审批
+        self._schedule_force_cancel()
         return True
+
+    # ---- 强制中止（取消的第二段）------------------------------------------
+    def _schedule_force_cancel(self, delay: float = FORCE_CANCEL_GRACE_S) -> None:
+        """挂一个看门狗：delay 秒后如果任务还活着，就强制 cancel。"""
+        task = self._run_task
+        if task is None or task.done():
+            return
+        if self._force_cancel_task is not None and not self._force_cancel_task.done():
+            return      # 已经有看门狗在跑，不重复挂
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:        # 没有事件循环（极少见）：直接取消
+            task.cancel()
+            return
+        self._force_cancel_task = loop.create_task(
+            self._force_cancel_later(task, delay),
+            name=f"loom-force-cancel-{self.task_id}",
+        )
+
+    async def _force_cancel_later(self, task: asyncio.Task[Any], delay: float) -> None:
+        await asyncio.sleep(delay)
+        if task.done():
+            return
+        log.warning(
+            "任务 %s 在 %.1fs 内没有响应取消，强制中止（cancel asyncio task）",
+            self.task_id, delay,
+        )
+        task.cancel()
 
     async def resolve_approval(self, approval_id: str, decision: str, reason: str = "") -> bool:
         """
@@ -463,7 +532,15 @@ class TaskRuntime:
             )
 
     async def _persist_final(self) -> None:
-        """终态落盘：摘要字段 + 完整快照，同一个 UPDATE。"""
+        """终态落盘：摘要字段 + 完整快照，同一个 UPDATE。
+
+        ★ 投影自动维护（#51）：任务结束时同步重建该任务的投影行。
+          顺序是 **先刷盘、再重建** —— 最后几条事件可能还在归档队列里，
+          不刷盘就直接从磁盘读事件重建，会漏掉尾部事件，投影的
+          event_count / status 等字段就和事实不一致。
+          投影重建失败不影响终态落盘（投影是派生查询表，可随时全量重建，
+          不是事实档案），只记日志。
+        """
         async with self._persist_lock:
             await self._store.save_task(
                 self.task_id,
@@ -474,3 +551,12 @@ class TaskRuntime:
                 ended_at=self.ended_at or time.time(),
                 turn=self.core.state.turn if self.core.state else None,
             )
+            # ---- 投影自动维护（#51）----
+            try:
+                await self._hub.flush_archive()
+                await self._store.rebuild_projection(self.task_id)
+            except Exception as exc:  # noqa: BLE001 —— 投影是派生的，失败不阻塞终态
+                log.warning(
+                    "任务 %s 投影重建失败（不影响终态落盘，可全量重建）：%s",
+                    self.task_id, exc,
+                )

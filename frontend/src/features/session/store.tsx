@@ -165,7 +165,12 @@ export type LoomAction =
   /** 步骤 7：改"下一条任务"的权限模式（不改变正在跑的任务） */
   | { type: "SET_SESSION_MODE"; mode: SessionMode }
   | { type: "SET_WEB_SEARCH"; enabled: boolean }
-  | { type: "SET_WEB_SEARCH_READY"; ready: boolean };
+  | { type: "SET_WEB_SEARCH_READY"; ready: boolean }
+  /**
+   * 会话已在后端删除成功：把本地这条连同它的任务/消息一并摘掉。
+   * ★ 只在后端确认删除后才 dispatch —— 前端不预删，避免"删失败但界面已经没了"。
+   */
+  | { type: "DELETE_SESSION"; sessionId: string };
 
 // --------------------------------------------------------------------------- //
 // 初始状态
@@ -648,6 +653,42 @@ export function reducer(state: LoomStore, action: LoomAction): LoomStore {
       };
     }
 
+    case "DELETE_SESSION": {
+      /**
+       * 后端已确认删除，这里做本地清理。
+       *
+       * ★ 不能只删 `sessions` 里那一条：tasks / messages / taskModes
+       *   都是按 session 归属的，留着会变成"会话没了但任务还在列表里"的内存残留。
+       * ★ 若删的正是当前选中会话，退回剩下最近更新的那个（没有就 null）。
+       */
+      const sid = action.sessionId;
+      const sessions = { ...state.sessions };
+      delete sessions[sid];
+
+      const tasks: Record<string, Task> = {};
+      for (const [tid, t] of Object.entries(state.tasks)) {
+        if (t.session_id !== sid) tasks[tid] = t;
+      }
+
+      const messages = { ...state.messages };
+      delete messages[sid];
+
+      const taskModes = { ...state.taskModes };
+      for (const [tid, t] of Object.entries(state.tasks)) {
+        if (t.session_id === sid) delete taskModes[tid];
+      }
+
+      let activeSessionId = state.activeSessionId;
+      let activeTaskId = state.activeTaskId;
+      if (activeSessionId === sid) {
+        const rest = Object.values(sessions).sort((a, b) => b.updated_at - a.updated_at);
+        activeSessionId = rest.length > 0 ? rest[0].session_id : null;
+        activeTaskId = null;
+      }
+
+      return { ...state, sessions, tasks, messages, taskModes, activeSessionId, activeTaskId };
+    }
+
     case "APPEND_MESSAGES": {
       const prev = state.messages[action.sessionId] ?? [];
       const seen = new Set(prev.map((m) => m.message_id));
@@ -735,6 +776,43 @@ export function useActiveMessages(): Message[] {
 export function useActiveTask(): Task | null {
   const { state } = useLoom();
   return state.activeTaskId ? state.tasks[state.activeTaskId] ?? null : null;
+}
+
+/**
+ * 当前任务的 token 累计（对比表 #4）。
+ *
+ * ★ 为什么从事件取而不是从任务快照取：
+ *   快照要等 /api/tasks 刷新（或任务结束时落盘）才更新，而 llm.usage 事件
+ *   是 SSE 实时到的。顶部要显示"现在烧了多少"，只能走事件。
+ * ★ 为什么取**最后一条**而不是把每条加起来：
+ *   事件里带了任务累计（total_*），服务端已经算好了。前端再加一遍，
+ *   一旦漏收一条（重连补发、去重）就会永久偏差。
+ */
+export interface TokenUsage {
+  prompt: number;
+  completion: number;
+  reasoning: number;
+  calls: number;
+}
+
+export function useActiveUsage(): TokenUsage | null {
+  const events = useActiveEvents();
+  return useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.type !== "llm.usage") continue;
+      const d = (e.data || {}) as Record<string, unknown>;
+      const n = (k: string) => Number(d[k] ?? 0) || 0;
+      return {
+        // 兼容只有单次字段的旧事件（没有 total_* 时退回单次值）
+        prompt: n("total_prompt_tokens") || n("prompt_tokens"),
+        completion: n("total_completion_tokens") || n("completion_tokens"),
+        reasoning: n("total_reasoning_tokens") || n("reasoning_tokens"),
+        calls: n("total_calls") || 1,
+      };
+    }
+    return null;
+  }, [events]);
 }
 
 /** 当前任务的事件（正序） */

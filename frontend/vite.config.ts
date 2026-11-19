@@ -1,6 +1,11 @@
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { defineConfig } from "vite";
+
+/** 配置所在目录（ESM 没有 __dirname，用 import.meta.url 换） */
+const root = fileURLToPath(new URL(".", import.meta.url));
 
 /**
  * Vite 配置
@@ -30,5 +35,20 @@ export default defineConfig({
     // Tauri 2 的 WebView2 基于较新的 Chromium，可以放心用现代语法
     target: "chrome105",
     sourcemap: !!process.env.TAURI_DEBUG,
+    rollupOptions: {
+      /**
+       * 多页入口。
+       * ★ 为什么用独立 HTML 而不是前端路由：项目没有装 react-router，
+       *   而「Agent 工作树」是一个与主应用无关的静态展示页 —— 独立 HTML
+       *   既满足"独立入口"，又完全不用碰 App.tsx / main.tsx，
+       *   现有功能零改动。dev 访问 /agent-tree.html，build 后产物同名。
+       * ★ Tauri 只加载 index.html，多出来的这个 html 不会影响桌面壳。
+       */
+      input: {
+        main: resolve(root, "index.html"),
+        "agent-tree": resolve(root, "agent-tree.html"),
+        stats: resolve(root, "stats.html"),
+      },
+    },
   },
 });

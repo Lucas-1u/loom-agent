@@ -15,6 +15,7 @@ Loom Agent v0.1 · ModelAdapter 抽象接口
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Literal, Sequence
 
@@ -24,6 +25,58 @@ Role = Literal["system", "user", "assistant", "tool"]
 # --------------------------------------------------------------------------- #
 # 消息
 # --------------------------------------------------------------------------- #
+@dataclass
+class ImageRef:
+    """
+    上下文里的一张图 —— **引用，不是内联 base64**（对比表 #12 的地基）。
+
+    ★ 为什么存路径、发送时才读文件：
+      ① 2MB 的截图 base64 后约 2.7MB 字符串，要进消息内存、进 state_json、
+         甚至可能在事件里落盘，处处是负担；
+      ② 「卸载」只需要丢掉这个引用，不用重写几 MB 的字符串；
+      ③ 文件被删了就降级成一行占位文本 —— 整个请求不会因为一张图挂掉。
+
+    ★ 为什么 `label` 是必填语义：模型看到的是一行说明 + 一张图。
+      "屏幕截图 20261118_2240" 比裸图更容易让它知道这是什么时候的什么。
+    """
+
+    path: str = ""
+    mime: str = "image/png"
+    bytes: int = 0
+    label: str = ""
+
+    def to_part(self, *, max_bytes: int = 0) -> dict[str, Any] | None:
+        """
+        读文件 → `{"type":"image_url", ...}`。
+        读不到 / 超过 max_bytes 返回 None，由调用方降级成文本占位符。
+        """
+        try:
+            if max_bytes and self.bytes and self.bytes > max_bytes:
+                return None
+            with open(self.path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return None
+        b64 = base64.b64encode(raw).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{self.mime};base64,{b64}"},
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        """落库用：**只存引用**，不存图片数据。"""
+        return {"path": self.path, "mime": self.mime, "bytes": self.bytes, "label": self.label}
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> "ImageRef":
+        return ImageRef(
+            path=str(d.get("path") or ""),
+            mime=str(d.get("mime") or "image/png"),
+            bytes=int(d.get("bytes") or 0),
+            label=str(d.get("label") or ""),
+        )
+
+
 @dataclass
 class Message:
     """
@@ -49,12 +102,35 @@ class Message:
     # 仅 tool：回指的是哪个调用
     tool_call_id: str = ""
     tool_name: str = ""       # 仅 tool：工具名（部分供应商要求）
+    # 随本条消息一起送出的图片（对比表 #12）。**只存引用**，见 ImageRef。
+    images: list[ImageRef] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"role": self.role}
         # 注意：content 为空但有 tool_calls 时必须显式给 ""，不能给 None，
         # 否则部分供应商（含百炼）会报参数错误。
         d["content"] = self.content if self.content else ""
+
+        # ---- 多模态：有图时 content 必须变成 part 数组 --------------------
+        # ★ 格式约定：`[{"type":"text"}, {"type":"image_url","image_url":{"url":"data:..."}}]`
+        #   读不到文件的那张图**跳过**并在文本里留一句说明，绝不让整个请求失败。
+        if self.images:
+            parts: list[dict[str, Any]] = []
+            if self.content:
+                parts.append({"type": "text", "text": self.content})
+            dropped: list[str] = []
+            for img in self.images:
+                p = img.to_part()
+                if p is None:
+                    dropped.append(img.label or img.path)
+                    continue
+                parts.append(p)
+            if dropped:
+                parts.append({
+                    "type": "text",
+                    "text": "（以下图片无法读取，已省略：" + "、".join(dropped) + "）",
+                })
+            d["content"] = parts
 
         if self.role == "tool":
             d["tool_call_id"] = self.tool_call_id
@@ -70,8 +146,8 @@ class Message:
         return Message(role="system", content=text)
 
     @staticmethod
-    def user(text: str) -> "Message":
-        return Message(role="user", content=text)
+    def user(text: str, images: list[ImageRef] | None = None) -> "Message":
+        return Message(role="user", content=text, images=list(images or []))
 
     @staticmethod
     def assistant(text: str = "", tool_calls: list["ToolCall"] | None = None, reasoning: str = "") -> "Message":
@@ -189,9 +265,15 @@ class StreamDelta:
         是「观察 Agent 内部过程」这个项目目标的核心体验。
     """
 
-    kind: Literal["reasoning", "content", "tool_call", "done"]
+    kind: Literal["reasoning", "content", "tool_call", "done", "usage"]
     text: str = ""              # reasoning / content 的增量文本
     tool_call: ToolCall | None = None   # tool_call 时携带（已拼接完整的那个）
+
+    # ★ 流式 usage（对比表 #4）：OpenAI 兼容协议里它出现在**收尾帧**
+    #   —— 那一帧的 choices 是空数组。旧代码 `if not chunk.choices: continue`
+    #   直接把这帧扔了，所以流式路径（默认路径）永远拿不到 token。
+    #   这里单独带出来，由 chat_stream_collect 填进 ModelReply。
+    usage: dict[str, int] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -270,8 +352,16 @@ class ModelAdapter:
         reasoning: list[str] = []
         content: list[str] = []
         tool_calls: list[ToolCall] = []
+        usage: dict[str, int] | None = None
 
         async for d in self.chat_stream(messages, tools, temperature=temperature, max_tokens=max_tokens):
+            # ★ usage 不进 on_delta：那个回调是给界面推 THINKING 的，
+            #   把 token 数字塞过去会让界面多出一堆无意义片段。
+            if d.kind == "usage":
+                if d.usage:
+                    usage = d.usage
+                continue
+
             if d.kind in ("reasoning", "content") and on_delta is not None:
                 res = on_delta(d)
                 if hasattr(res, "__await__"):
@@ -284,13 +374,18 @@ class ModelAdapter:
             elif d.kind == "tool_call" and d.tool_call is not None:
                 tool_calls.append(d.tool_call)
 
-        return ModelReply(
+        reply = ModelReply(
             content="".join(content),
             reasoning="".join(reasoning),
             tool_calls=tool_calls,
             model=self.model,
             duration_ms=int((time.time() - t0) * 1000),
         )
+        if usage:
+            reply.prompt_tokens = int(usage.get("prompt", 0) or 0)
+            reply.completion_tokens = int(usage.get("completion", 0) or 0)
+            reply.reasoning_tokens = int(usage.get("reasoning", 0) or 0)
+        return reply
 
     def spec(self) -> ToolSpec | None:  # 便于统一日志
         return None
