@@ -1,758 +1,201 @@
 # Loom Agent
 
 **一个跑在自己电脑上的 Coding Agent 运行时。**
-给它一句话，它会规划、查项目、调工具、改文件、跑命令、验证结果，最后给一份**带证据**的答案。
 
-- 默认执行引擎 **Graph**（LangGraph），**Legacy** 保留为显式兜底
-- **1502** 项离线自检 · **21** 种事件 · 内置工具 + 可选 RAG / MCP / 子任务 / 工作流 / 上下文管理
-- 离线优先、可审计：没有 API Key 也能跑演示，没有网络也不影响核心逻辑
+给它一句话，它会自己规划、查项目、调工具、改文件、跑命令、验证结果，最后给一份**带证据**的答案。
 
-> 这是**学习型项目**，不是产品：架构清晰 > 功能数量，可理解性 > 代码量。
-> 所以代码里有大量"为什么这么写、踩过什么坑"的注释，也有明确写着"这个不做"的边界。
-
-> **⚠️ 2026-11-05 版本状态（读 §6 之前先看这条）**
-> 安全模型已按 `docs/22` 的 8 步计划重构完成，**步骤 1–8 全部走完**：
-> · **人工审批已移除**（步骤 5）——Agent 直接执行工具，不再有批准环节；
-> · **Policy 从 7 道关卡精简**，只保留参数/schema、预算、软硬熔断、只读意图、禁止/允许范围；
-> · **会话权限模式**（read-only / workspace-write / full-access）落地，服务端按任务切工具注册表（步骤 6–7）；
-> · **Windows ACL 受限令牌沙箱**已实现（`LOOM_ACL_MODE`，默认关闭），标准用户可用、无需管理员。
-> 因此 §6 中关于"审批挂起 / TOCTOU / 七道关卡"的描述属于**历史实现**，
-> 现状与取舍见 `docs/26`（步骤 5）、`docs/27`（步骤 6）、`docs/29`（步骤 7）、
-> `docs/30`（步骤 8：真实模型灰度，含两个实测发现）。
+- 手写 Agent 循环，不依赖编排框架（LangGraph 只作为可选引擎）
+- 25 种事件类型贯穿全程，每一步都可回放、可审计
+- 离线优先：没有 API Key 也能跑演示，没有网络不影响核心逻辑
 
 ---
 
-## 目录
+## 它能做什么
 
-- [1. 这是什么](#1-这是什么)
-- [2. 现在能做什么](#2-现在能做什么)
-- [3. 快速开始](#3-快速开始)
-- [4. 架构](#4-架构)
-- [5. 一个任务的一生](#5-一个任务的一生)
-- [6. 核心机制](#6-核心机制)
-- [7. 工具与安全](#7-工具与安全)
-- [8. 检索：BM25 + 本地向量](#8-检索bm25--本地向量)
-- [9. 外部工具：MCP](#9-外部工具mcp)
-- [10. 父子任务](#10-父子任务)
-- [11. 数据与持久化](#11-数据与持久化)
-- [12. 前端](#12-前端)
-- [13. 测试](#13-测试)
-- [14. 配置](#14-配置)
-- [15. 已知限制](#15-已知限制)
-- [16. 路线图](#16-路线图)
-- [17. 目录结构](#17-目录结构)
-- [18. 文档索引](#18-文档索引)
+### 执行
+
+| 能力 | 说明 |
+|---|---|
+| **双引擎** | 默认 **Graph**（LangGraph 编译的状态图），**Legacy** 手写循环保留为显式兜底；切换引擎不改任何上层契约 |
+| **三段式流程** | Plan（拆步骤）→ Act（调工具）→ Reflect（自评）；反思可触发重新规划 |
+| **意图识别** | 区分 diagnostic / repair / implementation / test_authoring 等，不同意图走不同门禁 |
+| **风险审查** | 执行前评估动作风险等级，越权操作在 Policy 层拦下 |
+| **证据分级** | 模型声称 vs 实测输出分开记账，没验证过的结论不许写成已完成 |
+| **计划真值** | 步骤状态必须与实际动作对应，防止"计划说做完了但什么都没改" |
+| **预算** | 轮次 / 秒数 / 工具调用数 / 同调用重复次数四维限制；仍在推进时允许有界续期一次 |
+| **反循环** | 零进展检测、重复调用熔断、软熔断与硬熔断两道闸 |
+
+### 权限与隔离
+
+四种会话权限模式，**服务端按模式切换工具注册表**，不是提示词里说一句：
+
+| 模式 | 能做什么 |
+|---|---|
+| `read-only` | 只能看：写/执行类工具根本不注册 |
+| `workspace-write` | 可改工作区内文件、可跑命令 |
+| `full-access` | 不受工作区写限制 |
+| `desktop` | 额外开放桌面操控（截屏、定位、点击、输入） |
+
+配套的安全边界：
+
+- `run_command` 的**唯一出口是 Docker 容器**，宿主机不直接执行
+- 路径白名单 / 黑名单，越界在 Policy 层直接拒绝
+- 删除文件强制先备份，备份失败则拒绝删除
+- 可选 **Windows ACL 受限令牌沙箱**（`LOOM_ACL_MODE`）
+- 所有写操作留 `ChangeRecord`（前后 hash、增删行数、备份位置）
+
+### 工具
+
+| 分类 | 工具 |
+|---|---|
+| 文件 | `read_file` `list_files` `write_file` `edit_file`（行号锚定）`delete_file`（删前备份） |
+| 命令 | `run_command`（Docker 沙箱）、`terminal`（宿主机 shell，需相应权限模式） |
+| 桌面 | `capture_screen` `vision_query` `desktop_locate` `desktop_click` `desktop_type`（经 MCP） |
+| 检索 | `web_search`（DeepSeek Search）、`search_docs`（项目知识索引） |
+| 协作 | `ask_user`（结构化提问，支持超时后补答）、`spawn_subtask`、`spawn_parallel`、`session_history` |
+| 技能 | `load_skill`（三级渐进披露：目录 → 正文 → 附带文件） |
+| MCP | 官方 SDK 接入，单 Server 常驻连接，实测挂载 **67** 个外部工具 |
+
+### 上下文管理
+
+- **压缩**：超阈值时把早期轮次摘要化，保留最近 N 轮完整内容
+- **工具结果修剪**：只保留最近几条完整返回，更早的压成"开头 + 截断标记"
+- **读取复用**：同文件同 hash 折叠成标记，不重复贴全文
+- **图像引用**：截图以**引用**（路径 + 描述）进出上下文，不内联 base64；超出保留张数的自动卸载成文本占位符，原文件仍可按路径再读
+- **Token 计量**：直接采用 Provider 返回的 `usage`（精确值，不估算），按调用与任务两级累计
+
+### 持久化与恢复
+
+| 能力 | 说明 |
+|---|---|
+| **三层落盘** | 消息历史 / 状态快照 / 事件流，各自独立、跨重启可读 |
+| **事件回放** | 按任务、按类型、按轮次切片回放；导出导入格式稳定 |
+| **会话投影** | 从事件流派生的一行汇总，可随时删表重建，重建后逐行一致 |
+| **断点恢复** | Checkpoint 记录状态快照，配合消息历史把中断的任务接回来；恢复前做缺口检查，工具执行到一半的现场拒绝恢复（避免重复副作用） |
+| **会话管理** | 删除会话两级可选：只清库 / 连"本会话创建且未被改动过"的文件一起删（删前自动备份） |
+
+### 界面
+
+| 入口 | 内容 |
+|---|---|
+| 主应用 | 聊天视图 + 执行流视图；顶部实时显示当前任务 token；侧栏按工作目录分组会话 |
+| 任务树 | 父子任务可视化，含状态、耗时、阻断关系 |
+| 统计页 | 任务量、成功率、token、LLM/工具墙钟分解、首 token 延迟、每日趋势（7/30/90 天） |
+| 桌面壳 | Tauri 2 打包，可复用已运行的后端，原生目录选择 |
 
 ---
 
-## 1. 这是什么
+## 快速开始
 
-Loom 把"一次提问"变成"一次任务"：有状态、可中断、可审计、可回放。
+### 环境
 
-| 维度 | 普通 Chatbot / 单轮 API | Loom |
-|---|---|---|
-| 输入 | 一句话 | 一句话 → 任务（可取消、可中断；无人工审批，靠会话模式与沙箱约束） |
-| 输出 | 一段文本 | 一段**有证据**的文本 + 完整执行轨迹 |
-| 过程 | 无 | PLAN → ACT → TOOLS → REFLECT → FINAL，多轮自纠正 |
-| 副作用 | 无 | 读/写工作区、Docker 沙箱命令、宿主机终端、MCP 工具 |
-| 安全 | 无 | Policy 精简链 + 会话模式（只读/可写/完全访问）+ 预算熔断 + 验证闸门 |
-| 可观测 | 无 | 21 种事件经 SSE 推到时间线，可按 `task_id` 回放 |
-| 失败语义 | 编一段话 | 终态 + 原因码 + 证据等级，**绝不伪造成功** |
+- Python 3.11+
+- Node 18+
+- （可选）Docker Desktop —— `run_command` 需要
 
-一句话区分它和普通 Chatbot 的地方：**"说完成"不算完成，要过验证闸门**。
-
----
-
-## 2. 现在能做什么
-
-| 能力 | 状态 | 说明 |
-|---|---|---|
-| 多轮 Agent 执行 | ✅ | Graph 默认；Legacy 显式兜底 |
-| 文件读 / 列目录 | ✅ | 40k 字符截断、多编码、行号、hash |
-| 文件写 / 局部改 | ✅ | 覆盖前备份、唯一匹配、`expect_hash` 防 stale、行号锚定 + 模糊匹配 |
-| Docker 沙箱命令 | ✅ | 断网 / 只读根 / 非 root / 限额，无宿主机分支 |
-| **宿主机终端** | ✅ | pwsh / Windows PS / CMD / Git Bash；默认无沙箱（靠 cwd + 超时），**可选** ACL 受限令牌沙箱（`LOOM_ACL_MODE`，见 §7.3） |
-| Policy 精简链 | ✅ | 参数/schema、预算、软硬熔断、只读意图、禁止/允许范围；**审批已移除**（步骤 5） |
-| 会话权限模式 | ✅ | read-only / workspace-write / full-access；服务端按任务切工具注册表，前端可切换并显示实际模式 |
-| 预算 / 熔断 / 取消 | ✅ | 轮次·秒·工具数·重复·错误；取消在下一轮检查点生效 |
-| 验证闸门 + 证据分级 | ✅ | A/B/C 分级 + "零改动不得报 done" |
-| 项目知识检索 | ✅ | FTS5 + bm25；**可选**本地向量 + RRF 融合 |
-| MCP 工具接入 | ✅ | 仅本地 stdio；默认按写风险处理；无自动重连 |
-| 父子任务 | ✅ | 串行派生、结果信封、层级/数量/预算上限 |
-| 并行子任务 | ✅ | `spawn_parallel` 一次派生多个子任务并发执行；聚合结果 + 五类计数 |
-| 子任务树展示 | ✅ | 前端按 `parent_task_id` 构建可折叠树 |
-| **异步工作流（并行）** | ✅ | DAG 依赖调度：互不依赖的步骤真并行；http / 只读工具 / 本机命令 |
-| 事件 + SSE 时间线 | ✅ | 21 种事件，`since` 补拉 + `stream.gap` 快照恢复 |
-| 任务持久化 | ✅ | SQLite：sessions / tasks / task_history |
-| 跨进程恢复 | 🟡 | Checkpoint 三执行点默认落盘；`load_checkpoint` 恢复入口已实现，重启自动续跑未接线 |
-| 上下文溢出存储（Spill） | ✅ | 超长上下文溢出到磁盘，head/tail 保留策略 |
-| 工具结果修剪 | ✅ | 修剪陈旧工具结果，`shadowed_tool_call_ids` 保证 replay-safe |
-| 桌面应用（Tauri） | ✅ | `src-tauri/`（Rust 壳 + Tauri 窗口，开发模式用 `node <tauri.js> dev` 起） |
-| 向量检索 | 🟡 | 已实现，默认关（`LOOM_RAG_EMBED=off`） |
-| `delete_file` | ❌ | 从未实现 |
-
----
-
-## 3. 快速开始
-
-### 3.1 先看它跑（不需要 API Key）
+### 安装
 
 ```bash
 git clone https://github.com/Lucas-1u/loom-agent.git
 cd loom-agent
 
 python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt      # Windows
-# source .venv/bin/activate && pip install -r requirements.txt   # macOS / Linux
+./.venv/Scripts/activate        # Windows
+# source .venv/bin/activate     # macOS / Linux
+pip install -r requirements.txt
 
-python -m backend.demo            # 正常：规划 → 观测 → 写文件（直接执行）
-python -m backend.demo --readonly # 只读：写工具未注册，写入被拦住
-python -m backend.demo --budget   # 熔断：重复调用 + 轮数耗尽
+cd frontend && npm install && cd ..
 ```
 
-`demo` 会自建临时工作区、跑完整套 Agent Loop，打印**调试面板**（轮次/证据/文件变更/计划打勾）、
-**事件直方图**、**磁盘实际状态**。理解机制最快的入口。
+### 配置
 
-### 3.2 接真实模型（CLI）
+复制 `.env.example` 为 `.env`，填入模型凭据：
+
+```ini
+LOOM_MODEL=your-model
+LOOM_BASE_URL=https://your-endpoint/v1
+LOOM_API_KEY=sk-xxx
+```
+
+支持任何 OpenAI 兼容端点（讯飞 MaaS / 阿里百炼 / DeepSeek / 本地 vLLM 均可）。
+
+> 不配也能跑：未设置 Key 时前端提供**演示模式**，用内置数据走完整个界面。
+
+### 运行
 
 ```bash
-cp .env.example .env
-# 填 BAILIAN_API_KEY / DEEPSEEK_API_KEY / XFYUN_API_KEY 之一
-python -m backend.cli -w D:/some/project "分析这个项目的结构"
+# 后端（默认 8765）
+python -m backend.server
+
+# 前端（默认 5173）
+cd frontend && npm run dev
 ```
 
-三家都走 OpenAI 兼容协议，同一个 Adapter（`backend/models/openai_compat.py`），换供应商只改配置。
+打开 http://localhost:5173 ，新建会话 → 输入任务 → 看它干活。
 
-常用参数：`-m bailian|deepseek|xfyun`、`--model-name`、`--mode read-only|workspace-write|full-access`、
-`--readonly`、`--no-plan` / `--no-reflect`、`--dry-run`。交互模式里 `:t` 看工具、`:s` 看预算、`:q` 退出。
-（`--yes` / `--no` 自步骤 5 起已废弃：审批整体移除，传了也不生效。）
-
-### 3.3 起服务 + GUI
+### 自检
 
 ```bash
-python -m backend.server                      # 默认 127.0.0.1:8765
-cd frontend && npm install && npm run dev     # http://localhost:5173
+./.venv/Scripts/python.exe -m backend.selfcheck_agent    # Agent 全链路
+./.venv/Scripts/python.exe -m backend.selfcheck_server   # 服务端 / 持久化 / 统计
+./.venv/Scripts/python.exe -m backend.selfcheck_p1       # 编排与工具
+./.venv/Scripts/python.exe -m backend.selfcheck_p2       # 模型层
+./.venv/Scripts/python.exe -m backend.selfcheck_sandbox  # 沙箱
+./.venv/Scripts/python.exe -m backend.selfcheck_mcp      # MCP
+cd frontend && npm run test:events                       # 事件契约一致性
 ```
-
-前端**真的在跟后端说话**：会话/任务来自 `GET /api/sessions`、`POST /api/tasks`，
-执行过程走 `GET /api/stream`（SSE，断线用 `?since=<lastId>` 补拉），
-审批走 `POST /api/approvals/{id}/decision`，取消走 `POST /api/tasks/{id}/cancel`。
-演示数据只在后端不可达时兜底（右上角显示 `DEMO` / `OFFLINE`，不假装连上）。
-
-### 3.4 Windows 一键启动
-
-`loom.bat`（CLI）与 `loom-gui.bat`（GUI）：切到项目根、清代理、用 `.venv`、清掉 `PYTHONUTF8` ——
-四件事少做一件就会报错。GUI 版还会查端口、起 Vite、自动开浏览器。
-装到桌面：`python dev/install_desktop.py`。
-
-Tauri 桌面壳（`src-tauri/`）：
-
-```bat
-cd /d D:\path\to\loom
-tauri dev                              :: 开发：起 Vite + 弹窗，热更新
-tauri build --no-bundle                :: 出 release exe（不打扰安装器）
-```
-
-- `tauri` CLI 来自 `npm i -g @tauri-apps/cli`（本机已装；国内用 `--registry=https://registry.npmmirror.com`）。
-- 构建钩子在 `tauri.conf.json` 里写的是 `npm run dev` / `npm run build`。
-  **实测工作目录是 `frontend/`（不是仓库根）** —— Tauri 把 `frontendDist: "../frontend/dist"`
-  的上一级当前端目录，所以钩子里直接写 npm 就行，别写绝对路径（换机器会断）。
-- `tauri build` 会把 `frontend/dist` **编译进 exe**，所以改完前端必须重新 build，
-  否则窗口里还是旧的 UI。
-- 产物 `src-tauri/target/release/loom-agent.exe` 双击即用：它自己拉起后端，关窗口后端自动退出。
-  ★ 但如果你**已经**在跑 `loom-gui.bat`（8765 被占用），它会**复用**那个后端，退出时**不会**杀掉它。
-- 仍然是"跑仓库里的代码"：要求 `<仓库>/.venv` 和源码目录在。exe 挪走后靠
-  「从 exe 逐级向上找 `backend/server/__main__.py`」定位；实在找不到就设
-  `LOOM_ROOT=D:\Loom_agent\loom`。
-- **选工作目录走系统原生对话框**（`tauri-plugin-dialog`）：
-  Rust 侧 `.plugin(tauri_plugin_dialog::init())`，能力在 `capabilities/default.json` 里开 `dialog:default`，
-  前端在 `services/native.ts` 里收敛成一个 `pickDirectory()`。
-  浏览器开发模式没有这个能力 → 退回 `prompt()` 手输（不是"没做"）。
-  ★ 前端不能静态 import 那个插件：要 `isTauri()` + 动态 import，否则浏览器模式下白挂。
-- 打包成能发给别人的安装包还没做（缺 Python 运行时 + `find_loom_root` 对安装路径的适配）。
-
-### 3.5 Docker 沙箱（`run_command` 用）
-
-```bash
-docker build -f dev/Dockerfile.sandbox -t loom-sandbox:py312 .
-```
-
-镜像只需 build 一次；运行期 `--network none` + `--pull never`，**不会联网拉依赖**。
-Docker 不可用时 `run_command` 直接返回 `sandbox_unavailable`——**不降级到宿主机**。
-需要本机环境时用 `terminal`（另一个工具，见 §7）。
 
 ---
 
-## 4. 架构
+## 架构
 
-```mermaid
-flowchart TB
-    UI["React 前端<br/>Chat / 时间线 / 审批卡片"]
-    API["FastAPI<br/>sessions · tasks · approvals · health"]
-    SSE["SSE /api/stream<br/>EventHub（since + gap）"]
-    SCH["TaskScheduler<br/>并发槽 / 取消 / 审批路由"]
-    RT["TaskRuntime"]
-    CORE["AgentCore<br/>阶段方法 · 闸门 · 审计"]
-    G["Graph 引擎（默认）"]
-    L["Legacy _loop（兜底）"]
-    POL["Policy 七道关卡"]
-    APR["ApprovalManager<br/>Future 挂起"]
-    ST["TaskState（59 字段）"]
-    T["工具层<br/>readonly / mutating / exec / subagent / mcp"]
-    EXT["外部<br/>模型 · Docker · 本机 shell · MCP Server"]
-    DB[("SQLite<br/>sessions/tasks/history")]
-    IDX[("FTS5 索引<br/>+ 可选向量")]
-
-    UI -->|HTTP| API
-    UI -->|EventSource| SSE
-    API --> SCH
-    SCH --> RT
-    RT --> CORE
-    CORE --> G
-    CORE --> L
-    G --> CORE
-    CORE --> ST
-    CORE --> POL
-    POL --> APR
-    CORE --> T
-    CORE --> EXT
-    CORE -->|事件| SSE
-    SCH --> DB
-    CORE --> DB
-    CORE --> IDX
+```
+frontend/           React + Vite + Tailwind；SSE 自行解析帧
+backend/
+  server/           FastAPI + 事件总线 + 调度器 + SQLite
+    store.py          任务 / 会话 / 事件 / 投影
+    runtime.py        单任务生命周期
+    scheduler.py      并发调度、权限模式、预算覆盖
+  agent/            Agent 内核（不依赖 server）
+    core.py           Agent 循环（legacy）
+    graph_engine.py   状态图引擎（默认）
+    context.py        上下文构建、压缩、图像卸载
+    policy.py         权限与风险关卡
+    checkpoint/       快照保存与恢复判定
+  tools/            工具实现（不依赖 agent）
+  models/           模型适配（OpenAI 兼容 + 流式解析）
+  events.py         事件契约（25 种类型）
+  history/          历史查询与统计（只读叶子模块）
 ```
 
-**依赖方向单向**：`server/ → agent/ → tools/`，**`agent/` 禁止 import `server/`**
-（所以 RAG 自带 SQLite 连接，不复用 server 的库句柄）。
-`workflow/` 是一个**平级基础设施**：tools 里的 `run_workflow` 调它，server 启动时用它做恢复扫描，
-它自己不依赖 agent —— 新增执行器不需要动调度核心。
+依赖方向单向：`server → agent → tools`。`agent` 不 import `server`，`events.py` 不 import 项目模块。
 
-| 层 | 关键文件 | 职责 |
-|---|---|---|
-| 入口 | `server/app.py` `scheduler.py` `runtime.py` | HTTP/SSE、并发调度、单任务执行器 |
-| 内核 | `agent/core.py` | 阶段方法、闸门、审计、RAG 接入、子任务入口 |
-| 编排 | `agent/graph_engine.py` | LangGraph 图；节点调 core 的阶段方法 |
-| 状态 | `agent/state.py` | `TaskState`（唯一真相）、`TaskStatus`、`RiskLevel`、`PlanStep` |
-| 策略 | `agent/policy.py` `agent/approval.py` | 七道关卡、审批挂起/恢复 |
-| 工具 | `tools/base.py` `registry.py` `tools/*` | 工具抽象、注册表、具体工具 |
-| 检索 | `agent/rag/*` | 索引 / 检索 / 融合 / 嵌入 |
-| 工作流 | `workflow/*` | DAG 调度、Job 执行适配（http/tool/shell）、outbox、重启恢复 |
-| 外部 | `mcp/*` `sandbox/manager.py` `models/openai_compat.py` | MCP 客户端、Docker 沙箱、模型适配 |
+**State ≠ 聊天记录**：`TaskState` 是唯一真相，消息由 `ContextBuilder` 从 State + 历史单向派生。
 
 ---
 
-## 5. 一个任务的一生
+## 文档
 
-```mermaid
-sequenceDiagram
-    participant FE as 前端
-    participant API as FastAPI
-    participant SCH as Scheduler
-    participant CORE as AgentCore
-    participant POL as Policy
-    participant T as 工具
-    participant HUB as EventHub
+`docs/` 下按功能编号，每篇是完整的验收报告（问题 / 设计与取舍 / 改动清单 / 实测数据 / 已知局限）：
 
-    FE->>API: POST /api/tasks {goal, workspace, session_id}
-    API->>SCH: submit(task_id)（落库 status=created）
-    FE->>API: GET /api/stream?task_id&since=0
-    SCH->>CORE: run()（占槽 → mark_started）
-    CORE->>CORE: 意图分类 + 预算初始化 + 历史恢复（只读）
-    loop 每轮
-        CORE->>CORE: 预算 / 取消检查
-        CORE->>CORE: PLAN（首轮）→ RAG 预检索（≤2 次）
-        CORE->>CORE: ACT（调模型）
-        alt 要调工具
-            CORE->>POL: check(tool, args, state)
-            opt 需要审批
-                POL-->>HUB: approval.request
-                FE->>API: POST /api/approvals/{id}/decision
-                API->>POL: resolve（Future.set_result）
-            end
-            POL->>T: 放行 → run()
-            T-->>CORE: ToolResult(ok/summary/data/error)
-            CORE-->>HUB: tool.call / tool.result / observe
-        else 文本答复
-            CORE->>CORE: 三道关口（空回复/证据/闸门）
-        end
-        CORE->>CORE: REFLECT（done? 继续? 收敛?）
-    end
-    CORE->>CORE: 验证闸门 + 证据分级 + 机器判定
-    CORE-->>HUB: final_answer + task.end
-```
-
-关键落点：
-
-| 步骤 | 位置 |
+| 主题 | 文档 |
 |---|---|
-| 建任务 / 落库 | `server/app.py` → `store.create_task` |
-| 引擎选择 | `AgentCore.run`：`config.orchestrator`（默认 `graph`） |
-| 上下文构造 | `agent/context.py` + `prompts/system.py`（阶段提示） |
-| 模型调用 | `AgentCore._call_model` → `OpenAICompatAdapter` |
-| 工具执行 | `AgentCore._execute_tools` → `Policy.check` → `tools/registry.execute` |
-| 收尾 | `_finalize_text_reply` / `_final_phase` → `state.finish` |
-| 落终态 | `store.save_task`（写 `state_json`）+ `task_history` |
+| 权限模式与沙箱 | `26` `27` `29` `30` |
+| Computer Use / MCP | `31` |
+| ask_user | `32` `37` |
+| 联网搜索 | `34` |
+| Checkpoint 自动恢复 | `35` |
+| SSE 协议 | `36` |
+| Skill 机制 | `38` |
+| 持久化三层 | `39` |
+| 会话历史查询 | `40` |
+| Token 计量 | `41` |
+| 删除会话 | `42` |
+| 墙钟时间分解 | `43` |
+| 图像块卸载 | `44` |
 
 ---
 
-## 6. 核心机制
-
-### 6.1 阶段与方法
-
-`AgentCore` 是唯一执行内核，两条引擎调同一组方法：
-
-| 阶段 | 方法 | 产出 |
-|---|---|---|
-| 预算 | `_budget_verdict` | 续期 / 终结（`budget_turns`、`budget_seconds`、`cancelled`…） |
-| 计划 | `_plan_phase` | `PlanStep[]`（≤8 步，带完成条件类型） |
-| 行动 | `_act_phase` | `ModelReply`（文本或 tool_calls） |
-| 工具 | `_execute_tools` | `tool_events` / `change_records` / `command_history` |
-| 反思 | `_reflect_phase` | done / continue / 收敛（`no_progress`） |
-| 收尾 | `_finalize_text_reply` / `_final_phase` | 最终答复 + 终态 |
-
-### 6.2 Graph 是默认引擎
-
-```mermaid
-flowchart LR
-    S((START)) --> B[budget]
-    B -->|plan| P[plan]
-    B -->|act| A[act]
-    B -->|END| E((END))
-    P -->|END| E
-    P -->|budget| B
-    A -->|tools| T[tools]
-    A -->|finalize| F[finalize]
-    A -->|END| E
-    T --> R[reflect]
-    R -->|budget| B
-    R -->|END| E
-    F -->|budget| B
-    F -->|END| E
-```
-
-- 默认 `graph`；`LOOM_ORCHESTRATOR=legacy` 显式切回（**暂不删除**）。
-- 图状态只放路由信息（`phase/route/note/turns`），**任务真相始终在 `TaskState`**。
-- 每个条件边的 `path_map` **必须显式包含 `END`**：LangGraph 会静默丢弃未声明的目标。
-  这条坑曾让 `plan` 节点返回的 END 被吞掉，模型认证失败时任务空转到轮次耗尽。
-- **图引擎自身没有 checkpointer、没有 interrupt/resume**：图异常直接 `failed`，绝不回退 legacy 重跑
-  （工具副作用可能已经发生）。进程级 checkpoint 由 `agent/checkpoint/` 负责（见 §11）。
-
-### 6.3 Policy：七道关卡
-
-`agent/policy.py::Policy.check`，按顺序：
-
-| # | 关卡 | 拦什么 |
-|---|---|---|
-| ① | 工具存在 / 白名单 | 未注册、`allowed_tools` 之外 |
-| ② | 参数 JSON | 模型给了坏 JSON |
-| ③ | schema | 缺必填 / 类型错 |
-| ④ | 预算 | 轮次/工具数/秒数耗尽 |
-| ⑤ | 重复熔断（软） | 同参调用超限 |
-| ⑤b | 确定性失败熔断（硬） | 撞过一次的确定性失败再撞 |
-| ⑤b2 | 用户声明只读 | 一切写文件操作 |
-| ⑤c | 禁止路径 | 用户显式 forbidden |
-| ⑤d | 允许范围 | 范围外写入（执行前） |
-| ⑥ | ~~审批~~ | **步骤 5 起已移除**：工具直接执行，不再有人工批准环节（见 `docs/26`） |
-| ⑦ | 放行 | — |
-
-风险来自三处：工具类属性、`tool.risk_for(args)`（按参数判定，`terminal` 的只读白名单用它）、
-以及 MCP/子任务工具的配置。**模型不能给自己声明安全**。
-
-### 6.4 审批是"真挂起"（步骤 5 起 Agent 循环已不再调用）
-
-> ⚠️ **现状**：审批已从 Agent 循环移除，`ApprovalManager` 作为独立模块保留
-> （事件类型、`/api/approvals` 端点、前端卡片都还在，只是不再被触发）。
-> 下面这段描述的是**保留模块本身的能力**，不再代表默认执行路径。
-> 取舍与失去的保护见 `docs/26-ACL沙箱-步骤5-Policy精简验收报告.md`。
-
-`ApprovalManager.request()` 建 `asyncio.Future` → `await wait_for(fut, timeout)`。
-**不是轮询**：任务真的停住，事件循环继续服务其他任务。
-用户点批准 → `POST /api/approvals/{id}/decision` → `Future.set_result` →
-`recheck_after_approval`（TOCTOU 防护）→ 工具才执行。
-`args_hash` 防"批准后换参数"、`pop` 防重放。超时 = 拒绝；**跨进程不支持**。
-
-### 6.5 预算、取消、闸门
-
-- 预算：`max_turns=20`、`max_seconds=300`、`max_tool_calls=40`、`max_same_call_repeat=3`、`max_errors=5`；
-  轮次可**有界续期**一次（出现循环/停滞/冲突则不续）。
-- 取消：`scheduler.cancel` → `cancel_event` → 下一轮检查点生效；工具层各自尽力终止
-  （容器 stop / `taskkill /T` / 子任务 cancel）。
-- 验证闸门 `_verification_gate`：意图 → 最后命令 → 证据 A/B/C → 风险收尾；
-  `repair` 且零改动零命令 → 直接判未通过。收尾时 `answer` 附**机器判定段**（非模型自述）。
-
-### 6.6 事件与 SSE
-
-- 21 种事件：`task.start/end`、`plan`、`thinking`、`act`、`observe`、`tool.call/result`、
-  `approval.request/decision/expired`、`reflect`、`final_answer`、`error`、`budget.exceeded`、
-  `context.compacted`、`rag.retrieve/result`、**`workflow.state`**、**`permission.mode`**、`state.snapshot`。
-- `EventBus.emit` 同步分配全局 `seq`；`EventHub` 缓冲（3000 条 / 单条 64KB），
-  订阅者队列满 → 丢最旧 + 标 `need_gap` → 前端收到 `stream.gap` 后走快照恢复。
-- **事件不落盘**；`task_history` 存的是消息级历史（append-only）。
-- 前端 `EVENT_TYPES` 少一项 → 该事件的 SSE 帧会被浏览器**静默丢弃**；
-  靠 `npm run test:events` 双向比对兜底（构建期）。
-
----
-
-## 7. 工具与安全
-
-### 7.1 工具清单
-
-| 工具 | 风险 | 审批 | 副作用 | 说明 |
-|---|---|---|---|---|
-| `list_files` | read | 否 | 无 | 列目录，跳过噪音目录 |
-| `read_file` | read | 否 | 无 | 40k 字符、多编码、行号、hash |
-| `search_docs` | read | 否 | 无 | 项目检索（`mode`: keyword/semantic/hybrid）；**仅在启用 RAG 时注册** |
-| `write_file` | write | **是** | 改文件 | 覆盖前备份 |
-| `edit_file` | write | **是** | 改文件 | 唯一匹配 / stale 检测 / 备份 / 行号锚定 / 空白归一化模糊匹配 |
-| `run_command` | exec | **是** | 执行 | **Docker 沙箱**，无宿主机分支 |
-| `terminal` | exec | **是**（只读白名单免） | 执行 | **宿主机** shell；cwd 必须在工作区 |
-| `spawn_subtask` | write | **是** | 建任务 | 派生**一个**子任务并等待；拒绝则不创建 |
-| `spawn_parallel` | write | **是** | 建任务 | 派生**多个**子任务并发执行；聚合统计（仅注入 spawner 时注册） |
-| `run_workflow` | exec | **是**（整条工作流一次） | 执行多步 | DAG 并行调度；支持 http / 工具 / 命令 |
-| `mcp__<server>__<tool>` | 默认 write | **是** | 由 Server 决定 | 外部 MCP 工具 |
-
-> 不注入 `knowledge` / `mcp` / `spawner` 时，对应工具**不会注册**——离线演示与旧测试行为不变。
-
-### 7.2 三条硬边界
-
-1. **工作区**：`path_safety` 做 realpath + 前缀校验，`..` 与工作区外绝对路径一律拒；
-   `run_command` 把工作区挂进容器（`:rw`），容器看不到别处；`terminal` 的 `cwd` 同样受限。
-2. **审批**：写/执行类工具默认都要人工批准；MCP 工具默认不信任；模型不能给自己降级。
-3. **凭据**：`terminal` 不把名字像 KEY/TOKEN/SECRET 的环境变量传给子进程，
-   输出里出现这些值会替换成 `***` 并计数。
-
-**提示词 vs 硬约束**：工作区越界、审批、沙箱、只读声明都是**后端强制**；
-"资料不是指令""不要修改 tests/"是提示 + 闸门（软），后者还能靠 `forbidden_paths` 变硬。
-
-### 7.3 Windows ACL 沙箱（`terminal` 可选）
-
-`LOOM_ACL_MODE` 打开后，`terminal` 的命令不再直接以你的身份跑，而是跑在**受限令牌**下
-——写权限由操作系统 ACL 强制，不是应用层审批。抄 DSH `dsh-sandbox-windows-acl`。
-
-| 模式 | 令牌里有什么 | 能写什么 |
-|---|---|---|
-| `read-only` | logon + Everyone + temp SID | 只能写私有 temp（Python 能启动，工作区写不了） |
-| `workspace-write` | 再加 workspace SID | 工作区 + 私有 temp |
-| `full-access` | 完整主令牌（同一用户） | 全部（仍过审批与超时） |
-
-- 机制：`CreateRestrictedToken` + `CreateProcessAsUser`（**不是** `CreateProcessWithTokenW`，
-  后者要求 `SE_IMPERSONATE` 特权、标准用户必败）；能力 SID = 路径哈希算出来的 `S-1-4-<hash>`。
-- 私有 temp：受限令牌连系统 TEMP 都写不了，每次任务自建 `sandbox/acl_tmp/<rand>/`，
-  结束撤销授权并删目录。
-- 授权登记：往目录 DACL 加的 ACE 会记进 `sandbox/acl_grants.json`，可用
-  `python -m backend.sandbox.acl --list` / `--revoke-all` / `--revoke <路径>` 撤销。
-- 超时 / 取消：非阻塞读管道（`PeekNamedPipe`）+ 父进程 `taskkill /F /T` 杀进程树，
-  超时标 `timed_out`、取消标 `cancelled`。
-- **已知限制**：Git Bash 不兼容（MSYS 运行时建命名 file mapping 被拒，明确报错而非静默放行）；
-  只限制**写**，读与网络不受限；继承 ACE 会让工作区里新建文件也带一条授权副本。
-- 默认**关闭**；不设 `LOOM_ACL_MODE` 时 `terminal` 行为与之前完全一致。
-
----
-
-## 8. 检索：BM25 + 本地向量
-
-**默认纯关键词**（`LOOM_RAG_EMBED=off`）：SQLite FTS5 + bm25，中文先切 bigram 再入库。
-打开向量后变成混合检索。
-
-| mode | 含义 |
-|---|---|
-| `keyword` | 只用 FTS5 + bm25 |
-| `semantic` | 只用向量余弦（本地 fastembed / ONNX） |
-| `hybrid` | 两路各取候选 → **RRF** 融合（`Σ 1/(60+rank)`，只看名次） |
-| `auto` | 用服务端默认（`LOOM_RAG_MODE`，默认 hybrid） |
-
-- 命中带 `matched_by`（`bm25` / `vector` / `both`），能看出"这条靠词面还是语义进来的"。
-- 向量不可用（没装 fastembed / 模型没下 / 编码失败）→ **降级成 keyword** 并在结果与事件里标
-  `degraded`（如 `no_embedder:off`），**不会**静默返回空。
-- 索引增量：只给新增/改动的片段算向量；按 `model` 字段隔离，换模型不会串味。
-- 自动检索**每任务最多 2 次**（任务开始 + 计划出来后），中途靠模型调 `search_docs`；
-  三层计数分开记：`count`（命中）≠ `injected`（注入）≠ `rag_used`（被后续引用）。
-- 资料是**不可信数据**：不参与风险判定、不能绕过审批、不能覆盖系统规则。
-
-```bash
-# 打开向量（模型缓存在 sandbox/models，约 90MB，已 gitignore）
-LOOM_RAG_EMBED=onnx
-LOOM_RAG_MODE=hybrid
-```
-
----
-
-## 9. 外部工具：MCP
-
-第一版只支持**本地 stdio** Server（官方 SDK `mcp`，实测 2.3.0）。
-
-```json
-{"servers":[{"id":"notes","command":"...python.exe","args":["-B","server.py"],
-             "env":{"MCP_TEST_DIR":"..."},"enabled":true,"trust":"prompt",
-             "read_tools":["read_note"]}]}
-```
-
-- 开启：`LOOM_MCP=1` + `LOOM_MCP_CONFIG=<json>`（默认关，示例见 `mcp_servers.example.json`）。
-- 生命周期：**服务启动时**连接并发现工具；每个 Server 一个常驻 task 持有 SDK 异步上下文
-  （anyio 要求 `__aenter__/__aexit__` 同 task）；退出统一 `close()`。
-- 安全：**默认 `risk=write`（必须审批）**；只有配置 `trust:"read"` 或 `read_tools` 才按只读；
-  Server 的 description/schema **不参与**风险判定；子进程 env 走白名单，主进程凭据不给。
-- 命名 `mcp__<server>__<tool>`，来源用 `source={kind,server,tool}` 元数据（不靠解析名字）。
-- 超时/断开 → 该 Server 标记 `failed`，**不自动重连、不自动重试**。
-
----
-
-## 10. 父子任务
-
-`spawn_subtask` 让父 Agent 把一件可独立验收的事派给子任务，并**等它结束**；
-`spawn_parallel` 一次派生**多个**子任务并发执行，全部完成后返回聚合结果。
-
-| 边界 | 默认值 |
-|---|---|
-| 派生层级 | 2 |
-| 每父任务子任务数 | 3 |
-| 子任务预算 | 8 轮 / 180s / 12 次工具 |
-| 单次派生总超时 | 240s |
-| 审批 | 派生本身要审批；拒绝 → 子任务**根本不创建** |
-
-- `tasks.parent_task_id`（schema v2，`ALTER` 迁移）；根任务为 NULL。
-- 子任务**共用父任务的 ToolRegistry / Policy / 审批 / 闸门**，没有旁路；引擎与工作区约束继承。
-- 结果信封：`task_id / status / end_reason / summary / evidence / tools / commands / changes`；
-  子任务非 `done` → 工具返回失败，**不伪装成功**。
-- 子任务默认不开 PLAN/REFLECT（父已拆解，省轮次给工具与验证）。
-- 并行派生返回聚合统计（done / aborted / rejected / timed_out / cancelled 五类计数），
-  全部被拒 → 工具直接失败，不假装派生成功。
-
----
-
-## 10.5 异步工作流：让"等"不再堵住一切
-
-`run_workflow` 把目标拆成**带依赖**的步骤交给调度器：互不依赖的步骤同时跑，
-依赖别人的等前置完成，全部结束才把结构化结果还给模型。
-
-```json
-{"goal": "对比两份资料并汇总结论",
- "steps": [
-   {"id": "a", "kind": "http", "spec": {"url": "https://example.com/a"}},
-   {"id": "b", "kind": "tool", "spec": {"tool": "read_file", "args": {"path": "notes/b.md"}}},
-   {"id": "c", "kind": "http", "spec": {"url": "https://example.com/slow"}, "timeout_s": 5},
-   {"id": "sum", "kind": "tool", "spec": {"tool": "read_file",
-                                          "args": {"path": "notes/summary.md"}},
-    "depends_on": ["a", "b"]}
- ]}
-```
-
-| 层 | 含义 | 例子 |
-|---|---|---|
-| Workflow | 一个目标 | "对比两份资料" |
-| Step | 可验收的一步（有依赖） | `sum` 依赖 `a`、`b` |
-| Job | 一次真实执行（有状态与重试） | `a` 的这次 HTTP GET |
-
-- **并行是调度出来的**，不是把多个工具调用一起发出去：只启动依赖已完成的步骤，最多 `max_parallel` 个同时跑。
-- **失败隔离**：一步失败 → 依赖它的步骤标 `blocked`，不相关的步骤照常完成；工作流整体记 `failed`。
-- **超时/取消**：单步超时 → `failed(timed_out)`；任务取消 → 未完成步骤标 `cancelled`，不等慢请求自然结束。
-- **持久化**：`workflows / workflow_steps / workflow_jobs / workflow_outbox` 四张表与任务共用同一个 SQLite 文件。
-- **事件可靠**：状态变更先写 outbox 再投递（`workflow.state`，第 20 种事件）；重复投递幂等。
-- **重启恢复**：幂等步骤（http GET / 只读工具）自动重跑；有副作用的 shell 步骤只能标 `unknown` + `needs_attention`，**绝不自动重跑**。
-- **安全**：整个工具一次审批；`shell` 步骤等同 `terminal`；`http` 只允许 GET 且**禁止内网/回环**（防 SSRF）；后台只允许只读工具。
-
-> 这仍然**不是**"多个子 Agent 并行"：`run_workflow` 派的是"操作"，没有独立推理。
-> 要并行推理子 Agent 用 `spawn_parallel`（见 §10）。
-
----
-
-## 11. 数据与持久化
-
-| 实体 | 存储 | 说明 |
-|---|---|---|
-| Session | `sessions` 表 | 会话容器，1:N 任务 |
-| Task | `tasks` 表（含 `state_json`、`parent_task_id`） | 一次任务的状态与结果 |
-| 消息历史 | `task_history`（append-only，`(task_id, seq)` 幂等） | 刷新后能看历史 |
-| Checkpoint | `<workspace>/.loom_checkpoints/`（每任务 JSON 快照） | 三执行点落盘，进程崩溃后可从最近点恢复 |
-| Spill 溢出 | `<workspace>/.loom_spill/` | 超长上下文溢出到磁盘，head/tail 保留 |
-| 事件 | **内存**（EventHub，3000 条上限） | 不落盘；断线靠 `since` + 快照 |
-| 审批 | 内存（`asyncio.Future`） | 进程退出即失效 |
-| 知识索引 | 独立 SQLite（`sandbox/index/knowledge.db`） | 按 workspace 隔离；可含向量 |
-
-**重启能恢复什么**：任务列表 / 快照 / 结果 / 历史消息 ✅；Checkpoint 快照文件 ✅；
-**继续跑中断的任务** 🟡（`safe_to_resume` 恒 False，`load_checkpoint` 可手动恢复 state 但自动续跑未接线）；
-恢复挂起的审批 ❌。
-
----
-
-## 12. 前端
-
-React 19 + Vite 8 + TypeScript 6 + Tailwind 4，单一 `useReducer` store（`features/session/store.tsx`）。
-
-- 三栏：左侧按**工作目录**分组的会话列表 / 中央双视图（聊天 · 执行流）/ 底部工作区与输入框。
-- 事件时间线：`EventCard` 按事件类型分派渲染——工具调用（含 MCP 来源徽标）、终端的
-  命令/exit/stdout/stderr、审批卡、RAG 检索命中、压缩事件等。
-- **任务树**：执行流视图的任务选择器按 `parent_task_id` 构建可折叠树（▶ 展开/折叠、
-  状态圆点、子任务数、相对时间）；纯函数建树（`taskTree.ts`）+ 32 项脱离 React 的测试。
-- 断线：自研指数退避重连（显式关掉浏览器原生重连），带 `since` 续传；`stream.gap` → 快照恢复。
-- 模型下拉：显示 `/api/health` 的真实模型，其余候选 `disabled`（**只能看，不能切**）。
-
----
-
-## 13. 测试
-
-```bash
-# 离线自检（不需要 API Key）—— 1502 项
-python -m backend.selfcheck_p1        #  56  契约层：事件/错误码/schema
-python -m backend.selfcheck_p2        #  45  模型层：候选轮换/错误分类
-python -m backend.selfcheck_agent     # 599  Agent 全链路：阶段/闸门/预算/模式/压缩/意图
-python -m backend.selfcheck_cli       #  65  CLI 渲染/中文解码
-python -m backend.selfcheck_server    # 185  存储/Hub/运行时/调度/恢复
-python -m backend.selfcheck_sandbox   #  89  Docker 参数与控制流
-python -m backend.selfcheck_rag       # 110  索引/检索/集成/安全/闭环/混合
-python -m backend.selfcheck_mcp       #  58  MCP 连接/发现/注册/超时/关闭
-python -m backend.selfcheck_subtask   #  32  父子任务/迁移/上限/取消
-python -m backend.selfcheck_terminal  #  59  终端探测/真跑/越界/双引擎
-python -m backend.selfcheck_workflow   # 41  工作流 DAG/并行/失败隔离/取消/恢复
-python -m backend.selfcheck_checkpoint # 58  Checkpoint 三执行点/落盘/恢复/裁剪
-python -m backend.selfcheck_spill      # 33  溢出存储/head-tail 策略/集成
-python -m backend.selfcheck_edit_file_line # 28  行号锚定/模糊匹配
-python -m backend.selfcheck_spawn_parallel # 16  并行派生/聚合/上限
-python -m backend.selfcheck_pruner_replay  # 10  修剪 replay-safe
-python -m backend.selfcheck_orchestrator_equiv # 18  双引擎终态等价
-
-# 集成 / 真实环境（按需）
-python -m backend.server.test_live_e2e       #  56  真 HTTP/SSE/调度/模式（模型替身，5 场景）
-python -m backend.test_sandbox_docker        #  25  真实容器
-python -m backend.test_live_model            #   7  真实模型 7 场景（要 Key）
-
-cd frontend
-npm run test:events    # 39  事件契约：后端 EventType ↔ 前端清单 ↔ 样式
-npm run test:session   # 33  会话隔离 + 状态映射 + 权限模式
-npm run test:workspace # 26  路径规范化 / 分组
-npm run test:tasktree  # 32  子任务树构建
-npm run test:tasktree  # 32  任务树纯函数：建树/折叠/遍历/跨会话
-npx tsc -p tsconfig.app.json --noEmit
-```
-
-**最值钱的是"可证伪"断言**：删掉事件发射、把风险判定改成全都免审批、去掉派生上限、
-把 `rag_context_block` 置空——都会立刻让测试变红。数量本身不重要，**能失败**才重要。
-
-ACL 沙箱的验证不在 `selfcheck_*` 套件里（它是可选运行时功能），而是 `dev/` 下的独立脚本：
-
-```bash
-.venv/Scripts/python.exe dev/poc_acl_sandbox.py        # 4 用例：读/写 × 区内外
-.venv/Scripts/python.exe dev/verify_acl_shells.py     # 11 项：三种 shell × 各模式分发
-.venv/Scripts/python.exe dev/verify_acl_temp.py       # 13 项：私有 temp + 凭据隔离
-.venv/Scripts/python.exe dev/verify_acl_timeout.py    # 10 项：超时 / 取消 / 进程树 kill
-.venv/Scripts/python.exe dev/verify_acl_grants.py     # 6 项：授权登记 / 撤销闭环
-.venv/Scripts/python.exe dev/verify_acl_falsify.py    # 3 项：可证伪（关掉关键代码必须变红）
-```
-
----
-
-## 14. 配置
-
-`.env`（示例见 `.env.example`），常用项：
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `BAILIAN_API_KEY` / `DEEPSEEK_API_KEY` / `XFYUN_API_KEY` | — | 三家任选其一 |
-| `LOOM_MODEL` | 供应商默认 | 模型名，如 `spark-x2.6`、`qwen3.7-plus` |
-| `LOOM_ORCHESTRATOR` | `graph` | `graph` / `legacy` |
-| `LOOM_MAX_TURNS` / `LOOM_MAX_SECONDS` / `LOOM_MAX_TOOL_CALLS` | 20 / 300 / 40 | 任务预算 |
-| `LOOM_APPROVAL_TIMEOUT` | 180 | 审批等待上限（超时=拒绝） |
-| `LOOM_RAG` / `LOOM_RAG_DB` | 1 / `sandbox/index/knowledge.db` | 检索开关与库路径 |
-| `LOOM_RAG_EMBED` / `LOOM_RAG_MODE` | `off` / `hybrid` | 向量开关与默认检索方式 |
-| `LOOM_MCP` / `LOOM_MCP_CONFIG` | 0 / — | MCP 开关与配置路径 |
-| `LOOM_AGENTS` / `LOOM_AGENT_MAX_DEPTH` / `LOOM_AGENT_MAX_CHILDREN` | 1 / 2 / 3 | 子任务开关与上限 |
-| `LOOM_TERMINAL` | 1 | 宿主机终端开关 |
-| `LOOM_ACL_MODE` | （空=关） | ACL 受限令牌沙箱：`read-only` / `workspace-write` / `full-access`；空=沿用旧行为 |
-| `LOOM_CHECKPOINT` / `LOOM_CKPT_MODEL` / `LOOM_CKPT_TOOL` / `LOOM_CKPT_TURN` | 1 / 1 / 1 / 1 | 跨进程恢复快照（三执行点开关） |
-| `LOOM_SPILL` / `LOOM_SPILL_MAX_INLINE` / `LOOM_SPILL_DIR` | 1 / 内联阈值 / `.loom_spill` | 上下文溢出存储开关与参数 |
-| `LOOM_PRUNE_THRESHOLD` / `LOOM_PRUNE_HEAD` / `LOOM_PRUNE_TAIL` | 修剪阈值 / head / tail 保留字符数 | 工具结果修剪策略 |
-| `LOOM_SANDBOX_IMAGE` | `loom-sandbox:py312` | 沙箱镜像 |
-
-完整列表见 `.env.example`（按模块分组，含注释）。
-
----
-
-## 15. 已知限制
-
-- **自动续跑未接线**：Checkpoint 已落盘、`load_checkpoint` 可手动恢复 state，
-  但重启后任务不会自动从最近 checkpoint 继续（`safe_to_resume` 恒 False）。
-- **并行子任务有上限**：层级 2、每父 3 个、单次派生 240s；大规模并行要等调度层改造。
-- **`terminal` 默认没有沙箱**：命令以你的用户身份运行，安全靠审批 + cwd + 超时；
-  审批卡里写明了这一点，不要把它当隔离环境。**可**开 `LOOM_ACL_MODE` 走操作系统级
-  ACL 隔离（见 §7.3），但该路径只限写、不限读与网络。
-- **MCP 只支持本地 stdio**：无远程传输、OAuth、自动重连；in-flight 调用无法取消。
-- **检索以关键词为主**：向量是可选增强，没有 reranker；同义词/改述仍可能搜不到。
-- **事件不落盘**：前端落后一个版本时，未知事件会被静默丢弃（构建期有契约测试兜底）。
-- **CMD 的引号**：`python -c "print(1)"` 在 CMD 下会被拆坏，复杂引号用 PS 或脚本文件。
-- **没有 `delete_file`**。
-
----
-
-## 16. 路线图
-
-| 阶段 | 状态 |
-|---|---|
-| M1 编排地基 / M2 LangGraph / M2.1 工具链 / M2.2 事件契约 | ✅ |
-| M3 项目知识检索（FTS5） | ✅ |
-| M4.1 MCP Client（stdio） | ✅ |
-| M4.2 RAG 实用化（查询构建 / 计划后检索 / 来源追溯） | ✅ |
-| M4.3 Graph 设为默认引擎 | ✅ |
-| M5 父子任务（串行 + 并行派生） | ✅ |
-| M6 展示与对比 | ✅ 混合检索、前端任务树已完成；对比报告待做 |
-| 上下文管理（Spill / 修剪 / Checkpoint） | ✅ |
-| Windows ACL 沙箱（受限令牌 / 私有 temp / 授权登记） | ✅ |
-| 自动续跑接线（从 checkpoint 恢复执行） | ⬜ |
-| Tauri 桌面外壳 | ✅ |
-
----
-
-## 17. 目录结构
-
-```
-loom/
-├── backend/
-│   ├── agent/          core.py（内核）· graph_engine.py · policy.py · approval.py
-│   │                   state.py · context.py · intent.py · compaction.py · subtask.py
-│   │   ├── rag/        discover / chunk / store / service / query / embed
-│   │   ├── spill/      溢出存储（spill_store + head/tail 策略）
-│   │   ├── checkpoint/ 跨进程恢复快照（store + policy，三执行点）
-│   │   └── tool_result_pruner.py  工具结果修剪（replay-safe）
-│   ├── workflow/       models（Workflow/Step/Job）· store（4 表 + outbox）
-│   │                   executors（http/tool/shell）· service（DAG 调度 + 恢复）
-│   ├── tools/          base · registry · path_safety
-│   │   ├── readonly/   list_files · read_file · search_docs
-│   │   ├── mutating/   write_file · edit_file · spawn_subtask · spawn_parallel
-│   │   └── exec/       run_command（Docker）· shells + terminal（宿主机）· run_workflow
-│   ├── mcp/            config · client（每 Server 一个常驻 task）· tool
-│   ├── models/         openai_compat（三家共用）· adapter（协议 + FakeAdapter）
-│   ├── server/         app（HTTP+SSE）· scheduler · runtime · store · hub
-│   ├── sandbox/        manager（Docker 参数与生命周期）· acl（ACL 受限令牌沙箱 + 授权登记）
-│   ├── prompts/        system（系统提示 / 阶段提示 / 收尾提示）
-│   ├── cli/            main · approve · render
-│   └── selfcheck_*.py  17 套离线自检 + 3 个真实环境测试
-├── frontend/src/       App.tsx · features/session（store · taskTree）· components · services · types
-├── src-tauri/          Tauri 桌面壳（Rust：子进程管理后端 + 窗口）
-├── dev/                Dockerfile.sandbox · 启动器构建脚本 · ACL 验证脚本 · PoC
-└── sandbox/            运行时产物（index / 模型 / 数据库 / spill / checkpoints / acl_tmp，已 gitignore）
-```
-
----
-
-## 18. 文档索引
-
-深度材料在仓库**外**的 `docs/`（按日期编号，不进 git）：
-
-| 文档 | 内容 |
-|---|---|
-| `architecture/LOOM_ARCHITECTURE_AND_FEATURES.md` | 完整架构与功能说明书（1000+ 行） |
-| `09-M3-项目知识检索.md` · `12-M4.2-RAG-验收报告.md` · `16-混合检索-验收报告.md` | 检索的设计与验收 |
-| `12-M4.1-MCP-Client验收报告.md` | MCP 集成 |
-| `13-M4.3-LangGraph-集成验收报告.md` | Graph 默认引擎的切换与缺陷修复 |
-| `14-M5-Multi-Agent-验收报告.md` · `22-P1-三项验收报告.md` | 父子任务（串行 / 并行派生） |
-| `15-Terminal-Tool-验收报告.md` | 宿主机终端 |
-| `17-异步工作流-验收报告.md` | DAG 调度、outbox、重启恢复 |
-| `18-Spill与工具结果修剪-验收报告.md` | 上下文溢出存储、修剪 replay-safe |
-| `21-Checkpoint-验收报告.md` | 跨进程恢复快照 |
-| `23-EditFile行号锚定验收报告.md` | 编辑工具行号锚定 + 模糊匹配 |
-| `22-ACL沙箱实施交接文档.md` · `24-Windows-ACL沙箱-实施计划.md` · `25-ACL沙箱-PoC验收报告.md` | Windows ACL 受限令牌沙箱的 8 步计划、实测校正与验收 |
-
----
-
-## License
+## 许可
 
 MIT
