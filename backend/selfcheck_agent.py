@@ -3007,6 +3007,7 @@ async def main() -> int:
         await test_desktop_click_dpi(sb)
         await test_desktop_locate_helpers(sb)
         await test_history_tool(sb)
+        await test_reasoning_echo(sb)
         await test_image_offload(sb)
         await test_ask_user(sb)
         await test_repair_zero_work_gate(sb)
@@ -4750,6 +4751,32 @@ async def test_desktop_click_dpi(sb: Sandbox) -> None:
     check(res3.ok, "★ list_displays 读不到时回退 scale=1.0，点击仍成功")
     check(captured.get("xy2") == "100,100",
           f"★ 回退时不乱乘（xy2={captured.get('xy2')}，应为 100,100）")
+
+
+async def test_reasoning_echo(sb: Sandbox) -> None:
+    """[R] 思维链回传（DeepSeek thinking 模式强制要求）。
+
+    ★ 真实事故：deepseek-flash 第二轮 400 ——
+      "The reasoning_content in the thinking mode must be passed back to the API"
+      原因就是 to_dict() 存了 reasoning 却没发出去。
+    """
+    print("\n[R] 思维链回传（推理模型）")
+    from backend.models.adapter import Message
+
+    m = Message.assistant("答案", reasoning="我先想想…")
+    d = m.to_dict()
+    check(d.get("reasoning_content") == "我先想想…",
+          "★ assistant 消息的 reasoning 原样回传（否则第二轮 400）")
+    check(d["role"] == "assistant" and d["content"] == "答案", "正文与角色不受影响")
+
+    plain = Message.assistant("答案").to_dict()
+    check("reasoning_content" not in plain,
+          "★ 没有思维链时不发这个字段（兼容非推理模型）")
+
+    tool = Message.tool_result("c1", "read_file", "内容")
+    tool.reasoning = "不该发"
+    check("reasoning_content" not in tool.to_dict(),
+          "tool 消息永远不发 reasoning_content")
 
 
 async def test_image_offload(sb: Sandbox) -> None:

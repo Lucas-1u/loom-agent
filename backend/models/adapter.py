@@ -138,6 +138,15 @@ class Message:
                 d["name"] = self.tool_name
         if self.role == "assistant" and self.tool_calls:
             d["tool_calls"] = [tc.to_dict() for tc in self.tool_calls]
+
+        # ---- 思维链回传（推理模型必需）------------------------------------
+        # ★ DeepSeek 等 thinking 模型要求：上一轮的 reasoning_content 必须
+        #   原样发回来，否则第二轮直接 400：
+        #   "The `reasoning_content` in the thinking mode must be passed back"
+        # ★ 只在非空时发：部分模型不认识这个字段，空值也可能被判非法。
+        # ★ 历史表已经存了 reasoning（history_log.py），所以恢复后也发得出来。
+        if self.role == "assistant" and self.reasoning:
+            d["reasoning_content"] = self.reasoning
         return d
 
     # ---- 便捷构造 ----------------------------------------------------------
