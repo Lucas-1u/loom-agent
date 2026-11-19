@@ -140,13 +140,15 @@ class Message:
             d["tool_calls"] = [tc.to_dict() for tc in self.tool_calls]
 
         # ---- 思维链回传（推理模型必需）------------------------------------
-        # ★ DeepSeek 等 thinking 模型要求：上一轮的 reasoning_content 必须
-        #   原样发回来，否则第二轮直接 400：
+        # ★ DeepSeek thinking 模式要求：**每一轮** assistant 都要带
+        #   reasoning_content 字段，哪怕是空字符串。有些轮次（如工具结果后的
+        #   反思）模型确实不吐思维链，此时字段仍必须在，否则下一轮 400：
         #   "The `reasoning_content` in the thinking mode must be passed back"
-        # ★ 只在非空时发：部分模型不认识这个字段，空值也可能被判非法。
-        # ★ 历史表已经存了 reasoning（history_log.py），所以恢复后也发得出来。
-        if self.role == "assistant" and self.reasoning:
-            d["reasoning_content"] = self.reasoning
+        # ★ 实测：回传空字符串 → 200；完全不带这个字段 → 400。
+        # ★ 但只在字段名此前出现过时才补：非推理模型的历史里没有 reasoning，
+        #   凭空加一个空字段可能被视为非法参数。
+        if self.role == "assistant":
+            d["reasoning_content"] = self.reasoning or ""
         return d
 
     # ---- 便捷构造 ----------------------------------------------------------

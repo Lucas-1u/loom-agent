@@ -1165,7 +1165,7 @@ class AgentCore:
                 if getattr(self.config, "main_vision", False):
                     _imgs = [
                         ImageRef.from_dict(d)
-                        for d in (getattr(res, "images", None) or [])
+                        for d in (getattr(result, "images", None) or [])
                         if isinstance(d, dict)
                     ]
                 tb.add_tool(tc.id, tc.name, content, images=_imgs or None)

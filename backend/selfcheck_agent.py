@@ -4770,8 +4770,8 @@ async def test_reasoning_echo(sb: Sandbox) -> None:
     check(d["role"] == "assistant" and d["content"] == "答案", "正文与角色不受影响")
 
     plain = Message.assistant("答案").to_dict()
-    check("reasoning_content" not in plain,
-          "★ 没有思维链时不发这个字段（兼容非推理模型）")
+    check(plain.get("reasoning_content") == "",
+          "★ 没有思维链也要带空字段（DeepSeek thinking 每轮都要求）")
 
     tool = Message.tool_result("c1", "read_file", "内容")
     tool.reasoning = "不该发"
